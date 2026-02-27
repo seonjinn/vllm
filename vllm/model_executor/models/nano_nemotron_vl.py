@@ -857,8 +857,21 @@ class BaseNanoNemotronVLProcessor(ABC):
             and self.video_target_num_patches is not None
             and len(images) > 1
         ):
-            # Video-as-images: resize frames to target patch budget
-            # (mirrors Megatron's DynamicResolutionImageTilingStrategy video branch)
+            # Video-as-images with temporal compression: group T frames into
+            # tubelets while maintaining 1:1 mapping with vLLM's multimodal
+            # pipeline (N items ↔ N <image> tokens ↔ N mm_kwargs entries).
+            #
+            # Primary frames (every T-th) get T patches → [T, 3, H, W] pixel
+            # data, producing one tubelet embedding each. Secondary frames get
+            # 0 patches → scheduler skips them, they expand to 0 prompt tokens.
+            temporal_patch_size = self.video_temporal_patch_size
+            num_images = len(images)
+            num_tubelets = math.ceil(num_images / temporal_patch_size)
+            num_padded = num_tubelets * temporal_patch_size
+
+            if num_padded > num_images:
+                images = list(images) + [images[-1]] * (num_padded - num_images)
+
             patch_size = self.config.patch_size
             downsample_ratio = self.config.downsample_ratio
             target_patches = self.video_target_num_patches
@@ -888,13 +901,26 @@ class BaseNanoNemotronVLProcessor(ABC):
             pixel_values_flat = input_conditioner(
                 torch.stack(frame_tensors), self.norm_mean, self.norm_std
             )
-            image_num_patches = torch.tensor([1] * len(images))
-            toks_per_frame = int((target_h // patch_size) * downsample_ratio) * int((target_w // patch_size) * downsample_ratio)
+
+            # Primary frames (i % T == 0) own T patches; secondary frames own
+            # 0 patches. FlatField slicing gives primary items [T, 3, H, W] and
+            # secondary items empty tensors. N entries to match N <image> tokens.
+            image_num_patches = torch.tensor([
+                temporal_patch_size if (i % temporal_patch_size == 0) else 0
+                for i in range(num_images)
+            ])
+            toks_per_frame = (
+                int((target_h // patch_size) * downsample_ratio)
+                * int((target_w // patch_size) * downsample_ratio)
+            )
             image_inputs = {
                 "pixel_values_flat": pixel_values_flat,
                 "image_num_patches": image_num_patches,
             }
-            num_tokens_per_image = [toks_per_frame] * len(images)
+            num_tokens_per_image = [
+                toks_per_frame if (i % temporal_patch_size == 0) else 0
+                for i in range(num_images)
+            ]
         else:
             max_num_tiles = max_num_tiles or self.max_num_tiles
             pixel_values_lst = self._images_to_pixel_values_lst(images, max_num_tiles)
@@ -915,9 +941,9 @@ class BaseNanoNemotronVLProcessor(ABC):
             "which should be a single string"
         )
         parts = [x for x in re.split(r"(<image>)", text[0]) if x]
-        assert parts.count("<image>") == len(pixel_values_lst), (
-            "the number of <image> tokens in the text should be the "
-            "same as the number of images"
+        assert parts.count("<image>") == len(num_tokens_per_image), (
+            f"Expected {len(num_tokens_per_image)} <image> tokens in text "
+            f"but found {parts.count('<image>')}"
         )
 
         for i, (feature_size, num_patches) in enumerate(
@@ -1488,12 +1514,15 @@ class NanoNemotronBaseVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
             image_num_patches = []
 
         def get_replacement_custom(item_idx: int):
-            T = hf_processor.video_temporal_patch_size
             max_num_tiles = hf_processor_mm_kwargs.get("max_num_tiles")
 
-            # Secondary frames in a tubelet get 0 image tokens.
-            if T > 1 and max_num_tiles == 1 and item_idx % T != 0:
-                return hf_processor.get_image_repl(0, None)
+            # Secondary frames in temporal compression have 0 patches
+            # and expand to 0 visual tokens in the prompt.
+            if (
+                item_idx < len(image_num_patches)
+                and image_num_patches[item_idx] == 0
+            ):
+                return hf_processor.get_image_repl(0, 0)
 
             images = mm_items.get_items(
                 "image", (ImageEmbeddingItems, ImageProcessorItems)
@@ -2155,40 +2184,44 @@ class NemotronH_Nano_VL_V2(
         """Return True when these images are video frames that should be
         temporally compressed (video-as-images with T > 1).
 
-        Heuristic: temporal compression is configured AND every image has
-        exactly 1 tile (static resolution with max_num_tiles=1).
+        Detection: temporal compression is configured AND every item has
+        exactly T frames (set by _preprocess_image's tubelet grouping).
         """
         T = self.video_temporal_patch_size
         if T <= 1 or image_input["type"] != "pixel_values":
             return False
         num_patches = image_input["num_patches"]
-        return bool(num_patches.numel() > 0 and (num_patches == 1).all())
+        return bool(num_patches.numel() > 0 and (num_patches == T).all())
 
     def _process_image_input_temporal(
         self, image_input: NanoNemotronVLImagePixelInputs
     ) -> tuple[torch.Tensor, ...]:
-        """Process images that are video frames with temporal compression.
+        """Process batched tubelets of T video frames with temporal compression.
 
-        All N images are treated as a single video and fed through
-        extract_feature with num_frames, which uses the fixed-resolution
-        temporal path in RADIO (no attention mask needed).
-
-        Returns ceil(N/T) embeddings (one per tubelet).
+        The V1 scheduler batches all scheduled primary-frame items for a
+        request into one call.  pixel_values_flat has shape
+        [num_tubelets * T, 3, H, W] and num_patches is [T, T, ..., T]
+        (one entry per tubelet).  extract_feature with num_frames applies
+        RADIO's temporal path (conv3d + flash attention) and returns
+        [num_tubelets, tokens_per_tubelet, hidden].  We split into one
+        embedding per tubelet so embed_multimodal gets the right count.
         """
-        T = self.video_temporal_patch_size
-        pixel_values = image_input["pixel_values_flat"]  # [N, 3, H, W]
-        num_images = pixel_values.shape[0]
-        num_tubelets = math.ceil(num_images / T)
+        pixel_values = image_input["pixel_values_flat"]
+        num_patches = image_input["num_patches"]
+        num_tubelets = len(num_patches)
 
-        vit_embeds = self.extract_feature(pixel_values, num_frames=num_images)
+        vit_embeds = self.extract_feature(
+            pixel_values, num_frames=pixel_values.shape[0]
+        )
 
         hidden_size = self.config.text_config.hidden_size
+
+        if num_tubelets == 1:
+            return (vit_embeds.view(-1, hidden_size),)
+
         vit_embeds = vit_embeds.view(-1, hidden_size)
-
-        feature_size = vit_embeds.shape[0] // num_tubelets
-        per_tubelet = [feature_size] * num_tubelets
-
-        return tuple(vit_embeds.split(per_tubelet))
+        tokens_per_tubelet = vit_embeds.shape[0] // num_tubelets
+        return tuple(vit_embeds.split([tokens_per_tubelet] * num_tubelets))
 
     def _process_video_input(
         self, video_input: NanoNemotronVLVideoPixelInputs
