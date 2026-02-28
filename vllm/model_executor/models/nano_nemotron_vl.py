@@ -829,6 +829,7 @@ class BaseNanoNemotronVLProcessor(ABC):
         text: list[str],
         images: list[Image.Image],
         max_num_tiles: int | None,
+        max_num_patches: int | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         if len(images) == 0:
             image_inputs = {}
@@ -1004,6 +1005,7 @@ class BaseNanoNemotronVLProcessor(ABC):
         images: Image.Image | list[Image.Image] | None = None,
         return_tensors: str | TensorType | None = None,
         max_num_tiles: int | None = None,
+        max_num_patches: int | None = None,
     ) -> BatchFeature:
         raise NotImplementedError
 
@@ -1262,6 +1264,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         audios: AudioItem | list[AudioItem] | None = None,
         return_tensors: str | TensorType | None = None,
         max_num_tiles: int | None = None,
+        max_num_patches: int | None = None,
     ) -> BatchFeature:
         text, images, videos, audios = [
             self._make_batch_input(x) for x in (text, images, videos, audios)
@@ -1271,6 +1274,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             text=text,
             images=images,
             max_num_tiles=max_num_tiles,
+            max_num_patches=max_num_patches,
         )
 
         text, video_inputs = self._preprocess_video(
