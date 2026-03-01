@@ -9,6 +9,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import math
+import os as _os
 from collections.abc import Iterable
 from itertools import repeat
 from typing import TypeAlias
@@ -18,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
+
+_CONV3D_DEBUG = _os.environ.get("CONV3D_DEBUG", "0") == "1"
 
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -289,6 +292,17 @@ class ViTPatchGenerator(nn.Module):
 
         N_padded = patches.shape[0]
         patches = patches.view(N_padded // T, num_spatial, T * feat_dim)
+
+        embedder_name = "video_embedder" if self.separate_video_embedder else "embedder"
+        if _CONV3D_DEBUG:
+            print(f"[CONV3D_DEBUG forward_video]")
+            print(f"  x.shape={list(x.shape)}, num_frames={num_frames}, T={T}")
+            print(f"  patches before reshape: N={N}, num_spatial={num_spatial}, "
+                  f"feat_dim={feat_dim}, pad_frames={pad_frames}")
+            print(f"  patches after reshape: "
+                  f"[{N_padded // T}, {num_spatial}, {T * feat_dim}]")
+            print(f"  using {embedder_name} "
+                  f"(separate_video_embedder={self.separate_video_embedder})")
 
         if self.separate_video_embedder:
             patches = self.video_embedder(patches)
@@ -801,6 +815,11 @@ class RadioInternVisionModel(nn.Module):
 
         if num_frames_per_video is not None and imgs_sizes is not None and T > 1:
             # Dynamic-resolution video with temporal compression.
+            if _CONV3D_DEBUG:
+                print(f"[CONV3D_DEBUG RadioInternVisionModel.forward] "
+                      f"branch=DYNAMIC_VIDEO_TEMPORAL, "
+                      f"x.shape={list(x.shape)}, T={T}, "
+                      f"num_frames_per_video={num_frames_per_video}")
             hidden_states = self.patch_generator(
                 x,
                 imgs_sizes=imgs_sizes,
@@ -811,10 +830,19 @@ class RadioInternVisionModel(nn.Module):
             )
         elif num_frames is not None and T > 1:
             # Fixed-resolution video with temporal compression (legacy).
+            if _CONV3D_DEBUG:
+                print(f"[CONV3D_DEBUG RadioInternVisionModel.forward] "
+                      f"branch=FIXED_VIDEO_TEMPORAL (forward_video), "
+                      f"x.shape={list(x.shape)}, T={T}, num_frames={num_frames}")
             hidden_states = self.patch_generator.forward_video(x, num_frames)
             effective_sizes = None
         else:
             # Images (dynamic or fixed) or video without temporal compression.
+            if _CONV3D_DEBUG:
+                print(f"[CONV3D_DEBUG RadioInternVisionModel.forward] "
+                      f"branch=IMAGE_OR_NO_TEMPORAL, "
+                      f"x.shape={list(x.shape)}, T={T}, "
+                      f"imgs_sizes={'len=' + str(len(imgs_sizes)) if imgs_sizes else None}")
             hidden_states = self.patch_generator(x, imgs_sizes=imgs_sizes)
             effective_sizes = imgs_sizes
 
