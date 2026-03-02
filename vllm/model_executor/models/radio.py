@@ -309,8 +309,29 @@ class ViTPatchGenerator(nn.Module):
         else:
             patches = self.embedder(patches)
 
+        if _CONV3D_DEBUG:
+            print(f"  patches after embedder: {list(patches.shape)}")
+
         patches, pos_enc = self.apply_pos_enc(patches, input_size=input_size)
+
+        if _CONV3D_DEBUG:
+            print(f"  patches after pos_enc: {list(patches.shape)}")
+
         patches = self.cls_token(patches)
+
+        if _CONV3D_DEBUG:
+            num_skip = self.num_cls_tokens + self.num_registers
+            print(f"  patches after cls_token: {list(patches.shape)}")
+            print(f"  num_cls_tokens={self.num_cls_tokens}, "
+                  f"num_registers={self.num_registers}, "
+                  f"num_skip={num_skip}")
+            expected_seq_len = num_spatial + num_skip
+            actual_seq_len = patches.shape[1]
+            print(f"  expected seq_len={expected_seq_len} "
+                  f"(num_spatial={num_spatial} + num_skip={num_skip}), "
+                  f"actual={actual_seq_len}, "
+                  f"match={expected_seq_len == actual_seq_len}")
+
         patches = self.patch_normalizer(patches)
         if self.return_pos_enc:
             return patches, pos_enc
@@ -556,6 +577,11 @@ class ViTPatchGenerator(nn.Module):
             return pos_embed
 
         if self.cpe_mode:
+            assert not self.training, (
+                "RADIO CPE position encoding is in training mode during inference. "
+                "This introduces random position augmentation that corrupts embeddings. "
+                "Ensure model.eval() is called before inference."
+            )
             if self.training:
                 min_scale = math.sqrt(0.1)
                 scale = (
@@ -605,7 +631,7 @@ class ViTPatchGenerator(nn.Module):
                 pos_embed = F.interpolate(
                     pos_embed.float(),
                     size=(max_dim, max_dim),
-                    align_corners=True,
+                    align_corners=False,
                     mode="bilinear",
                 ).to(pos_embed.dtype)
 
@@ -615,7 +641,7 @@ class ViTPatchGenerator(nn.Module):
 
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(
-                pos_embed.float(), size=input_dims, align_corners=True, mode="bilinear"
+                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
             ).to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
@@ -853,6 +879,32 @@ class RadioInternVisionModel(nn.Module):
             attn_mask = self.create_inter_image_attention_mask(
                 effective_sizes, device=x.device
             )
+
+        if _CONV3D_DEBUG:
+            print(f"[CONV3D_DEBUG RadioInternVisionModel.forward] pre-encoder:")
+            print(f"  hidden_states.shape={list(hidden_states.shape)}, "
+                  f"effective_sizes={effective_sizes}, "
+                  f"attn_mask={'None' if attn_mask is None else list(attn_mask.shape)}")
+            # For conv3d video: hidden_states should be [num_tubelets, num_skip+num_spatial, hidden]
+            # Each tubelet is an independent batch element. attn_mask should be None (flash attn
+            # handles batch elements independently). effective_sizes should be None.
+            # In Mcore, tubelets are packed into ONE sequence with block-diagonal attention via
+            # packed_seq_params. The batch approach here must produce equivalent results.
+            if num_frames is not None and T > 1:
+                num_tubelets = hidden_states.shape[0]
+                seq_per_tubelet = hidden_states.shape[1]
+                print(f"  CONV3D BATCH CHECK: {num_tubelets} tubelets, "
+                      f"{seq_per_tubelet} tokens each "
+                      f"(should be num_skip + num_spatial_patches)")
+                assert attn_mask is None, (
+                    f"Conv3d video batch path should have NO attn_mask "
+                    f"(each tubelet is independent), but got {attn_mask.shape}"
+                )
+                assert effective_sizes is None, (
+                    f"Conv3d video batch path should have effective_sizes=None, "
+                    f"but got {effective_sizes}"
+                )
+
         encoder_outputs = self.encoder(inputs_embeds=hidden_states, attn_mask=attn_mask)
         return encoder_outputs
 
@@ -984,9 +1036,17 @@ class RadioModel(nn.Module):
         num_skip = self.model.patch_generator.num_skip
         patch_size = self.model.patch_generator.patch_size
         num_cls_tokens = self.model.patch_generator.num_cls_tokens
+        if _CONV3D_DEBUG:
+            print(f"[CONV3D_DEBUG _extract_final]")
+            print(f"  encoder_output y.shape={list(y.shape)}, "
+                  f"num_skip={num_skip}, num_cls_tokens={num_cls_tokens}, "
+                  f"imgs_sizes={imgs_sizes}")
         if imgs_sizes is None:
             all_summary = y[:, :num_cls_tokens]
             all_feat = y[:, num_skip:]
+            if _CONV3D_DEBUG:
+                print(f"  fixed-res: all_feat.shape={list(all_feat.shape)} "
+                      f"(stripped first {num_skip} tokens per batch element)")
         else:
             all_patches = []
             summaries = []
