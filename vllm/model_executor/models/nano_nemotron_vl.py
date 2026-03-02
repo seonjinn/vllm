@@ -1196,12 +1196,13 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
                 video_repl = self.get_video_repl(
                     tokens_per_frame=tokens_per_frame,
-                    frames_indices=tubelet_frames_indices,
+                    frames_indices=frames_indices,
                     frame_duration_ms=frame_duration_ms,
                     tokenizer=self.tokenizer,
                     img_start_token_ids=self._img_start_token_ids,
                     img_end_token_ids=self._img_end_token_ids,
                     img_context_token_ids=self._img_context_token_ids,
+                    video_temporal_patch_size=T,
                 )
 
                 # video_repl.full is a list of token IDs
@@ -1337,6 +1338,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         img_start_token_ids: list[int],
         img_end_token_ids: list[int],
         img_context_token_ids: list[int],
+        video_temporal_patch_size: int = 1,
     ) -> PromptUpdateDetails[list[int]]:
         """
         Build prompt replacement for a video.
@@ -1355,20 +1357,47 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                         make sure the total number of tokens is correct.
         - EVS real (called from get_real_video_repl_for_evs) - different value per frame
         Args:
-            tokens_per_frame (list[int]): number of tokens per frame
-            frames_indices (list[int]): frame indices
+            tokens_per_frame (list[int]): number of tokens per frame (one per
+                tubelet when T > 1)
+            frames_indices (list[int]): all original frame indices (one per
+                frame, before any tubelet subsampling)
             frame_duration_ms (int): duration of each frame in milliseconds
-            tokenizer (TokenizerLike): tokenizer to use for tokenizing frame separators
+            tokenizer (TokenizerLike): tokenizer to use for tokenizing frame
+                separators
             img_start_token_ids (list[int]): pre-tokenized IMG_START tokens
             img_end_token_ids (list[int]): pre-tokenized IMG_END tokens
             img_context_token_ids (list[int]): pre-tokenized IMG_CONTEXT tokens
+            video_temporal_patch_size (int): T value; when > 1 generates
+                version 2 grouped format matching
+                build_frame_timestamp_prefix(version=2).
         """
         # TODO: Add support of frame_duration_ms to be None
         # At preprocessing step we should allow absent / metadata without
         # frames_indices field.
         timestamps_enabled = frame_duration_ms is not None
+        T = video_temporal_patch_size
+        num_frames = len(frames_indices)
 
-        if timestamps_enabled:
+        if T > 1 and timestamps_enabled:
+            all_timestamps = calculate_timestamps(
+                frames_indices, frame_duration_ms
+            )
+
+            frame_separators = []
+            for i in range(0, num_frames, T):  # Every group
+                group_frames = []
+                for j in range(T):  # Every frame in the group
+                    frame_idx = i + j
+                    if frame_idx < num_frames:  # Valid idx (haven't padded to mult. of T yet)
+                        ts = all_timestamps[frame_idx]
+                        frame_str = "Frame" if j == 0 else "frame"
+                        group_frames.append(
+                            f"{frame_str} {frame_idx + 1} sampled at {ts:.2f} seconds"
+                        )
+                if group_frames:
+                    # Join by " and " if there are >1 frame, otherwise there's no " and "
+                    frame_separators.append(" and ".join(group_frames) + ": ")
+        elif timestamps_enabled:
             timestamps = calculate_timestamps(frames_indices, frame_duration_ms)
 
             assert len(timestamps) == len(tokens_per_frame), (
@@ -1808,12 +1837,13 @@ class NanoNemotronVLMultiModalProcessor(
             frame_duration_ms = int(1000 / metadata["fps"])
             return hf_processor.get_video_repl(
                 tokens_per_frame=tokens_per_frame,
-                frames_indices=tubelet_frames_indices,
+                frames_indices=metadata["frames_indices"],
                 frame_duration_ms=frame_duration_ms,
                 tokenizer=hf_processor.tokenizer,
                 img_start_token_ids=hf_processor._img_start_token_ids,
                 img_end_token_ids=hf_processor._img_end_token_ids,
                 img_context_token_ids=hf_processor._img_context_token_ids,
+                video_temporal_patch_size=T,
             )
 
         if self.info.supports_video:
@@ -2410,8 +2440,9 @@ class NemotronH_Nano_VL_V2(
                 self._create_final_video_embeddings(
                     single_video_embeddings,
                     num_tokens_per_frame,
-                    tubelet_frames_indices,
+                    original_frames_indices,
                     frame_duration_ms,
+                    video_temporal_patch_size=T,
                 ),
             )
 
@@ -2492,6 +2523,7 @@ class NemotronH_Nano_VL_V2(
         num_tokens_per_frame: list[int],
         frames_indices: list[int],
         frame_duration_ms: int,
+        video_temporal_patch_size: int = 1,
     ) -> torch.Tensor:
         """Create final embeddings that combine video embeddings with
         text embeddings of indicator tokens.
@@ -2519,6 +2551,7 @@ class NemotronH_Nano_VL_V2(
             img_start_token_ids=self._img_start_token_ids,
             img_end_token_ids=self._img_end_token_ids,
             img_context_token_ids=self._img_context_token_ids,
+            video_temporal_patch_size=video_temporal_patch_size,
         )
 
         # video_repl.full is a list of token IDs
