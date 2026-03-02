@@ -11,7 +11,8 @@
 import math
 import os as _os
 from collections.abc import Iterable
-from itertools import repeat
+from dataclasses import dataclass
+from itertools import accumulate, repeat
 from typing import TypeAlias
 
 import torch
@@ -697,44 +698,29 @@ class ViTPatchLinear(nn.Linear):
         self.temporal_patch_dim = temporal_patch_dim
 
 
+@dataclass(frozen=True, kw_only=True)
+class MaskMetadata:
+    cu_seqlens: torch.Tensor
+    max_seqlen: torch.Tensor
+
+
 class RadioParallelAttention(InternParallelAttention):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
-        cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: int | None = None,
+        mask_meta: MaskMetadata | None = None,
     ) -> torch.Tensor:
-        if attn_mask is None and cu_seqlens is None:
-            return super().forward(x)
-
-        B, N, _ = x.shape
         qkv, _ = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
         if self.qk_normalization:
             q, k = self._apply_qk_norm(q, k)
 
-        if cu_seqlens is not None:
-            # Packed-sequence path: use MMEncoderAttention with cu_seqlens
-            # for varlen flash attention (matches Mcore's packed_seq_params)
-            max_seqlen_tensor = torch.tensor(
-                max_seqlen, dtype=torch.int32, device=x.device
-            ) if not isinstance(max_seqlen, torch.Tensor) else max_seqlen
-            out = self.attn(q, k, v, cu_seqlens=cu_seqlens,
-                            max_seqlen=max_seqlen_tensor)
-            out, _ = self.proj(out)
-            return out
-
-        # Dense attention mask path (fallback for dynamic-res images; typically much slower)
-        q = q.view(B, N, self.num_heads_per_partition, self.head_dim)
-        k = k.view(B, N, self.num_heads_per_partition, self.head_dim)
-        v = v.view(B, N, self.num_heads_per_partition, self.head_dim)
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, scale=self.scale
-        )
-        out = out.transpose(1, 2).reshape(B, N, -1)
+        cu_seqlens, max_seqlen = None, None
+        if mask_meta is not None:
+            cu_seqlens = mask_meta.cu_seqlens
+            max_seqlen = mask_meta.max_seqlen
+        out = self.attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         out, _ = self.proj(out)
         return out
 
@@ -746,14 +732,11 @@ class RadioVisionEncoderLayer(InternVisionEncoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
-        cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: int | None = None,
+        mask_meta: MaskMetadata | None = None,
     ):
         hidden_states = (
             hidden_states
-            + self.attn(self.norm1(hidden_states), attn_mask=attn_mask,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen) * self.ls1
+            + self.attn(self.norm1(hidden_states), mask_meta=mask_meta) * self.ls1
         )
 
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)) * self.ls2
@@ -768,16 +751,11 @@ class RadioVisionEncoder(InternVisionEncoder):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
-        cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: int | None = None,
+        mask_meta: MaskMetadata | None = None,
     ):
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(
-                hidden_states, attn_mask=attn_mask,
-                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-            )
+            hidden_states = encoder_layer(hidden_states, mask_meta=mask_meta)
         return hidden_states
 
 
@@ -837,30 +815,17 @@ class RadioInternVisionModel(nn.Module):
     def get_input_embeddings(self):
         return self.embeddings
 
-    def create_inter_image_attention_mask(
-        self, imgs_sizes: list[tuple[int, int]], device: torch.device
-    ) -> torch.Tensor:
-        patch_size = self.patch_generator.patch_size
-        num_skip = self.patch_generator.num_skip
-
-        seq_lens = calc_seq_lens(imgs_sizes, patch_size)
-        patch_counts = [seq_len + num_skip for seq_len in seq_lens]
-        total_patches = sum(patch_counts)
-
-        # Create attention mask - default to False (mask out)
-        mask = torch.zeros(
-            total_patches, total_patches, dtype=torch.bool, device=device
+    def create_mask_metadata(
+        self, seq_lens: list[int], device: torch.device
+    ) -> MaskMetadata:
+        assert len(seq_lens) > 0
+        cu_seqlens = torch.tensor(
+            list(accumulate(seq_lens, initial=0)), dtype=torch.int32, device=device
         )
-
-        # Each image's patches can only attend to patches from the same image
-        start_idx = 0
-        for patch_count in patch_counts:
-            end_idx = start_idx + patch_count
-            # Allow attention within this image's patches
-            mask[start_idx:end_idx, start_idx:end_idx] = True
-            start_idx = end_idx
-
-        return mask
+        # Keep max_seqlen on CPU to avoid .item() sync.
+        # See: vllm/v1/attention/ops/vit_attn_wrappers.py.
+        max_seqlen = torch.tensor(max(seq_lens), dtype=torch.int32)
+        return MaskMetadata(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
     def forward(
         self,
@@ -904,29 +869,21 @@ class RadioInternVisionModel(nn.Module):
             hidden_states = self.patch_generator(x, imgs_sizes=imgs_sizes)
             effective_sizes = imgs_sizes
 
-        # Attention strategy: use packed-sequence with cu_seqlens for flash
-        # attention (matches Mcore's packed_seq_params). This replaces the old
-        # dense attn_mask approach which fell back to non-flash SDPA.
-        # Set USE_PACKED_SEQ = False to revert to the old behavior.
-        USE_PACKED_SEQ = True
-        attn_mask = None
-        cu_seqlens = None
-        max_seqlen = None
+        # Build packed-sequence metadata for MMEncoderAttention when needed.
+        mask_meta = None
         packed_batch_size = None  # original batch size before packing
 
-        if USE_PACKED_SEQ and num_frames is not None and T > 1:
+        if num_frames is not None and T > 1:
             # Conv3d video: all tubelets have the same sequence length.
             # Pack [num_tubelets, seq_per_tubelet, hidden] → [1, total, hidden]
             packed_batch_size = hidden_states.shape[0]
             seq_per_tubelet = hidden_states.shape[1]
             hidden_states = hidden_states.reshape(1, -1, hidden_states.shape[-1])
-            cu_seqlens = torch.arange(
-                0, (packed_batch_size + 1) * seq_per_tubelet, seq_per_tubelet,
-                dtype=torch.int32, device=hidden_states.device,
+            mask_meta = self.create_mask_metadata(
+                [seq_per_tubelet] * packed_batch_size, device=hidden_states.device
             )
-            max_seqlen = seq_per_tubelet
 
-        elif USE_PACKED_SEQ and effective_sizes is not None and len(effective_sizes) > 1:
+        elif effective_sizes is not None and len(effective_sizes) > 1:
             # Dynamic-res images/tubelets: variable sequence lengths.
             # hidden_states is already [1, total_seq, hidden] from the
             # dynamic-res patch generator. Compute cu_seqlens from sizes.
@@ -936,35 +893,23 @@ class RadioInternVisionModel(nn.Module):
                 (h // patch_size) * (w // patch_size) + num_skip
                 for h, w in effective_sizes
             ]
-            cu_seqlens = torch.zeros(
-                len(seq_lens) + 1, dtype=torch.int32, device=hidden_states.device
-            )
-            torch.cumsum(
-                torch.tensor(seq_lens, dtype=torch.int32, device=hidden_states.device),
-                dim=0, out=cu_seqlens[1:],
-            )
-            max_seqlen = max(seq_lens)
-
-        elif effective_sizes is not None and len(effective_sizes) > 1:
-            # Fallback: dense attention mask (non-flash, slower)
-            attn_mask = self.create_inter_image_attention_mask(
-                effective_sizes, device=x.device
+            mask_meta = self.create_mask_metadata(
+                seq_lens, device=hidden_states.device
             )
 
         if _CONV3D_DEBUG:
-            mode = "PACKED-SEQ" if cu_seqlens is not None else (
-                "DENSE-MASK" if attn_mask is not None else "BATCH"
-            )
+            mode = "PACKED-SEQ" if mask_meta is not None else "BATCH"
             print(f"[CONV3D_DEBUG RadioInternVisionModel.forward] pre-encoder:")
             print(f"  mode={mode}, hidden_states.shape={list(hidden_states.shape)}")
-            if cu_seqlens is not None:
-                print(f"  cu_seqlens (first 10)={cu_seqlens[:10].tolist()}, "
-                      f"max_seqlen={max_seqlen}, "
-                      f"num_seqs={len(cu_seqlens) - 1}")
+            if mask_meta is not None:
+                print(
+                    f"  cu_seqlens (first 10)={mask_meta.cu_seqlens[:10].tolist()}, "
+                    f"max_seqlen={mask_meta.max_seqlen.item()}, "
+                    f"num_seqs={len(mask_meta.cu_seqlens) - 1}"
+                )
 
         encoder_outputs = self.encoder(
-            inputs_embeds=hidden_states, attn_mask=attn_mask,
-            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            inputs_embeds=hidden_states, mask_meta=mask_meta
         )
 
         # Unpack back to original batch shape if we packed for video
