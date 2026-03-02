@@ -291,7 +291,15 @@ class ViTPatchGenerator(nn.Module):
             )
 
         N_padded = patches.shape[0]
-        patches = patches.view(N_padded // T, num_spatial, T * feat_dim)
+        # Group T frames per tubelet: for each spatial position, concatenate
+        # features across T consecutive frames (matching Mcore's torch.cat
+        # per spatial position). A plain .view() would incorrectly group
+        # adjacent spatial patches from the same frame.
+        patches = rearrange(
+            patches,
+            '(tubelets frames) spatial feat -> tubelets spatial (frames feat)',
+            frames=T,
+        )
 
         embedder_name = "video_embedder" if self.separate_video_embedder else "embedder"
         if _CONV3D_DEBUG:
