@@ -9,6 +9,7 @@
 
 import copy
 import math
+import os
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
@@ -850,6 +851,20 @@ class BaseNanoNemotronVLProcessor(ABC):
                 input_conditioner(img, tiler.norm_mean, tiler.norm_std)
                 for img in pixel_values_lst
             ]
+            if os.environ.get("NRL_DEBUG", "0") == "1":
+                for _i, (_norm, _sz) in enumerate(zip(normalized, imgs_sizes)):
+                    _flat = _norm.float().reshape(-1)
+                    _exact5 = _flat[:5].tolist()
+                    print(
+                        f"[VLLM_PIXEL_DEBUG] _preprocess_image(dynamic): "
+                        f"img[{_i}] shape={tuple(_norm.shape)} "
+                        f"resolution=({_sz[0]},{_sz[1]}) "
+                        f"num_tokens={num_tokens_per_image[_i]} "
+                        f"mean={float(_norm.float().mean()):.4f} "
+                        f"std={float(_norm.float().std()):.4f} "
+                        f"flat[:5]={[f'{v:.6f}' for v in _exact5]}",
+                        flush=True,
+                    )
             image_num_patches = torch.tensor([1] * len(num_tokens_per_image))
             image_inputs = {
                 "pixel_values_flat": normalized,
@@ -941,6 +956,15 @@ class BaseNanoNemotronVLProcessor(ABC):
             pixel_values_flat = input_conditioner(
                 torch.cat(pixel_values_lst), self.norm_mean, self.norm_std
             )
+            if os.environ.get("NRL_DEBUG", "0") == "1":
+                print(
+                    f"[VLLM_PIXEL_DEBUG] _preprocess_image(static): "
+                    f"pixel_values_flat shape={tuple(pixel_values_flat.shape)} "
+                    f"num_patches={image_num_patches.tolist()} "
+                    f"mean={float(pixel_values_flat.float().mean()):.4f} "
+                    f"std={float(pixel_values_flat.float().std()):.4f}",
+                    flush=True,
+                )
             image_inputs = {
                 "pixel_values_flat": pixel_values_flat,
                 "image_num_patches": image_num_patches,
