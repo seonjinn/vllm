@@ -1026,18 +1026,10 @@ class RadioModel(nn.Module):
                 weight_loader(param, weight)
                 loaded_params.add(vllm_key)
 
-        if (
-            temporal_patch_dim > 1
-            and separate_video_embedder
-            and "model.patch_generator.video_embedder.weight" in params_dict
-            and "model.patch_generator.video_embedder.weight" not in loaded_params
-        ):
-            raise ValueError(
-                "Temporal compression (video_temporal_patch_size > 1) requires "
-                "video_embedder weights in the checkpoint, but "
-                "'model.patch_generator.video_embedder.weight' was not loaded. "
-                "Ensure the checkpoint was trained with temporal compression."
-            )
+        # Note: validation for video_embedder loading is skipped here because
+        # weights may arrive in multiple batches during streaming (refit).
+        # loaded_params is local to each call, so the check would false-alarm
+        # on batches that don't contain the video_embedder weight.
 
         return loaded_params
 

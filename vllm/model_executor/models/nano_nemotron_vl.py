@@ -2790,10 +2790,11 @@ class NemotronH_Nano_VL_V2(
                 assert self.sound_encoder is not None
                 sound_weights.append((name, w))
 
-        self.language_model.load_weights(llm_weights)
-        self.vision_model.load_weights(vision_weights)
-        if self.sound_encoder is not None:
-            assert len(sound_weights) > 0
+        if llm_weights:
+            self.language_model.load_weights(llm_weights)
+        if vision_weights:
+            self.vision_model.load_weights(vision_weights)
+        if self.sound_encoder is not None and sound_weights:
             self.sound_encoder.load_weights(sound_weights)
 
     def print_architecture(self, detailed: bool = True, save_to_file: str = None):
