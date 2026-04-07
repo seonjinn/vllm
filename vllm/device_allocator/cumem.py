@@ -263,6 +263,14 @@ class CuMemAllocator:
             tag = CuMemAllocator.default_tag
 
         assert isinstance(tag, str)
+        # [PATCH:001_cumem_init_jitter]
+        # Serialize CuMemAllocator init across workers to avoid cuMemCreate race.
+        import time as _time, random as _random
+        _local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]))
+        _jitter = _local_rank * 0.5 + _random.random() * 0.3
+        _time.sleep(_jitter)
+
+
 
         old_tag = self.current_tag
         self.current_tag = tag

@@ -153,6 +153,10 @@ class Worker(WorkerBase):
         self._pp_send_work: list[Handle] = []
 
     def sleep(self, level: int = 1) -> None:
+        # [PATCH:001_disable_cumem]
+        import os
+        if os.environ.get('VLLM_DISABLE_CUMEM', '0') == '1':
+            return
         from vllm.device_allocator.cumem import CuMemAllocator
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
@@ -177,6 +181,10 @@ class Worker(WorkerBase):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        # [PATCH:001_disable_cumem]
+        import os
+        if os.environ.get('VLLM_DISABLE_CUMEM', '0') == '1':
+            return
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
@@ -201,6 +209,10 @@ class Worker(WorkerBase):
             self.model_runner.init_fp8_kv_scales()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        # [PATCH:001_disable_cumem]
+        import os
+        if os.environ.get('VLLM_DISABLE_CUMEM', '0') == '1':
+            return nullcontext()
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
 
