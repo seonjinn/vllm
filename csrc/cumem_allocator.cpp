@@ -127,10 +127,10 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
   // Allocate memory using cuMemCreate
   CUresult ret = (CUresult)cuMemCreate(p_memHandle, size, &prop, 0);
   if (ret) {
-    if (fab_flag &&
-        (ret == CUDA_ERROR_NOT_PERMITTED || ret == CUDA_ERROR_NOT_SUPPORTED)) {
-      // Fabric allocation may fail without multi-node nvlink,
-      // fallback to POSIX file descriptor
+    if (fab_flag) {
+      // Fabric allocation may fail without multi-node nvlink or due to
+      // driver/config issues (NOT_PERMITTED, NOT_SUPPORTED, INVALID_VALUE).
+      // Fallback to POSIX file descriptor for any fabric-related failure.
       prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
       CUDA_CHECK(cuMemCreate(p_memHandle, size, &prop, 0));
     } else {
