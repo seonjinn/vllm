@@ -263,43 +263,33 @@ class CuMemAllocator:
             tag = CuMemAllocator.default_tag
 
         assert isinstance(tag, str)
-        # [PATCH:001_cumem_init_jitter]
-        # Serialize CuMemAllocator init across workers to avoid cuMemCreate race.
-        import time as _time, random as _random
-        _local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]))
-        _jitter = _local_rank * 0.5 + _random.random() * 0.3
-        _time.sleep(_jitter)
 
+        # [PATCH:001_cumem_flock_serialize]
+        # Serialize CuMemAllocator init across workers via file lock.
+        # cuMemCreate/cuMemMap race when 8 workers init simultaneously.
+        # Lock held for entire context (model load / KV cache alloc).
+        # No inference impact: use_memory_pool() not called after init.
+        import fcntl as _fcntl
 
-
-        old_tag = self.current_tag
-        self.current_tag = tag
-        with use_memory_pool_with_allocator(
-            self.python_malloc_callback, self.python_free_callback
-        ) as data:
-            # start to hit another PyTorch bug in PyTorch 2.6,
-            # possibly because of gc-related issue w.r.t. the allocator and
-            # the memory pool.
-            # to avoid the issue, we keep a reference of the data.
-            # see https://github.com/pytorch/pytorch/issues/146431 .
-            self.allocator_and_pools[tag] = data
-            yield
-            # PyTorch's bug, calling torch.cuda.empty_cache() will error
-            # when using pluggable allocator, see
-            # https://github.com/pytorch/pytorch/issues/145168 .
-            # if we have some memory allocated and then freed,
-            # the memory will not be released, e.g. in online quantization,
-            # where the model is created in higher precision, and then
-            # quantized in lower precision.
-            # Find all unused allocations and manually release them.
-            # TODO: we should expose `empty_cache` method in the memory pool.
-            # TODO: ask for help from PyTorch team to expose this method.
-            allocations = data[0].snapshot()
-            for allocation in allocations:
-                if allocation["allocated_size"] == 0:
-                    handle = self._python_free_callback(allocation["address"])
-                    unmap_and_release(handle)
-            self.current_tag = old_tag
+        _lock_f = open("/tmp/vllm_cumem_init.lock", "w")
+        _fcntl.flock(_lock_f, _fcntl.LOCK_EX)
+        try:
+            old_tag = self.current_tag
+            self.current_tag = tag
+            with use_memory_pool_with_allocator(
+                self.python_malloc_callback, self.python_free_callback
+            ) as data:
+                self.allocator_and_pools[tag] = data
+                yield
+                allocations = data[0].snapshot()
+                for allocation in allocations:
+                    if allocation["allocated_size"] == 0:
+                        handle = self._python_free_callback(allocation["address"])
+                        unmap_and_release(handle)
+                self.current_tag = old_tag
+        finally:
+            _fcntl.flock(_lock_f, _fcntl.LOCK_UN)
+            _lock_f.close()
 
     def get_current_usage(self) -> int:
         """
