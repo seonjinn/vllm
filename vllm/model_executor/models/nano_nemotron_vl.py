@@ -991,17 +991,26 @@ class BaseNanoNemotronVLProcessor(ABC):
             print(f"  text before (first 400 chars): "
                   f"{text[0][:400]!r}")
 
-        for i, (feature_size, num_patches) in enumerate(
-            zip(num_tokens_per_image, image_num_patches, strict=True)
-        ):
+        image_idx = 0
+        for part_idx, part in enumerate(parts):
+            if part != "<image>":
+                continue
+
+            feature_size = num_tokens_per_image[image_idx]
+            num_patches = image_num_patches[image_idx]
             image_repl = self.get_image_repl(feature_size, num_patches)
             if _CONV3D_DEBUG:
-                is_image = "<image>" in str(parts[i])
-                print(f"  parts[{i}] is_<image>={is_image}, "
+                print(f"  parts[{part_idx}] is_<image>=True, "
                       f"feature_size={feature_size}, "
                       f"num_patches={num_patches}, "
                       f"repl_full_len={len(image_repl.full)}")
-            parts[i] = parts[i].replace("<image>", image_repl.full)
+            parts[part_idx] = image_repl.full
+            image_idx += 1
+
+        assert image_idx == len(num_tokens_per_image), (
+            f"Expected to replace {len(num_tokens_per_image)} <image> tokens "
+            f"but replaced {image_idx}"
+        )
 
         if _CONV3D_DEBUG:
             joined = "".join(parts)
