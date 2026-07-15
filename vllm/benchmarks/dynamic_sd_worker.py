@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import hashlib
 import importlib
@@ -75,6 +76,11 @@ class WorkerConfig:
     data_parallel_size: int
     cudagraph_capture_sizes: tuple[int, ...]
     engine_kwargs: Mapping[str, object] = field(default_factory=dict)
+    draft_tensor_parallel_size: int = 1
+    temperature: float = 1.0
+    top_p: float = 1.0
+    draft_sample_method: str = "probabilistic"
+    rejection_sample_method: str = "standard"
 
     def __post_init__(self) -> None:
         if not self.model or not self.model_revision:
@@ -110,6 +116,16 @@ class WorkerConfig:
             raise ValueError("cudagraph_capture_sizes must be positive.")
         if len(set(self.cudagraph_capture_sizes)) != len(self.cudagraph_capture_sizes):
             raise ValueError("cudagraph_capture_sizes must not contain duplicates.")
+        if self.draft_tensor_parallel_size <= 0:
+            raise ValueError("draft_tensor_parallel_size must be positive.")
+        if self.temperature < 0:
+            raise ValueError("temperature must be non-negative.")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1].")
+        if self.draft_sample_method not in {"greedy", "probabilistic"}:
+            raise ValueError("Unsupported draft_sample_method.")
+        if not self.rejection_sample_method:
+            raise ValueError("rejection_sample_method must not be empty.")
         reserved_engine_keys = {
             "compilation_config",
             "data_parallel_size",
@@ -210,8 +226,8 @@ def workload_identity(config: WorkerConfig) -> dict[str, object]:
         "warmups": config.warmups,
         "repeats": config.repeats,
         "sampling_parameters": {
-            "temperature": 1.0,
-            "top_p": 1.0,
+            "temperature": config.temperature,
+            "top_p": config.top_p,
             "min_tokens": config.max_tokens,
             "max_tokens": config.max_tokens,
             "ignore_eos": True,
@@ -325,6 +341,90 @@ def write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def worker_config_to_payload(config: WorkerConfig) -> dict[str, object]:
+    """Serialize a worker configuration for one isolated subprocess."""
+    return {
+        "output_path": str(config.output_path),
+        "profile_identity": config.profile_identity.payload,
+        "model": config.model,
+        "model_revision": config.model_revision,
+        "speculative_model": config.speculative_model,
+        "speculative_revision": config.speculative_revision,
+        "speculative_method": config.speculative_method,
+        "k": config.k,
+        "kmax": config.kmax,
+        "scheduler_keys": list(config.scheduler_keys),
+        "prompt_token_ids": [list(tokens) for tokens in config.prompt_token_ids],
+        "max_tokens": config.max_tokens,
+        "warmups": config.warmups,
+        "repeats": config.repeats,
+        "seed": config.seed,
+        "data_parallel_size": config.data_parallel_size,
+        "cudagraph_capture_sizes": list(config.cudagraph_capture_sizes),
+        "engine_kwargs": _json_compatible(config.engine_kwargs),
+        "draft_tensor_parallel_size": config.draft_tensor_parallel_size,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "draft_sample_method": config.draft_sample_method,
+        "rejection_sample_method": config.rejection_sample_method,
+    }
+
+
+def worker_config_from_payload(payload: Mapping[str, object]) -> WorkerConfig:
+    """Deserialize and validate a worker configuration payload."""
+    expected = {field.name for field in dataclasses.fields(WorkerConfig)}
+    unknown = set(payload) - expected
+    missing = expected - set(payload)
+    if unknown:
+        raise ValueError("unknown WorkerConfig fields: " + ", ".join(sorted(unknown)))
+    if missing:
+        raise ValueError("missing WorkerConfig fields: " + ", ".join(sorted(missing)))
+    engine_kwargs = payload["engine_kwargs"]
+    profile_identity = payload["profile_identity"]
+    if not isinstance(engine_kwargs, Mapping):
+        raise ValueError("engine_kwargs must be a mapping.")
+    if not isinstance(profile_identity, Mapping):
+        raise ValueError("profile_identity must be a mapping.")
+    return WorkerConfig(
+        output_path=Path(str(payload["output_path"])),
+        profile_identity=ProfileIdentity.from_mapping(profile_identity),
+        model=str(payload["model"]),
+        model_revision=str(payload["model_revision"]),
+        speculative_model=(
+            None
+            if payload["speculative_model"] is None
+            else str(payload["speculative_model"])
+        ),
+        speculative_revision=(
+            None
+            if payload["speculative_revision"] is None
+            else str(payload["speculative_revision"])
+        ),
+        speculative_method=str(payload["speculative_method"]),
+        k=None if payload["k"] is None else int(payload["k"]),
+        kmax=int(payload["kmax"]),
+        scheduler_keys=tuple(int(value) for value in payload["scheduler_keys"]),
+        prompt_token_ids=tuple(
+            tuple(int(token) for token in tokens)
+            for tokens in payload["prompt_token_ids"]
+        ),
+        max_tokens=int(payload["max_tokens"]),
+        warmups=int(payload["warmups"]),
+        repeats=int(payload["repeats"]),
+        seed=int(payload["seed"]),
+        data_parallel_size=int(payload["data_parallel_size"]),
+        cudagraph_capture_sizes=tuple(
+            int(value) for value in payload["cudagraph_capture_sizes"]
+        ),
+        engine_kwargs=dict(engine_kwargs),
+        draft_tensor_parallel_size=int(payload["draft_tensor_parallel_size"]),
+        temperature=float(payload["temperature"]),
+        top_p=float(payload["top_p"]),
+        draft_sample_method=str(payload["draft_sample_method"]),
+        rejection_sample_method=str(payload["rejection_sample_method"]),
+    )
+
+
 def _replace_file(source: Path, target: Path) -> None:
     source.replace(target)
 
@@ -334,6 +434,10 @@ def _validate_preflight(config: WorkerConfig) -> None:
         raise ValueError("data_parallel_size must be 1 for Dynamic SD profiling.")
     if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
         raise ValueError("Dynamic SD profiling requires VLLM_USE_V2_MODEL_RUNNER=1.")
+    if not _is_full_commit_hash(config.model_revision):
+        raise ValueError(
+            "model_revision must be an immutable 40-character commit hash."
+        )
     if config.k is not None and not _is_full_commit_hash(config.speculative_revision):
         raise ValueError(
             "speculative_revision must be an immutable 40-character commit hash."
@@ -394,8 +498,9 @@ def _build_engine_kwargs(config: WorkerConfig) -> dict[str, object]:
             "num_speculative_tokens_per_batch_size": [
                 [1, max(config.scheduler_keys), config.k]
             ],
-            "draft_sample_method": "probabilistic",
-            "rejection_sample_method": "standard",
+            "draft_tensor_parallel_size": config.draft_tensor_parallel_size,
+            "draft_sample_method": config.draft_sample_method,
+            "rejection_sample_method": config.rejection_sample_method,
         }
     return engine_kwargs
 
@@ -525,8 +630,8 @@ def _sampling_params(
 
     return [
         SamplingParams(
-            temperature=1.0,
-            top_p=1.0,
+            temperature=config.temperature,
+            top_p=config.top_p,
             seed=_sampling_seed(config, repeat, index),
             min_tokens=config.max_tokens,
             max_tokens=config.max_tokens,
@@ -669,11 +774,24 @@ def _resolved_engine_config(llm: Any) -> dict[str, object]:
         for section in sections
     }
     speculative_config = getattr(vllm_config, "speculative_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
     resolved["use_v2_model_runner"] = _json_compatible(
         getattr(vllm_config, "use_v2_model_runner", None)
     )
+    resolved["target_identity"] = _resolved_model_identity(model_config)
     resolved["drafter_identity"] = _resolved_drafter_identity(speculative_config)
     return resolved
+
+
+def _resolved_model_identity(model_config: Any) -> dict[str, object] | None:
+    if model_config is None:
+        return None
+    hf_config = _config_field(model_config, "hf_config")
+    return {
+        "model": _json_compatible(_config_field(model_config, "model")),
+        "revision": _json_compatible(_config_field(model_config, "revision")),
+        "commit": _json_compatible(_config_field(hf_config, "_commit_hash")),
+    }
 
 
 def _resolved_drafter_identity(speculative_config: Any) -> dict[str, object] | None:
@@ -709,6 +827,17 @@ def _validate_resolved_config(
     model = _require_mapping(resolved, "model_config")
     if model.get("enforce_eager") is not False:
         raise ValueError("Resolved engine must have enforce_eager=false.")
+    target = _require_mapping(resolved, "target_identity")
+    if target.get("model") != config.model:
+        raise ValueError("Resolved target model does not match the requested model.")
+    if target.get("revision") != config.model_revision:
+        raise ValueError(
+            "Resolved target revision does not match the requested immutable revision."
+        )
+    if target.get("commit") != config.model_revision:
+        raise ValueError(
+            "Resolved target commit does not match the requested immutable commit."
+        )
 
     compilation = _require_mapping(resolved, "compilation_config")
     mode = _enum_name(compilation.get("cudagraph_mode"))
@@ -743,8 +872,9 @@ def _validate_resolved_config(
         "model": config.speculative_model,
         "revision": config.speculative_revision,
         "method": config.speculative_method,
-        "draft_sample_method": "probabilistic",
-        "rejection_sample_method": "standard",
+        "draft_sample_method": config.draft_sample_method,
+        "rejection_sample_method": config.rejection_sample_method,
+        "draft_tensor_parallel_size": config.draft_tensor_parallel_size,
     }
     for field_name, expected in expected_controls.items():
         actual = speculative.get(field_name)
@@ -971,3 +1101,21 @@ class _DefaultMetricsReader:
             scheduler_steps=scheduler_steps,
             cudagraph_steps=dict(self.cudagraph_collector.cudagraph_steps),
         )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run one JSON-configured profile worker in this process."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    namespace = parser.parse_args(argv)
+    payload = json.loads(namespace.config.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError("Worker config JSON must contain an object.")
+    config = worker_config_from_payload(payload)
+    from vllm import LLM
+
+    run_worker(config, LLM)
+
+
+if __name__ == "__main__":
+    main()

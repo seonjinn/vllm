@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,8 @@ from vllm.benchmarks.dynamic_sd_worker import (
     WorkerMetricSnapshot,
     derive_cudagraph_capture_sizes,
     run_worker,
+    worker_config_from_payload,
+    worker_config_to_payload,
 )
 
 
@@ -300,6 +303,7 @@ class FakeMetricsReader:
 
 
 DRAFT_COMMIT = "d" * 40
+TARGET_COMMIT = "c" * 40
 
 
 class FakeLLM:
@@ -314,6 +318,9 @@ class FakeLLM:
         resolved_cudagraph_mode: str | None = None,
         resolved_capture_sizes: tuple[int, ...] | None = None,
         resolved_use_v2_model_runner: bool = True,
+        resolved_target_model: str | None = None,
+        resolved_target_revision: str | None = None,
+        resolved_target_commit: str | None = TARGET_COMMIT,
         resolved_speculative_overrides: dict[str, Any] | None = None,
         resolved_draft_model: str | None = None,
         resolved_draft_revision: str | None = None,
@@ -352,9 +359,10 @@ class FakeLLM:
             vllm_config=SimpleNamespace(
                 use_v2_model_runner=resolved_use_v2_model_runner,
                 model_config=SimpleNamespace(
-                    model=engine_kwargs["model"],
-                    revision=engine_kwargs["revision"],
+                    model=resolved_target_model or engine_kwargs["model"],
+                    revision=resolved_target_revision or engine_kwargs["revision"],
                     enforce_eager=engine_kwargs["enforce_eager"],
+                    hf_config=SimpleNamespace(_commit_hash=resolved_target_commit),
                 ),
                 parallel_config=SimpleNamespace(
                     data_parallel_size=engine_kwargs["data_parallel_size"],
@@ -462,13 +470,13 @@ def worker_config(
         profile_identity=ProfileIdentity.from_mapping(
             {
                 "model": "target-model",
-                "model_revision": "target-revision",
+                "model_revision": TARGET_COMMIT,
                 "speculative_model": "draft-model",
                 "speculative_revision": DRAFT_COMMIT,
             }
         ),
         model="target-model",
-        model_revision="target-revision",
+        model_revision=TARGET_COMMIT,
         speculative_model="draft-model",
         speculative_revision=DRAFT_COMMIT,
         speculative_method="eagle3",
@@ -497,6 +505,19 @@ def v2_runner(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def reset_worker_process_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dynamic_sd_worker, "_worker_invoked", False, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def lightweight_sampling_params(monkeypatch: pytest.MonkeyPatch) -> None:
+    class SamplingParams:
+        def __init__(self, **kwargs: Any) -> None:
+            vars(self).update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.sampling_params",
+        SimpleNamespace(SamplingParams=SamplingParams),
+    )
 
 
 def run_fake_worker(
@@ -737,6 +758,7 @@ def test_worker_rejects_resolved_capture_set_without_full_shape_coverage(
         ("method", "draft_model", "method"),
         ("draft_sample_method", "greedy", "draft_sample_method"),
         ("rejection_sample_method", "block", "rejection_sample_method"),
+        ("draft_tensor_parallel_size", 2, "draft_tensor_parallel_size"),
         ("num_speculative_tokens", 4, "Kmax"),
         ("num_speculative_tokens_per_batch_size", [[1, 4, 2]], "schedule"),
     ],
@@ -764,6 +786,27 @@ def test_worker_requires_immutable_requested_drafter_revision(
         run_fake_worker(config, FakeLLMFactory())
 
     assert json.loads(config.output_path.read_text())["status"] == "failed"
+
+
+def test_worker_requires_immutable_requested_target_revision(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = replace(worker_config(tmp_path), model_revision="main")
+
+    with pytest.raises(ValueError, match="model_revision must be an immutable"):
+        run_fake_worker(config, FakeLLMFactory())
+
+
+def test_worker_rejects_mismatched_resolved_target_commit(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    with pytest.raises(ValueError, match="target commit"):
+        run_fake_worker(
+            worker_config(tmp_path),
+            FakeLLMFactory(resolved_target_commit="e" * 40),
+        )
 
 
 def test_worker_rejects_mismatched_resolved_drafter_commit(
@@ -887,7 +930,7 @@ def test_worker_records_exact_work_identity_configs_and_fallback_histogram(
         ProfileIdentity.from_mapping(result.profile_identity)
     )
     assert result.profile_identity["workload_hash"] == result.workload_hash
-    assert result.target_revision == "target-revision"
+    assert result.target_revision == TARGET_COMMIT
     assert result.speculative_revision == DRAFT_COMMIT
     assert result.total_prompt_tokens == 8
     assert result.total_output_tokens == 16
@@ -938,3 +981,19 @@ def test_atomic_write_failure_leaves_no_result_or_temporary_file(
 
     assert not config.output_path.exists()
     assert not config.output_path.with_suffix(".json.tmp").exists()
+
+
+def test_worker_config_json_round_trip_preserves_process_inputs(tmp_path: Path):
+    config = worker_config(tmp_path, k=3, scheduler_keys=(1, 2, 4), kmax=3)
+
+    restored = worker_config_from_payload(worker_config_to_payload(config))
+
+    assert restored == config
+
+
+def test_worker_config_json_rejects_unknown_fields(tmp_path: Path):
+    payload = worker_config_to_payload(worker_config(tmp_path))
+    payload["unexpected"] = True
+
+    with pytest.raises(ValueError, match="unknown WorkerConfig fields"):
+        worker_config_from_payload(payload)
