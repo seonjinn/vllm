@@ -18,6 +18,7 @@ else:
 def _import_bench_subcommand_modules() -> None:
     # Imported lazily so `BenchmarkSubcommandBase` subclasses register only
     # when `vllm bench` is actually invoked.
+    import vllm.entrypoints.cli.benchmark.dynamic_sd  # noqa: F401
     import vllm.entrypoints.cli.benchmark.latency  # noqa: F401
     import vllm.entrypoints.cli.benchmark.mm_processor  # noqa: F401
     import vllm.entrypoints.cli.benchmark.serve  # noqa: F401
