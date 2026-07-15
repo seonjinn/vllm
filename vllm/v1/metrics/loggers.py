@@ -437,6 +437,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         }
         per_engine_labelvalues = self.per_engine_labelvalues
 
+        self.counter_dynamic_sd_scheduler_steps: Counter | None = None
+        if envs.VLLM_DYNAMIC_SD_PROFILE_METRICS:
+            self.counter_dynamic_sd_scheduler_steps = self._counter_cls(
+                name="vllm:dynamic_sd_scheduler_steps",
+                documentation=(
+                    "Number of scheduler steps by scheduled request count and "
+                    "selected speculative token count."
+                ),
+                labelnames=labelnames + ["scheduler_batch_size", "k"],
+            )
+
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config,
             labelnames,
@@ -1091,6 +1102,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_prefix_cache_hits[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.hits
             )
+
+            if (
+                self.counter_dynamic_sd_scheduler_steps is not None
+                and scheduler_stats.num_scheduled_reqs > 0
+            ):
+                self.counter_dynamic_sd_scheduler_steps.labels(
+                    *self.per_engine_labelvalues[engine_idx],
+                    str(scheduler_stats.num_scheduled_reqs),
+                    str(scheduler_stats.num_spec_tokens_to_schedule),
+                ).inc()
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.counter_connector_prefix_cache_queries[engine_idx].inc(

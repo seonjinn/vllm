@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
+from types import SimpleNamespace
+
 import prometheus_client
 import pytest
 
+import vllm.envs as envs
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.reader import (
     Counter,
     Gauge,
@@ -11,6 +16,7 @@ from vllm.v1.metrics.reader import (
     Vector,
     get_metrics_snapshot,
 )
+from vllm.v1.metrics.stats import SchedulerStats
 
 pytestmark = pytest.mark.cpu_test
 
@@ -21,6 +27,76 @@ def test_registry(monkeypatch):
     test_registry = prometheus_client.CollectorRegistry(auto_describe=True)
     monkeypatch.setattr("vllm.v1.metrics.reader.REGISTRY", test_registry)
     return test_registry
+
+
+def _make_prometheus_logger(test_registry, monkeypatch):
+    for metric_cls_name in ("_counter_cls", "_gauge_cls", "_histogram_cls"):
+        metric_cls = getattr(PrometheusStatLogger, metric_cls_name)
+        monkeypatch.setattr(
+            PrometheusStatLogger,
+            metric_cls_name,
+            partial(metric_cls, registry=test_registry),
+        )
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(),
+        kv_transfer_config=None,
+        lora_config=None,
+        model_config=SimpleNamespace(
+            is_diffusion=False,
+            max_model_len=128,
+            served_model_name="test-model",
+        ),
+        observability_config=SimpleNamespace(
+            kv_cache_metrics=False,
+            show_hidden_metrics=False,
+        ),
+        speculative_config=None,
+    )
+    return PrometheusStatLogger(config, engine_indexes=[0])
+
+
+def test_dynamic_sd_scheduler_key_counter(test_registry, monkeypatch):
+    monkeypatch.setenv("VLLM_DYNAMIC_SD_PROFILE_METRICS", "1")
+    logger = _make_prometheus_logger(test_registry, monkeypatch)
+
+    logger.record(
+        SchedulerStats(
+            num_scheduled_reqs=4,
+            num_spec_tokens_to_schedule=3,
+        ),
+        iteration_stats=None,
+    )
+
+    metric = next(
+        metric
+        for metric in get_metrics_snapshot()
+        if metric.name == "vllm:dynamic_sd_scheduler_steps"
+    )
+    assert isinstance(metric, Counter)
+    assert metric.value == 1
+    assert metric.labels["engine"] == "0"
+    assert metric.labels["scheduler_batch_size"] == "4"
+    assert metric.labels["k"] == "3"
+
+
+def test_dynamic_sd_scheduler_key_counter_defaults_off(test_registry, monkeypatch):
+    monkeypatch.delenv("VLLM_DYNAMIC_SD_PROFILE_METRICS", raising=False)
+    assert not envs.VLLM_DYNAMIC_SD_PROFILE_METRICS
+    logger = _make_prometheus_logger(test_registry, monkeypatch)
+
+    logger.record(
+        SchedulerStats(
+            num_scheduled_reqs=4,
+            num_spec_tokens_to_schedule=3,
+        ),
+        iteration_stats=None,
+    )
+
+    assert all(
+        metric.name != "vllm:dynamic_sd_scheduler_steps"
+        for metric in get_metrics_snapshot()
+    )
 
 
 @pytest.mark.parametrize("num_engines", [1, 4])

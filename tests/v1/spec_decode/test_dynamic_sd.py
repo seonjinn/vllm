@@ -164,6 +164,21 @@ def test_scheduler_uses_dsd_k_based_on_number_of_scheduled_requests():
         assert output.num_spec_tokens_to_schedule == expected_k
 
 
+def test_scheduler_stats_expose_dynamic_sd_lookup_key():
+    scheduler = _make_scheduler_with_dynamic_sd([(1, 16, 3)])
+    output = _add_requests_and_schedule(scheduler, 4)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    stats = scheduler.make_stats(
+        num_scheduled_reqs=len(output.num_scheduled_tokens),
+        num_spec_tokens_to_schedule=output.num_spec_tokens_to_schedule,
+    )
+
+    assert stats is not None
+    assert stats.num_scheduled_reqs == 4
+    assert stats.num_spec_tokens_to_schedule == 3
+
+
 def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
     scheduler = _make_scheduler_with_dynamic_sd(
         [(1, 256, 5)],
