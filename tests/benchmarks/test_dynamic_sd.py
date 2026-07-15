@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the pure Dynamic SD profile selection core."""
 
+import hashlib
 import json
 import math
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -293,6 +295,12 @@ class FakeMetricsReader:
             cudagraph_steps=dict(self.llm.cudagraph_steps),
         )
 
+    def close(self) -> None:
+        self.llm.metrics_reader_closed = True
+
+
+DRAFT_COMMIT = "d" * 40
+
 
 class FakeLLM:
     def __init__(
@@ -302,16 +310,25 @@ class FakeLLM:
         output_token_delta: int = 0,
         scheduler_noise: bool = False,
         fallback_steps: int = 0,
+        emit_cudagraph_metrics: bool = True,
         resolved_cudagraph_mode: str | None = None,
         resolved_capture_sizes: tuple[int, ...] | None = None,
+        resolved_use_v2_model_runner: bool = True,
+        resolved_speculative_overrides: dict[str, Any] | None = None,
+        resolved_draft_model: str | None = None,
+        resolved_draft_revision: str | None = None,
+        resolved_draft_commit: str | None = DRAFT_COMMIT,
     ) -> None:
         self.engine_kwargs = engine_kwargs
         self.output_token_delta = output_token_delta
         self.scheduler_noise = scheduler_noise
         self.fallback_steps = fallback_steps
+        self.emit_cudagraph_metrics = emit_cudagraph_metrics
         self.scheduler_steps: dict[tuple[int, int], int] = {}
         self.cudagraph_steps: dict[CUDAGraphStep, int] = {}
         self.generate_calls: list[tuple[list[dict[str, list[int]]], list[Any]]] = []
+        self.metrics_reader_closed = False
+        self.shutdown_calls = 0
 
         compilation = engine_kwargs["compilation_config"]
         assert isinstance(compilation, dict)
@@ -320,8 +337,20 @@ class FakeLLM:
         )
         cudagraph_mode = resolved_cudagraph_mode or str(compilation["cudagraph_mode"])
         speculative_config = engine_kwargs.get("speculative_config")
+        resolved_speculative_config = None
+        if isinstance(speculative_config, dict):
+            resolved_speculative_values = dict(speculative_config)
+            resolved_speculative_values.update(resolved_speculative_overrides or {})
+            resolved_speculative_values["draft_model_config"] = SimpleNamespace(
+                model=resolved_draft_model or speculative_config["model"],
+                revision=resolved_draft_revision or speculative_config["revision"],
+                hf_config=SimpleNamespace(_commit_hash=resolved_draft_commit),
+            )
+            resolved_speculative_config = SimpleNamespace(**resolved_speculative_values)
         self.llm_engine = SimpleNamespace(
+            engine_core=SimpleNamespace(shutdown=self._shutdown),
             vllm_config=SimpleNamespace(
+                use_v2_model_runner=resolved_use_v2_model_runner,
                 model_config=SimpleNamespace(
                     model=engine_kwargs["model"],
                     revision=engine_kwargs["revision"],
@@ -343,9 +372,12 @@ class FakeLLM:
                     cudagraph_capture_sizes=list(capture_sizes),
                     max_cudagraph_capture_size=max(capture_sizes),
                 ),
-                speculative_config=speculative_config,
-            )
+                speculative_config=resolved_speculative_config,
+            ),
         )
+
+    def _shutdown(self) -> None:
+        self.shutdown_calls += 1
 
     def generate(
         self,
@@ -376,13 +408,14 @@ class FakeLLM:
             )
 
         num_tokens = scheduler_key * (k + 1)
-        full_step = CUDAGraphStep(num_tokens, num_tokens, "FULL")
-        self.cudagraph_steps[full_step] = self.cudagraph_steps.get(full_step, 0) + 1
-        if self.fallback_steps:
-            fallback = CUDAGraphStep(num_tokens, num_tokens, "PIECEWISE")
-            self.cudagraph_steps[fallback] = (
-                self.cudagraph_steps.get(fallback, 0) + self.fallback_steps
-            )
+        if self.emit_cudagraph_metrics:
+            full_step = CUDAGraphStep(num_tokens, num_tokens, "FULL")
+            self.cudagraph_steps[full_step] = self.cudagraph_steps.get(full_step, 0) + 1
+            if self.fallback_steps:
+                fallback = CUDAGraphStep(num_tokens, num_tokens, "PIECEWISE")
+                self.cudagraph_steps[fallback] = (
+                    self.cudagraph_steps.get(fallback, 0) + self.fallback_steps
+                )
 
         return [
             SimpleNamespace(
@@ -431,14 +464,13 @@ def worker_config(
                 "model": "target-model",
                 "model_revision": "target-revision",
                 "speculative_model": "draft-model",
-                "speculative_revision": "draft-revision",
-                "workload_hash": "workload-a",
+                "speculative_revision": DRAFT_COMMIT,
             }
         ),
         model="target-model",
         model_revision="target-revision",
         speculative_model="draft-model",
-        speculative_revision="draft-revision",
+        speculative_revision=DRAFT_COMMIT,
         speculative_method="eagle3",
         k=k,
         kmax=kmax,
@@ -460,6 +492,11 @@ def worker_config(
 @pytest.fixture
 def v2_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+
+@pytest.fixture(autouse=True)
+def reset_worker_process_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dynamic_sd_worker, "_worker_invoked", False, raising=False)
 
 
 def run_fake_worker(
@@ -577,9 +614,38 @@ def test_worker_rejects_vllm_data_parallelism(
     v2_runner: None,
 ):
     config = worker_config(tmp_path, data_parallel_size=2)
+    config.output_path.write_text('{"status": "stale"}\n')
+    factory = FakeLLMFactory()
 
     with pytest.raises(ValueError, match="data_parallel_size must be 1"):
-        run_fake_worker(config, FakeLLMFactory())
+        run_fake_worker(config, factory)
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["output_tokens_per_second"] is None
+    assert "data_parallel_size must be 1" in payload["error"]
+    assert factory.calls == []
+
+
+def test_worker_engine_build_failure_replaces_stale_result_with_failure(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = replace(
+        worker_config(tmp_path),
+        engine_kwargs={"observability_config": "invalid"},
+    )
+    config.output_path.write_text('{"status": "stale"}\n')
+    factory = FakeLLMFactory()
+
+    with pytest.raises(ValueError, match="observability_config must be a mapping"):
+        run_fake_worker(config, factory)
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["output_tokens_per_second"] is None
+    assert "observability_config must be a mapping" in payload["error"]
+    assert factory.calls == []
 
 
 def test_worker_rejects_v1_model_runner(
@@ -590,6 +656,57 @@ def test_worker_rejects_v1_model_runner(
 
     with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
         run_fake_worker(worker_config(tmp_path), FakeLLMFactory())
+
+
+def test_worker_rejects_resolved_v1_model_runner(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = worker_config(tmp_path)
+
+    with pytest.raises(ValueError, match="Resolved use_v2_model_runner must be true"):
+        run_fake_worker(
+            config,
+            FakeLLMFactory(resolved_use_v2_model_runner=False),
+        )
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "failed"
+
+
+def test_worker_is_one_shot_and_second_invocation_fails_closed(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = worker_config(tmp_path, scheduler_keys=(2,))
+    first_factory = FakeLLMFactory()
+    second_factory = FakeLLMFactory()
+    run_fake_worker(config, first_factory)
+
+    with pytest.raises(RuntimeError, match="fresh process"):
+        run_fake_worker(config, second_factory)
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "failed"
+    assert "fresh process" in payload["error"]
+    assert len(first_factory.calls) == 1
+    assert second_factory.calls == []
+
+
+def test_worker_restores_environment_and_cleans_reader_and_engine(
+    tmp_path: Path,
+    v2_runner: None,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_DYNAMIC_SD_PROFILE_METRICS", "original")
+    factory = FakeLLMFactory()
+
+    run_fake_worker(worker_config(tmp_path, scheduler_keys=(2,)), factory)
+
+    llm = factory.instances[0]
+    assert os.environ["VLLM_DYNAMIC_SD_PROFILE_METRICS"] == "original"
+    assert llm.metrics_reader_closed
+    assert llm.shutdown_calls == 1
 
 
 def test_worker_rejects_resolved_piecewise_only_mode(
@@ -610,6 +727,135 @@ def test_worker_rejects_resolved_capture_set_without_full_shape_coverage(
 
     with pytest.raises(ValueError, match="Resolved capture sizes"):
         run_fake_worker(worker_config(tmp_path), factory)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("model", "other-draft", "model"),
+        ("revision", "e" * 40, "revision"),
+        ("method", "draft_model", "method"),
+        ("draft_sample_method", "greedy", "draft_sample_method"),
+        ("rejection_sample_method", "block", "rejection_sample_method"),
+        ("num_speculative_tokens", 4, "Kmax"),
+        ("num_speculative_tokens_per_batch_size", [[1, 4, 2]], "schedule"),
+    ],
+)
+def test_worker_rejects_changed_resolved_speculative_controls(
+    tmp_path: Path,
+    v2_runner: None,
+    field: str,
+    value: object,
+    error: str,
+):
+    factory = FakeLLMFactory(resolved_speculative_overrides={field: value})
+
+    with pytest.raises(ValueError, match=error):
+        run_fake_worker(worker_config(tmp_path), factory)
+
+
+def test_worker_requires_immutable_requested_drafter_revision(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = replace(worker_config(tmp_path), speculative_revision="main")
+
+    with pytest.raises(ValueError, match="immutable.*commit"):
+        run_fake_worker(config, FakeLLMFactory())
+
+    assert json.loads(config.output_path.read_text())["status"] == "failed"
+
+
+def test_worker_rejects_mismatched_resolved_drafter_commit(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    factory = FakeLLMFactory(resolved_draft_commit="e" * 40)
+
+    with pytest.raises(ValueError, match="drafter commit"):
+        run_fake_worker(worker_config(tmp_path), factory)
+
+
+def test_worker_fails_closed_when_measured_cudagraph_metrics_are_empty(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = worker_config(tmp_path, scheduler_keys=(2,))
+
+    with pytest.raises(ValueError, match="No CUDA Graph metrics"):
+        run_fake_worker(
+            config,
+            FakeLLMFactory(emit_cudagraph_metrics=False),
+        )
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["output_tokens_per_second"] is None
+
+
+def test_worker_binds_canonical_workload_provenance_to_profile_identity(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = worker_config(tmp_path, scheduler_keys=(2,))
+
+    result = run_fake_worker(config, FakeLLMFactory())
+
+    expected_workload = {
+        "schema_version": 1,
+        "scheduler_keys": [2],
+        "prompt_token_ids": [[10, 20], [11, 21]],
+        "max_output_tokens": 4,
+        "warmups": 1,
+        "repeats": 2,
+        "sampling_parameters": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "min_tokens": 4,
+            "max_tokens": 4,
+            "ignore_eos": True,
+        },
+        "seed_provenance": {
+            "base_seed": 17,
+            "seed_stride": 4,
+            "formula": "base_seed + repeat * seed_stride + request_index",
+            "warmup_seeds": {"2": [[17, 18]]},
+            "repeat_seeds": {"2": [[17, 18], [21, 22]]},
+        },
+    }
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            expected_workload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert result.workload_identity == expected_workload
+    assert result.workload_hash == expected_hash
+    assert result.profile_identity["workload_hash"] == expected_hash
+    assert result.profile_id == profile_id(
+        ProfileIdentity.from_mapping(result.profile_identity)
+    )
+
+
+def test_worker_rejects_declared_workload_hash_not_bound_to_exact_workload(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = worker_config(tmp_path, scheduler_keys=(2,))
+    mismatched_identity = config.profile_identity.payload
+    mismatched_identity["workload_hash"] = "not-the-canonical-hash"
+    config = replace(
+        config,
+        profile_identity=ProfileIdentity.from_mapping(mismatched_identity),
+    )
+
+    with pytest.raises(ValueError, match="workload_hash"):
+        run_fake_worker(config, FakeLLMFactory())
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["workload_hash"]
 
 
 def test_worker_exact_output_work_failure_has_no_zero_throughput(
@@ -637,10 +883,12 @@ def test_worker_records_exact_work_identity_configs_and_fallback_histogram(
     result = run_fake_worker(config, factory)
 
     assert result.status == "complete"
-    assert result.profile_id == profile_id(config.profile_identity)
-    assert result.profile_identity == config.profile_identity.payload
+    assert result.profile_id == profile_id(
+        ProfileIdentity.from_mapping(result.profile_identity)
+    )
+    assert result.profile_identity["workload_hash"] == result.workload_hash
     assert result.target_revision == "target-revision"
-    assert result.speculative_revision == "draft-revision"
+    assert result.speculative_revision == DRAFT_COMMIT
     assert result.total_prompt_tokens == 8
     assert result.total_output_tokens == 16
     assert result.output_tokens_per_second is not None
@@ -660,6 +908,12 @@ def test_worker_records_exact_work_identity_configs_and_fallback_histogram(
         result.resolved_engine_config["compilation_config"]["cudagraph_mode"]
         == "FULL_AND_PIECEWISE"
     )
+    assert result.resolved_engine_config["use_v2_model_runner"] is True
+    assert result.resolved_engine_config["drafter_identity"] == {
+        "model": "draft-model",
+        "revision": DRAFT_COMMIT,
+        "commit": DRAFT_COMMIT,
+    }
     assert result.runtime_identity["python"]
     assert result.runtime_identity["vllm_package_commit"]
     assert result.runtime_identity["vllm_source_commit"]

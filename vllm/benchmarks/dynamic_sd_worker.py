@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib
 import importlib.metadata
 import json
@@ -13,6 +14,7 @@ import platform
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -23,6 +25,9 @@ from typing import Any, Literal, Protocol
 from vllm.benchmarks.dynamic_sd_core import ProfileIdentity, profile_id
 
 WorkerStatus = Literal["complete", "infeasible", "failed"]
+_PROFILE_METRICS_ENV = "VLLM_DYNAMIC_SD_PROFILE_METRICS"
+_worker_invocation_lock = threading.Lock()
+_worker_invoked = False
 
 
 @dataclass(frozen=True, order=True)
@@ -146,6 +151,8 @@ class WorkerResult:
     status: WorkerStatus
     profile_id: str
     profile_identity: dict[str, object]
+    workload_hash: str
+    workload_identity: dict[str, object]
     variant: str
     forced_k: int | None
     common_kmax: int | None
@@ -189,25 +196,90 @@ def derive_cudagraph_capture_sizes(
     return tuple(sorted({key * (k + 1) for key, k in k_by_scheduler_key.items()}))
 
 
+def workload_identity(config: WorkerConfig) -> dict[str, object]:
+    """Return the exact canonical workload and deterministic sampling inputs."""
+    max_scheduler_key = max(config.scheduler_keys)
+    seed_stride = len(config.prompt_token_ids)
+    return {
+        "schema_version": 1,
+        "scheduler_keys": list(config.scheduler_keys),
+        "prompt_token_ids": [
+            list(token_ids) for token_ids in config.prompt_token_ids[:max_scheduler_key]
+        ],
+        "max_output_tokens": config.max_tokens,
+        "warmups": config.warmups,
+        "repeats": config.repeats,
+        "sampling_parameters": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "min_tokens": config.max_tokens,
+            "max_tokens": config.max_tokens,
+            "ignore_eos": True,
+        },
+        "seed_provenance": {
+            "base_seed": config.seed,
+            "seed_stride": seed_stride,
+            "formula": "base_seed + repeat * seed_stride + request_index",
+            "warmup_seeds": {
+                str(key): [
+                    [_sampling_seed(config, warmup, index) for index in range(key)]
+                    for warmup in range(config.warmups)
+                ]
+                for key in config.scheduler_keys
+            },
+            "repeat_seeds": {
+                str(key): [
+                    [_sampling_seed(config, repeat, index) for index in range(key)]
+                    for repeat in range(config.repeats)
+                ]
+                for key in config.scheduler_keys
+            },
+        },
+    }
+
+
+def workload_hash(config: WorkerConfig) -> str:
+    """Hash the canonical workload used by this worker."""
+    canonical = json.dumps(
+        workload_identity(config), sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _bound_profile_identity(config: WorkerConfig) -> ProfileIdentity:
+    payload = config.profile_identity.payload
+    payload["workload_hash"] = workload_hash(config)
+    return ProfileIdentity.from_mapping(payload)
+
+
 def run_worker(
     config: WorkerConfig,
     llm_factory: Callable[..., Any],
     *,
     metrics_reader_factory: Callable[[Any], WorkerMetricsReader] | None = None,
 ) -> WorkerResult:
-    """Run one vanilla or forced-K profile and atomically write its result."""
+    """Run one profile in a fresh process and atomically write its result.
+
+    A process may call this function exactly once, even when that invocation
+    fails. The caller must launch every additional profile in a fresh process.
+    """
     _clear_previous_result(config.output_path)
-    _validate_preflight(config)
-    engine_kwargs = _build_engine_kwargs(config)
-    os.environ["VLLM_DYNAMIC_SD_PROFILE_METRICS"] = "1"
+    engine_kwargs: dict[str, object] = {}
+    previous_metrics_env = os.environ.get(_PROFILE_METRICS_ENV)
 
     try:
+        _claim_worker_process()
+        _validate_preflight(config)
+        engine_kwargs = _build_engine_kwargs(config)
+        os.environ[_PROFILE_METRICS_ENV] = "1"
         result = _run_measurements(
             config,
             engine_kwargs,
             llm_factory,
             metrics_reader_factory or _DefaultMetricsReader,
         )
+        write_json_atomic(config.output_path, result.to_payload())
+        return result
     except Exception as exc:
         status: WorkerStatus = (
             "infeasible" if isinstance(exc, InfeasibleWorkerError) else "failed"
@@ -217,9 +289,22 @@ def run_worker(
             _failure_payload(config, engine_kwargs, status, exc),
         )
         raise
+    finally:
+        if previous_metrics_env is None:
+            os.environ.pop(_PROFILE_METRICS_ENV, None)
+        else:
+            os.environ[_PROFILE_METRICS_ENV] = previous_metrics_env
 
-    write_json_atomic(config.output_path, result.to_payload())
-    return result
+
+def _claim_worker_process() -> None:
+    global _worker_invoked
+    with _worker_invocation_lock:
+        if _worker_invoked:
+            raise RuntimeError(
+                "Dynamic SD workers are one-shot; launch each profile in a fresh "
+                "process."
+            )
+        _worker_invoked = True
 
 
 def _clear_previous_result(path: Path) -> None:
@@ -249,6 +334,21 @@ def _validate_preflight(config: WorkerConfig) -> None:
         raise ValueError("data_parallel_size must be 1 for Dynamic SD profiling.")
     if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
         raise ValueError("Dynamic SD profiling requires VLLM_USE_V2_MODEL_RUNNER=1.")
+    if config.k is not None and not _is_full_commit_hash(config.speculative_revision):
+        raise ValueError(
+            "speculative_revision must be an immutable 40-character commit hash."
+        )
+
+    declared_workload_hash = config.profile_identity.payload.get("workload_hash")
+    canonical_workload_hash = workload_hash(config)
+    if (
+        declared_workload_hash is not None
+        and declared_workload_hash != canonical_workload_hash
+    ):
+        raise ValueError(
+            "profile_identity workload_hash is not bound to the exact canonical "
+            "worker workload."
+        )
 
     forced_k = config.k or 0
     expected_capture_sizes = derive_cudagraph_capture_sizes(
@@ -306,79 +406,116 @@ def _run_measurements(
     llm_factory: Callable[..., Any],
     metrics_reader_factory: Callable[[Any], WorkerMetricsReader],
 ) -> WorkerResult:
-    llm = llm_factory(**engine_kwargs)
-    resolved_config = _resolved_engine_config(llm)
-    _validate_resolved_config(config, resolved_config)
-    metrics_reader = metrics_reader_factory(llm)
+    llm: Any = None
+    metrics_reader: WorkerMetricsReader | None = None
+    try:
+        llm = llm_factory(**engine_kwargs)
+        resolved_config = _resolved_engine_config(llm)
+        _validate_resolved_config(config, resolved_config)
+        metrics_reader = metrics_reader_factory(llm)
 
-    measurements: list[WorkerMeasurement] = []
-    total_prompt_tokens = 0
-    total_output_tokens = 0
-    total_elapsed = 0.0
+        measurements: list[WorkerMeasurement] = []
+        total_prompt_tokens = 0
+        total_output_tokens = 0
+        total_elapsed = 0.0
 
-    for scheduler_key in config.scheduler_keys:
-        prompts = [
-            {"prompt_token_ids": list(token_ids)}
-            for token_ids in config.prompt_token_ids[:scheduler_key]
-        ]
-        for warmup in range(config.warmups):
-            llm.generate(
-                prompts,
-                _sampling_params(config, scheduler_key, warmup),
-                use_tqdm=False,
-            )
+        for scheduler_key in config.scheduler_keys:
+            prompts = [
+                {"prompt_token_ids": list(token_ids)}
+                for token_ids in config.prompt_token_ids[:scheduler_key]
+            ]
+            for warmup in range(config.warmups):
+                llm.generate(
+                    prompts,
+                    _sampling_params(config, scheduler_key, warmup),
+                    use_tqdm=False,
+                )
 
-        for repeat in range(config.repeats):
-            before = metrics_reader.snapshot()
-            started_at = time.perf_counter()
-            outputs = llm.generate(
-                prompts,
-                _sampling_params(config, scheduler_key, repeat),
-                use_tqdm=False,
-            )
-            elapsed = time.perf_counter() - started_at
-            after = metrics_reader.snapshot()
-            if elapsed <= 0:
-                raise ValueError("Measured elapsed time must be positive.")
+            for repeat in range(config.repeats):
+                before = metrics_reader.snapshot()
+                started_at = time.perf_counter()
+                outputs = llm.generate(
+                    prompts,
+                    _sampling_params(config, scheduler_key, repeat),
+                    use_tqdm=False,
+                )
+                elapsed = time.perf_counter() - started_at
+                after = metrics_reader.snapshot()
+                if elapsed <= 0:
+                    raise ValueError("Measured elapsed time must be positive.")
 
-            prompt_tokens, output_tokens = _validate_exact_work(
-                prompts, outputs, config.max_tokens
-            )
-            metric_delta = _metric_delta(before, after)
-            measurement = _build_measurement(
-                config,
-                scheduler_key,
-                repeat,
-                elapsed,
-                prompt_tokens,
-                output_tokens,
-                metric_delta,
-            )
-            measurements.append(measurement)
-            total_prompt_tokens += prompt_tokens
-            total_output_tokens += output_tokens
-            total_elapsed += elapsed
+                prompt_tokens, output_tokens = _validate_exact_work(
+                    prompts, outputs, config.max_tokens
+                )
+                metric_delta = _metric_delta(before, after)
+                measurement = _build_measurement(
+                    config,
+                    scheduler_key,
+                    repeat,
+                    elapsed,
+                    prompt_tokens,
+                    output_tokens,
+                    metric_delta,
+                )
+                measurements.append(measurement)
+                total_prompt_tokens += prompt_tokens
+                total_output_tokens += output_tokens
+                total_elapsed += elapsed
 
-    return WorkerResult(
-        status="complete",
-        profile_id=profile_id(config.profile_identity),
-        profile_identity=config.profile_identity.payload,
-        variant="vanilla" if config.k is None else f"k{config.k}",
-        forced_k=config.k,
-        common_kmax=None if config.k is None else config.kmax,
-        target_revision=config.model_revision,
-        speculative_revision=(
-            None if config.k is None else config.speculative_revision
-        ),
-        engine_kwargs=_json_compatible(engine_kwargs),
-        runtime_identity=_runtime_identity(),
-        resolved_engine_config=resolved_config,
-        measurements=tuple(measurements),
-        total_prompt_tokens=total_prompt_tokens,
-        total_output_tokens=total_output_tokens,
-        elapsed_seconds=total_elapsed,
-        output_tokens_per_second=total_output_tokens / total_elapsed,
-    )
+        bound_profile_identity = _bound_profile_identity(config)
+        return WorkerResult(
+            status="complete",
+            profile_id=profile_id(bound_profile_identity),
+            profile_identity=bound_profile_identity.payload,
+            workload_hash=workload_hash(config),
+            workload_identity=workload_identity(config),
+            variant="vanilla" if config.k is None else f"k{config.k}",
+            forced_k=config.k,
+            common_kmax=None if config.k is None else config.kmax,
+            target_revision=config.model_revision,
+            speculative_revision=(
+                None if config.k is None else config.speculative_revision
+            ),
+            engine_kwargs=_json_compatible(engine_kwargs),
+            runtime_identity=_runtime_identity(),
+            resolved_engine_config=resolved_config,
+            measurements=tuple(measurements),
+            total_prompt_tokens=total_prompt_tokens,
+            total_output_tokens=total_output_tokens,
+            elapsed_seconds=total_elapsed,
+            output_tokens_per_second=total_output_tokens / total_elapsed,
+        )
+    finally:
+        _cleanup_runtime_state(metrics_reader, llm)
+
+
+def _cleanup_runtime_state(
+    metrics_reader: WorkerMetricsReader | None, llm: Any
+) -> None:
+    cleanup_error: Exception | None = None
+    close = getattr(metrics_reader, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            cleanup_error = exc
+
+    if llm is not None:
+        engine = getattr(llm, "llm_engine", None)
+        engine_core = getattr(engine, "engine_core", None)
+        for owner in (llm, engine, engine_core):
+            shutdown = getattr(owner, "shutdown", None)
+            if not callable(shutdown):
+                continue
+            try:
+                shutdown()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            break
+
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _sampling_params(
@@ -390,13 +527,17 @@ def _sampling_params(
         SamplingParams(
             temperature=1.0,
             top_p=1.0,
-            seed=config.seed + repeat * len(config.prompt_token_ids) + index,
+            seed=_sampling_seed(config, repeat, index),
             min_tokens=config.max_tokens,
             max_tokens=config.max_tokens,
             ignore_eos=True,
         )
         for index in range(scheduler_key)
     ]
+
+
+def _sampling_seed(config: WorkerConfig, repeat: int, request_index: int) -> int:
+    return config.seed + repeat * len(config.prompt_token_ids) + request_index
 
 
 def _validate_exact_work(
@@ -471,6 +612,8 @@ def _build_measurement(
     requested_steps = metrics.scheduler_steps.get((scheduler_key, requested_k), 0)
     if measured_steps <= 0:
         raise ValueError("No scheduler-key metrics were recorded for the point.")
+    if not metrics.cudagraph_steps:
+        raise ValueError("No CUDA Graph metrics were recorded for the point.")
     scheduler_key_coverage = requested_steps / measured_steps
     if scheduler_key_coverage < 0.95:
         raise ValueError(
@@ -521,15 +664,44 @@ def _resolved_engine_config(llm: Any) -> dict[str, object]:
         "compilation_config",
         "speculative_config",
     )
-    return {
+    resolved = {
         section: _json_compatible(getattr(vllm_config, section, None))
         for section in sections
     }
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    resolved["use_v2_model_runner"] = _json_compatible(
+        getattr(vllm_config, "use_v2_model_runner", None)
+    )
+    resolved["drafter_identity"] = _resolved_drafter_identity(speculative_config)
+    return resolved
+
+
+def _resolved_drafter_identity(speculative_config: Any) -> dict[str, object] | None:
+    if speculative_config is None:
+        return None
+    draft_model_config = _config_field(speculative_config, "draft_model_config")
+    if draft_model_config is None:
+        return None
+    hf_config = _config_field(draft_model_config, "hf_config")
+    return {
+        "model": _json_compatible(_config_field(draft_model_config, "model")),
+        "revision": _json_compatible(_config_field(draft_model_config, "revision")),
+        "commit": _json_compatible(_config_field(hf_config, "_commit_hash")),
+    }
+
+
+def _config_field(config: Any, field_name: str) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(field_name)
+    return getattr(config, field_name, None)
 
 
 def _validate_resolved_config(
     config: WorkerConfig, resolved: Mapping[str, object]
 ) -> None:
+    if resolved.get("use_v2_model_runner") is not True:
+        raise ValueError("Resolved use_v2_model_runner must be true.")
+
     parallel = _require_mapping(resolved, "parallel_config")
     if parallel.get("data_parallel_size") != 1:
         raise ValueError("Resolved data_parallel_size must be 1.")
@@ -561,15 +733,58 @@ def _validate_resolved_config(
     if config.k is None:
         if speculative is not None:
             raise ValueError("Vanilla worker resolved a speculative configuration.")
+        if resolved.get("drafter_identity") is not None:
+            raise ValueError("Vanilla worker resolved a drafter identity.")
         return
     if not isinstance(speculative, Mapping):
         raise ValueError("Speculative worker did not resolve speculative_config.")
+
+    expected_controls = {
+        "model": config.speculative_model,
+        "revision": config.speculative_revision,
+        "method": config.speculative_method,
+        "draft_sample_method": "probabilistic",
+        "rejection_sample_method": "standard",
+    }
+    for field_name, expected in expected_controls.items():
+        actual = speculative.get(field_name)
+        if field_name in {
+            "method",
+            "draft_sample_method",
+            "rejection_sample_method",
+        }:
+            actual = _enum_name(actual)
+        if actual != expected:
+            raise ValueError(
+                f"Resolved speculative {field_name} changed: expected "
+                f"{expected!r}, got {actual!r}."
+            )
     if speculative.get("num_speculative_tokens") != config.kmax:
         raise ValueError("Resolved speculative config changed common Kmax.")
     expected_schedule = [[1, max(config.scheduler_keys), config.k]]
     resolved_schedule = speculative.get("num_speculative_tokens_per_batch_size")
     if _json_compatible(resolved_schedule) != expected_schedule:
         raise ValueError("Resolved speculative config changed the forced-K schedule.")
+
+    drafter = _require_mapping(resolved, "drafter_identity")
+    if drafter.get("model") != config.speculative_model:
+        raise ValueError("Resolved drafter model does not match the requested model.")
+    if drafter.get("revision") != config.speculative_revision:
+        raise ValueError(
+            "Resolved drafter revision does not match the requested immutable revision."
+        )
+    if drafter.get("commit") != config.speculative_revision:
+        raise ValueError(
+            "Resolved drafter commit does not match the requested immutable commit."
+        )
+
+
+def _is_full_commit_hash(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _require_mapping(mapping: Mapping[str, object], key: str) -> Mapping[str, object]:
@@ -585,10 +800,13 @@ def _failure_payload(
     status: WorkerStatus,
     error: Exception,
 ) -> dict[str, object]:
+    bound_profile_identity = _bound_profile_identity(config)
     return {
         "status": status,
-        "profile_id": profile_id(config.profile_identity),
-        "profile_identity": config.profile_identity.payload,
+        "profile_id": profile_id(bound_profile_identity),
+        "profile_identity": bound_profile_identity.payload,
+        "workload_hash": workload_hash(config),
+        "workload_identity": workload_identity(config),
         "variant": "vanilla" if config.k is None else f"k{config.k}",
         "forced_k": config.k,
         "common_kmax": None if config.k is None else config.kmax,
@@ -732,6 +950,11 @@ class _DefaultMetricsReader:
         if not isinstance(stat_loggers, list):
             raise ValueError("LLM does not expose an enabled statistics logger.")
         stat_loggers.append(self.cudagraph_collector)
+        self.stat_loggers = stat_loggers
+
+    def close(self) -> None:
+        if self.cudagraph_collector in self.stat_loggers:
+            self.stat_loggers.remove(self.cudagraph_collector)
 
     def snapshot(self) -> WorkerMetricSnapshot:
         scheduler_steps: dict[tuple[int, int], int] = {}
