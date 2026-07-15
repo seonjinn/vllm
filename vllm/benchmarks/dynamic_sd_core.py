@@ -17,26 +17,39 @@ from typing import Literal
 MeasurementStatus = Literal["complete", "infeasible", "failed"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ProfileIdentity:
     """Stable, JSON-compatible identity for a Dynamic SD profile."""
 
-    payload: dict[str, object]
+    _serialized_payload: str = field(repr=False)
 
-    @classmethod
-    def from_mapping(cls, payload: Mapping[str, object]) -> ProfileIdentity:
-        """Create an identity detached from the caller's mutable mapping."""
+    def __init__(self, payload: Mapping[str, object]) -> None:
         if not all(isinstance(key, str) for key in payload):
             raise ValueError("Profile identity keys must be strings.")
         try:
-            serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            serialized = json.dumps(
+                dict(payload),
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 "Profile identity payload must be JSON-compatible."
             ) from exc
-        decoded = json.loads(serialized)
+        object.__setattr__(self, "_serialized_payload", serialized)
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object]) -> ProfileIdentity:
+        """Create an identity detached from the caller's mutable mapping."""
+        return cls(payload)
+
+    @property
+    def payload(self) -> dict[str, object]:
+        """Return a detached JSON-compatible representation."""
+        decoded = json.loads(self._serialized_payload)
         assert isinstance(decoded, dict)
-        return cls(payload=decoded)
+        return decoded
 
 
 @dataclass(frozen=True)
@@ -76,32 +89,31 @@ class Measurement:
 class SelectionPolicy:
     """Thresholds and profiling grid used for Dynamic SD selection."""
 
-    configured_ks: tuple[int, ...] | None = None
+    configured_ks: tuple[int, ...] = (0, 1, 2, 3, 4, 5)
     within_best_fraction: float = 0.02
     min_enable_gain: float = 0.05
     max_cv: float = 0.05
     confidence_level: float = 0.95
-    _requires_complete_grid: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         configured_ks = self.configured_ks
-        object.__setattr__(self, "_requires_complete_grid", configured_ks is not None)
-        if configured_ks is None:
-            configured_ks = (0, 1, 2, 3, 4, 5)
-            object.__setattr__(self, "configured_ks", configured_ks)
         if not configured_ks:
             raise ValueError("configured_ks must not be empty.")
         if len(set(configured_ks)) != len(configured_ks):
             raise ValueError("configured_ks must not contain duplicates.")
         if any(k < 0 for k in configured_ks):
             raise ValueError("configured_ks must be non-negative.")
-        if self.within_best_fraction < 0:
-            raise ValueError("within_best_fraction must be non-negative.")
-        if self.min_enable_gain < 0:
-            raise ValueError("min_enable_gain must be non-negative.")
-        if self.max_cv < 0:
-            raise ValueError("max_cv must be non-negative.")
-        if not 0 < self.confidence_level < 1:
+        fractional_thresholds = {
+            "within_best_fraction": self.within_best_fraction,
+            "min_enable_gain": self.min_enable_gain,
+            "max_cv": self.max_cv,
+        }
+        for name, value in fractional_thresholds.items():
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be a finite fraction in [0, 1].")
+        if not math.isfinite(self.confidence_level) or not (
+            0 < self.confidence_level < 1
+        ):
             raise ValueError("confidence_level must be between zero and one.")
 
 
@@ -134,7 +146,6 @@ def select_schedule(
     if not measurements:
         raise ValueError("At least one measurement is required.")
     configured_ks = policy.configured_ks
-    assert configured_ks is not None
 
     rows_by_scheduler_key: dict[int, list[Measurement]] = defaultdict(list)
     for measurement in measurements:
@@ -149,21 +160,20 @@ def select_schedule(
     infeasible_ks: dict[int, tuple[int, ...]] = {}
     median_throughputs: dict[int, dict[int, float]] = {}
     gain_intervals: dict[int, dict[int, tuple[float, float]]] = {}
+    requires_k_extension = False
 
     for scheduler_key in sorted(rows_by_scheduler_key):
         key_result = _select_scheduler_key(rows_by_scheduler_key[scheduler_key], policy)
         infeasible_ks[scheduler_key] = key_result.infeasible_ks
         median_throughputs[scheduler_key] = key_result.median_throughputs
         gain_intervals[scheduler_key] = key_result.gain_intervals
+        requires_k_extension |= key_result.requires_k_extension
         if key_result.selected_k is not None:
             selected_k[scheduler_key] = key_result.selected_k
 
     return SelectionResult(
         selected_k=selected_k,
-        requires_k_extension=any(
-            selected == max(configured_ks) and selected > 0
-            for selected in selected_k.values()
-        ),
+        requires_k_extension=requires_k_extension,
         infeasible_ks=infeasible_ks,
         median_throughputs=median_throughputs,
         gain_intervals=gain_intervals,
@@ -173,6 +183,7 @@ def select_schedule(
 @dataclass(frozen=True)
 class _SchedulerKeySelection:
     selected_k: int | None
+    requires_k_extension: bool
     infeasible_ks: tuple[int, ...]
     median_throughputs: dict[int, float]
     gain_intervals: dict[int, tuple[float, float]]
@@ -195,15 +206,8 @@ def _select_scheduler_key(
 
     complete_by_k: dict[int, dict[int, float]] = {}
     infeasible: list[int] = []
-    highest_measured_k = max(rows_by_k)
     configured_ks = policy.configured_ks
-    assert configured_ks is not None
-    required_ks = (
-        configured_ks
-        if policy._requires_complete_grid
-        else tuple(k for k in configured_ks if k <= highest_measured_k)
-    )
-    for k in required_ks:
+    for k in configured_ks:
         rows = rows_by_k.get(k)
         if not rows:
             raise ValueError(f"scheduler key {scheduler_key} missing K={k}.")
@@ -223,16 +227,27 @@ def _select_scheduler_key(
         complete_by_k[k] = _complete_repeats(rows, scheduler_key, k, policy)
 
     if not complete_by_k:
-        return _SchedulerKeySelection(None, tuple(infeasible), {}, {})
+        return _SchedulerKeySelection(None, False, tuple(infeasible), {}, {})
 
     repeat_sets = {frozenset(repeats) for repeats in complete_by_k.values()}
     if len(repeat_sets) != 1:
         raise ValueError(f"scheduler key {scheduler_key} requires paired repeats.")
+    repeat_ids = next(iter(repeat_sets))
+    if len(repeat_ids) < 3:
+        raise ValueError(
+            f"scheduler key {scheduler_key} requires at least three paired "
+            "complete repeats."
+        )
 
     medians = {
         k: statistics.median(repeats.values()) for k, repeats in complete_by_k.items()
     }
     best_throughput = max(medians.values())
+    maximum_configured_k = max(configured_ks)
+    requires_k_extension = (
+        maximum_configured_k > 0
+        and medians.get(maximum_configured_k) == best_throughput
+    )
     candidates = [
         k
         for k, throughput in medians.items()
@@ -247,14 +262,21 @@ def _select_scheduler_key(
         for k, repeats in complete_by_k.items():
             if k == 0:
                 continue
-            gains = [
-                repeats[repeat] / baseline[repeat] - 1 for repeat in sorted(repeats)
-            ]
-            intervals[k] = _bootstrap_interval(gains, policy.confidence_level)
+            intervals[k] = _bootstrap_paired_median_gain_interval(
+                baseline,
+                repeats,
+                policy.confidence_level,
+            )
         if selected != 0 and intervals[selected][0] < policy.min_enable_gain:
             selected = 0
 
-    return _SchedulerKeySelection(selected, tuple(infeasible), medians, intervals)
+    return _SchedulerKeySelection(
+        selected,
+        requires_k_extension,
+        tuple(infeasible),
+        medians,
+        intervals,
+    )
 
 
 def _complete_repeats(
@@ -280,19 +302,31 @@ def _complete_repeats(
     return repeats
 
 
-def _bootstrap_interval(
-    values: Sequence[float], confidence_level: float, *, samples: int = 2_000
+def _bootstrap_paired_median_gain_interval(
+    baseline: Mapping[int, float],
+    candidate: Mapping[int, float],
+    confidence_level: float,
+    *,
+    samples: int = 2_000,
 ) -> tuple[float, float]:
     random_generator = random.Random(0)
-    count = len(values)
-    medians = sorted(
-        statistics.median(random_generator.choices(values, k=count))
-        for _ in range(samples)
-    )
+    repeat_ids = sorted(baseline)
+    count = len(repeat_ids)
+    gains: list[float] = []
+    for _ in range(samples):
+        sampled_repeat_ids = random_generator.choices(repeat_ids, k=count)
+        baseline_median = statistics.median(
+            baseline[repeat] for repeat in sampled_repeat_ids
+        )
+        candidate_median = statistics.median(
+            candidate[repeat] for repeat in sampled_repeat_ids
+        )
+        gains.append(candidate_median / baseline_median - 1)
+    gains.sort()
     tail_probability = (1 - confidence_level) / 2
     return (
-        _quantile(medians, tail_probability),
-        _quantile(medians, 1 - tail_probability),
+        _quantile(gains, tail_probability),
+        _quantile(gains, 1 - tail_probability),
     )
 
 
