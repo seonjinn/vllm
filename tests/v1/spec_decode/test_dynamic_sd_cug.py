@@ -149,6 +149,76 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
             assert desc.num_active_loras == 0
 
 
+def test_dynamic_sd_draft_decode_manager_keeps_single_token_shapes(monkeypatch):
+    """DynamicSD must not expand shapes for the drafter's one-token decode."""
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=64,
+        max_spec_tokens=5,
+        num_spec_per_batch_size=[
+            (1, 4, 5),
+            (5, 8, 3),
+            (9, 16, 1),
+            (17, 64, 0),
+        ],
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=1,
+        use_dynamic_decode_shapes=False,
+    )
+
+    capture_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert capture_descs
+    assert {desc.uniform_token_count for desc in capture_descs} == {1}
+    assert all(
+        desc.num_reqs is not None and desc.num_reqs > 0 for desc in capture_descs
+    )
+
+
+def test_dynamic_sd_max_k_one_keeps_verification_shapes(monkeypatch):
+    """K=1 verification still needs separate K=0 and K=1 graph shapes."""
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=64,
+        max_spec_tokens=1,
+        num_spec_per_batch_size=[(1, 32, 1), (33, 64, 0)],
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=2,
+    )
+
+    capture_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert {desc.uniform_token_count for desc in capture_descs} == {1, 2}
+
+
 def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
     """DSD should use PIECEWISE when the batch is not a uniform decode batch.
 
