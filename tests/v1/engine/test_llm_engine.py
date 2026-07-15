@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import random
 from typing import TYPE_CHECKING
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
 from vllm import LLM
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.engine.output_processor import OutputProcessorOutput
 from vllm.v1.metrics.reader import Counter, Gauge, Histogram, Metric, Vector
+from vllm.v1.metrics.stats import SchedulerStats
 
 if TYPE_CHECKING:
     from tests.conftest import VllmRunner
@@ -16,6 +21,66 @@ else:
 
 MODEL = "facebook/opt-125m"
 DTYPE = "half"
+
+
+def _make_mock_engine(
+    scheduler_stats: SchedulerStats | None,
+    *,
+    log_stats: bool = True,
+) -> LLMEngine:
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.should_execute_dummy_batch = False
+    engine.log_stats = log_stats
+    engine.engine_core = MagicMock()
+    engine.engine_core.get_output.return_value = EngineCoreOutputs(
+        outputs=[], scheduler_stats=scheduler_stats
+    )
+    engine.output_processor = MagicMock()
+    engine.output_processor.process_outputs.return_value = OutputProcessorOutput(
+        request_outputs=[], reqs_to_abort=[]
+    )
+    engine.logger_manager = MagicMock() if log_stats else None
+    engine.renderer = MagicMock()
+    engine.do_log_stats_with_interval = MagicMock()
+    return engine
+
+
+@pytest.mark.cpu_test
+def test_step_records_scheduler_stats_without_request_outputs():
+    scheduler_stats = SchedulerStats(num_scheduled_reqs=1)
+    engine = _make_mock_engine(scheduler_stats)
+
+    assert engine.step() == []
+
+    assert engine.logger_manager is not None
+    engine.logger_manager.record.assert_called_once_with(
+        scheduler_stats=scheduler_stats,
+        iteration_stats=ANY,
+        mm_cache_stats=engine.renderer.stat_mm_cache.return_value,
+    )
+    engine.do_log_stats_with_interval.assert_called_once_with()
+
+
+@pytest.mark.cpu_test
+def test_step_skips_stats_recording_without_scheduler_stats():
+    engine = _make_mock_engine(None)
+
+    assert engine.step() == []
+
+    assert engine.logger_manager is not None
+    engine.logger_manager.record.assert_not_called()
+    engine.renderer.stat_mm_cache.assert_not_called()
+    engine.do_log_stats_with_interval.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_step_avoids_stats_work_when_logging_is_disabled():
+    engine = _make_mock_engine(SchedulerStats(num_scheduled_reqs=1), log_stats=False)
+
+    assert engine.step() == []
+
+    engine.renderer.stat_mm_cache.assert_not_called()
+    engine.do_log_stats_with_interval.assert_not_called()
 
 
 def _vllm_model(
