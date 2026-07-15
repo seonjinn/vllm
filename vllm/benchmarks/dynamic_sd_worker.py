@@ -297,14 +297,19 @@ def run_worker(
         write_json_atomic(config.output_path, result.to_payload())
         return result
     except Exception as exc:
+        classified_error = _classify_candidate_error(config, exc)
         status: WorkerStatus = (
-            "infeasible" if isinstance(exc, InfeasibleWorkerError) else "failed"
+            "infeasible"
+            if isinstance(classified_error, InfeasibleWorkerError)
+            else "failed"
         )
         write_json_atomic(
             config.output_path,
-            _failure_payload(config, engine_kwargs, status, exc),
+            _failure_payload(config, engine_kwargs, status, classified_error),
         )
-        raise
+        if classified_error is exc:
+            raise
+        raise classified_error from exc
     finally:
         if previous_metrics_env is None:
             os.environ.pop(_PROFILE_METRICS_ENV, None)
@@ -326,6 +331,22 @@ def _claim_worker_process() -> None:
 def _clear_previous_result(path: Path) -> None:
     path.unlink(missing_ok=True)
     path.with_suffix(path.suffix + ".tmp").unlink(missing_ok=True)
+
+
+def _classify_candidate_error(config: WorkerConfig, error: Exception) -> Exception:
+    if config.k is None or isinstance(error, InfeasibleWorkerError):
+        return error
+    message = str(error).lower()
+    memory_failure = error.__class__.__name__ == "OutOfMemoryError" or any(
+        marker in message
+        for marker in (
+            "cuda out of memory",
+            "no available memory for the cache blocks",
+        )
+    )
+    if memory_failure:
+        return InfeasibleWorkerError(str(error))
+    return error
 
 
 def write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
@@ -719,6 +740,13 @@ def _build_measurement(
         raise ValueError("No scheduler-key metrics were recorded for the point.")
     if not metrics.cudagraph_steps:
         raise ValueError("No CUDA Graph metrics were recorded for the point.")
+    expected_rows = scheduler_key * (requested_k + 1)
+    expected_full_step = CUDAGraphStep(expected_rows, expected_rows, "FULL")
+    if metrics.cudagraph_steps.get(expected_full_step, 0) <= 0:
+        raise ValueError(
+            "No expected FULL CUDA Graph execution was recorded for "
+            f"B={scheduler_key}, K={requested_k}, rows={expected_rows}."
+        )
     scheduler_key_coverage = requested_steps / measured_steps
     if scheduler_key_coverage < 0.95:
         raise ValueError(

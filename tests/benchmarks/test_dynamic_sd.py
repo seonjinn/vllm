@@ -314,6 +314,7 @@ class FakeLLM:
         output_token_delta: int = 0,
         scheduler_noise: bool = False,
         fallback_steps: int = 0,
+        emit_full_cudagraph_metrics: bool = True,
         emit_cudagraph_metrics: bool = True,
         resolved_cudagraph_mode: str | None = None,
         resolved_capture_sizes: tuple[int, ...] | None = None,
@@ -330,6 +331,7 @@ class FakeLLM:
         self.output_token_delta = output_token_delta
         self.scheduler_noise = scheduler_noise
         self.fallback_steps = fallback_steps
+        self.emit_full_cudagraph_metrics = emit_full_cudagraph_metrics
         self.emit_cudagraph_metrics = emit_cudagraph_metrics
         self.scheduler_steps: dict[tuple[int, int], int] = {}
         self.cudagraph_steps: dict[CUDAGraphStep, int] = {}
@@ -417,8 +419,11 @@ class FakeLLM:
 
         num_tokens = scheduler_key * (k + 1)
         if self.emit_cudagraph_metrics:
-            full_step = CUDAGraphStep(num_tokens, num_tokens, "FULL")
-            self.cudagraph_steps[full_step] = self.cudagraph_steps.get(full_step, 0) + 1
+            if self.emit_full_cudagraph_metrics:
+                full_step = CUDAGraphStep(num_tokens, num_tokens, "FULL")
+                self.cudagraph_steps[full_step] = (
+                    self.cudagraph_steps.get(full_step, 0) + 1
+                )
             if self.fallback_steps:
                 fallback = CUDAGraphStep(num_tokens, num_tokens, "PIECEWISE")
                 self.cudagraph_steps[fallback] = (
@@ -961,6 +966,45 @@ def test_worker_records_exact_work_identity_configs_and_fallback_histogram(
     assert result.runtime_identity["vllm_package_commit"]
     assert result.runtime_identity["vllm_source_commit"]
     assert json.loads(config.output_path.read_text())["status"] == "complete"
+
+
+def test_worker_rejects_measurement_without_expected_full_cudagraph(
+    tmp_path: Path,
+    v2_runner: None,
+):
+    config = worker_config(tmp_path, k=3, scheduler_keys=(2,))
+    factory = FakeLLMFactory(
+        emit_full_cudagraph_metrics=False,
+        fallback_steps=1,
+    )
+
+    with pytest.raises(ValueError, match="expected FULL CUDA Graph"):
+        run_fake_worker(config, factory)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA out of memory while capturing graph",
+        "No available memory for the cache blocks",
+    ],
+)
+def test_speculative_candidate_memory_failure_is_infeasible(
+    tmp_path: Path,
+    v2_runner: None,
+    message: str,
+):
+    config = worker_config(tmp_path, k=3)
+
+    def failing_factory(**engine_kwargs: Any) -> FakeLLM:
+        del engine_kwargs
+        raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match=message):
+        run_worker(config, failing_factory)
+
+    payload = json.loads(config.output_path.read_text())
+    assert payload["status"] == "infeasible"
 
 
 def test_atomic_write_failure_leaves_no_result_or_temporary_file(

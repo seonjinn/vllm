@@ -42,6 +42,13 @@ def _profile_argv(tmp_path: Path) -> list[str]:
         "1",
         "--data-parallel-size",
         "1",
+        "--engine-kwargs-json",
+        (
+            '{"dtype":"bfloat16","enable_chunked_prefill":true,'
+            '"enable_prefix_caching":true,"gpu_memory_utilization":0.4,'
+            '"kv_cache_dtype":"auto","max_model_len":8192,'
+            '"max_num_batched_tokens":2048,"moe_backend":"triton"}'
+        ),
         "--scheduler-batch-sizes",
         "1,2,4",
         "--k-values",
@@ -93,10 +100,21 @@ def test_dynamic_sd_profile_cli_contract_and_normalization(tmp_path: Path):
     assert profile.k_values == (0, 1, 2, 3)
     assert profile.common_kmax == 3
     assert profile.enforce_eager is False
+    assert profile.engine_kwargs == {
+        "dtype": "bfloat16",
+        "enable_chunked_prefill": True,
+        "enable_prefix_caching": True,
+        "gpu_memory_utilization": 0.4,
+        "kv_cache_dtype": "auto",
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 2048,
+        "moe_backend": "triton",
+    }
     assert DYNAMIC_SD_PROFILE_CONTRACT_VERSION == 1
     assert (
         frozenset(
             {
+                "deployment_engine_identity",
                 "external_ray_cluster",
                 "fixed_output_calibration",
                 "full_and_piecewise_capture",
@@ -120,7 +138,30 @@ def test_profile_builds_runtime_k_grid_with_common_kmax(tmp_path: Path):
     assert configs[0].cudagraph_capture_sizes == (1, 2, 4)
     assert configs[-1].cudagraph_capture_sizes == (4, 8, 16)
     assert configs[-1].engine_kwargs["tensor_parallel_size"] == 8
+    assert configs[-1].engine_kwargs["max_model_len"] == 8192
+    assert configs[-1].engine_kwargs["gpu_memory_utilization"] == 0.4
+    assert configs[-1].profile_identity.payload["engine_kwargs"] == {
+        "dtype": "bfloat16",
+        "enable_chunked_prefill": True,
+        "enable_prefix_caching": True,
+        "gpu_memory_utilization": 0.4,
+        "kv_cache_dtype": "auto",
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 2048,
+        "moe_backend": "triton",
+    }
     assert configs[-1].draft_tensor_parallel_size == 1
+
+
+def test_profile_rejects_non_object_engine_kwargs_json(tmp_path: Path):
+    parser = argparse.ArgumentParser()
+    BenchmarkDynamicSDSubcommand.add_cli_args(parser)
+    argv = _profile_argv(tmp_path)
+    value_index = argv.index("--engine-kwargs-json") + 1
+    argv[value_index] = "[]"
+
+    with pytest.raises(ValueError, match="JSON object"):
+        ProfileArgs.from_namespace(parser.parse_args(argv))
 
 
 def _write_raw_grid(tmp_path: Path, throughputs: dict[int, float]) -> Path:

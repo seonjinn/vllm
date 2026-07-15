@@ -36,6 +36,7 @@ from vllm.v1.spec_decode.dynamic.utils import (
 DYNAMIC_SD_PROFILE_CONTRACT_VERSION = 1
 DYNAMIC_SD_PROFILE_CAPABILITIES = frozenset(
     {
+        "deployment_engine_identity",
         "external_ray_cluster",
         "fixed_output_calibration",
         "full_and_piecewise_capture",
@@ -56,6 +57,7 @@ class ProfileArgs:
     tensor_parallel_size: int
     draft_tensor_parallel_size: int
     data_parallel_size: int
+    engine_kwargs: Mapping[str, object]
     scheduler_keys: tuple[int, ...]
     k_values: tuple[int, ...]
     common_kmax: int
@@ -93,6 +95,7 @@ class ProfileArgs:
             tensor_parallel_size=namespace.tensor_parallel_size,
             draft_tensor_parallel_size=namespace.draft_tensor_parallel_size,
             data_parallel_size=namespace.data_parallel_size,
+            engine_kwargs=_parse_engine_kwargs_json(namespace.engine_kwargs_json),
             scheduler_keys=scheduler_keys,
             k_values=k_values,
             common_kmax=namespace.common_kmax,
@@ -154,6 +157,10 @@ class ProfileArgs:
             raise ValueError("Invalid token or warmup count.")
         if self.tensor_parallel_size <= 0 or self.draft_tensor_parallel_size <= 0:
             raise ValueError("Tensor parallel sizes must be positive.")
+        if "tensor_parallel_size" in self.engine_kwargs:
+            raise ValueError(
+                "engine-kwargs-json must not override tensor_parallel_size."
+            )
 
 
 def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -181,6 +188,7 @@ def _add_profile_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tensor-parallel-size", type=int, required=True)
     parser.add_argument("--draft-tensor-parallel-size", type=int, required=True)
     parser.add_argument("--data-parallel-size", type=int, default=1)
+    parser.add_argument("--engine-kwargs-json", default="{}")
     parser.add_argument("--scheduler-batch-sizes", required=True)
     parser.add_argument("--k-values", required=True)
     parser.add_argument("--common-kmax", type=int, required=True)
@@ -233,7 +241,10 @@ def build_worker_configs(profile: ProfileArgs) -> list[WorkerConfig]:
         "repeats": profile.repeats,
         "seed": profile.seed,
         "data_parallel_size": profile.data_parallel_size,
-        "engine_kwargs": {"tensor_parallel_size": profile.tensor_parallel_size},
+        "engine_kwargs": {
+            **profile.engine_kwargs,
+            "tensor_parallel_size": profile.tensor_parallel_size,
+        },
         "draft_tensor_parallel_size": profile.draft_tensor_parallel_size,
         "temperature": profile.temperature,
         "top_p": profile.top_p,
@@ -551,6 +562,7 @@ def _profile_identity(profile: ProfileArgs) -> dict[str, object]:
         "tensor_parallel_size": profile.tensor_parallel_size,
         "draft_tensor_parallel_size": profile.draft_tensor_parallel_size,
         "data_parallel_size": profile.data_parallel_size,
+        "engine_kwargs": dict(profile.engine_kwargs),
         "scheduler_keys": list(profile.scheduler_keys),
         "configured_ks": list(profile.k_values),
         "common_kmax": profile.common_kmax,
@@ -624,6 +636,16 @@ def _parse_bool(value: str) -> bool:
     if normalized == "false":
         return False
     raise argparse.ArgumentTypeError("expected true or false")
+
+
+def _parse_engine_kwargs_json(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"engine-kwargs-json is invalid JSON: {error}") from None
+    if not isinstance(parsed, dict) or any(not isinstance(key, str) for key in parsed):
+        raise ValueError("engine-kwargs-json must be a JSON object with string keys.")
+    return parsed
 
 
 def _sha256(path: Path) -> str:
