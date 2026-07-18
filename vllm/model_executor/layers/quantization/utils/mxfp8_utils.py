@@ -317,7 +317,7 @@ def _mxfp8_trtllm_adaptive_linear_impl(
         use_8x4_sf_layout=use_8x4_sf_layout,
         backend="trtllm",
     )
-    return output[:, :output_features]
+    return output[:, :output_features].contiguous()
 
 
 def mxfp8_trtllm_adaptive_linear(
