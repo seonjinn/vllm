@@ -104,7 +104,9 @@ def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:
 
 
 @pytest.mark.parametrize(("m", "n"), [(4, 512), (64, 520)])
-def test_mxfp8_trtllm_linear_matches_bf16(m: int, n: int) -> None:
+def test_mxfp8_trtllm_linear_matches_bf16(
+    m: int, n: int, default_vllm_config: object
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
