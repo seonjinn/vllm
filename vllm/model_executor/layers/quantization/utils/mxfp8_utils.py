@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -302,6 +303,7 @@ def _mxfp8_trtllm_linear_fixed_impl(
     use_8x4_sf_layout: bool,
 ) -> torch.Tensor:
     from flashinfer import SfLayout
+    from flashinfer import autotune as flashinfer_autotune
     from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 
@@ -312,15 +314,23 @@ def _mxfp8_trtllm_linear_fixed_impl(
         backend="cuda",
         sf_swizzle_layout=sf_layout,
     )
-    output = flashinfer_mm_mxfp8(
-        input_mxfp8,
-        weight.t(),
-        input_scale,
-        weight_scale,
-        out_dtype=torch.bfloat16,
-        use_8x4_sf_layout=use_8x4_sf_layout,
-        backend="trtllm",
+    # High-M TRTLLM tactics that win isolated tuning can stall mixed serving
+    # schedules. Keep low-M tuning, but use the fallback tactic for 128x4.
+    autotune_context = (
+        nullcontext()
+        if use_8x4_sf_layout
+        else flashinfer_autotune(skip_ops={"mxfp8_gemm"})
     )
+    with autotune_context:
+        output = flashinfer_mm_mxfp8(
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype=torch.bfloat16,
+            use_8x4_sf_layout=use_8x4_sf_layout,
+            backend="trtllm",
+        )
     return output[:, :output_features].contiguous()
 
 
