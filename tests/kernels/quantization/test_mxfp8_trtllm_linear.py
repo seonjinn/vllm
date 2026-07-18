@@ -11,8 +11,13 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferTrtllmMxfp8LinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_TRTLLM_HIGH_M_TACTIC_ENV,
+    MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV,
     _mxfp8_layout_for_compile_range,
+    _parse_mxfp8_tactic_hints,
+    _resolve_mxfp8_high_m_tactic,
     _specialize_mxfp8_adaptive_layout_graph,
+    mxfp8_trtllm_high_m_static_tactics_enabled,
     mxfp8_trtllm_scale_numel,
     mxfp8_trtllm_use_8x4_sf_layout,
 )
@@ -59,6 +64,33 @@ def test_mxfp8_layout_compile_ranges_do_not_straddle_switch() -> None:
     assert not _mxfp8_layout_for_compile_range(257, 8480, 256)
     with pytest.raises(RuntimeError, match="straddles"):
         _mxfp8_layout_for_compile_range(1, 2048, 256)
+
+
+def test_mxfp8_high_m_tactic_hints_use_logical_shape() -> None:
+    hints = _parse_mxfp8_tactic_hints(
+        "1000,8768,8192:92;4004,8192,4096:91"
+    )
+    assert hints == {
+        (1000, 8768, 8192): 92,
+        (4004, 8192, 4096): 91,
+    }
+
+
+def test_mxfp8_high_m_tactic_exact_hit_and_global_fallback() -> None:
+    hints = {(1000, 8768, 8192): 92}
+    assert _resolve_mxfp8_high_m_tactic(1000, 8768, 8192, hints, -1) == 92
+    assert _resolve_mxfp8_high_m_tactic(2002, 8768, 8192, hints, 91) == 91
+
+
+def test_mxfp8_high_m_static_tactics_are_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, raising=False)
+    monkeypatch.delenv(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, raising=False)
+    assert not mxfp8_trtllm_high_m_static_tactics_enabled()
+
+    monkeypatch.setenv(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, "92")
+    assert mxfp8_trtllm_high_m_static_tactics_enabled()
 
 
 @pytest.mark.parametrize(

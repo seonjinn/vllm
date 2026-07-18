@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_e4m3_quantize,
     mxfp8_trtllm_adaptive_linear,
+    prepare_mxfp8_trtllm_high_m_tactic_state,
     swizzle_mxfp8_scale,
 )
 from vllm.platforms import current_platform
@@ -240,6 +241,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         layer.weight = Parameter(shuffled_weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(shuffled_scale.contiguous(), requires_grad=False)
         layer._mxfp8_trtllm_output_features = n
+        prepare_mxfp8_trtllm_high_m_tactic_state(layer.weight.device)
 
     def apply_weights(
         self,

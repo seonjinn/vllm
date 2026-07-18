@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -14,6 +15,10 @@ MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
 MXFP8_TRTLLM_8X4_MAX_M = 256
+MXFP8_TRTLLM_HIGH_M_TACTIC_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC"
+MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV = (
+    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
+)
 
 
 def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
@@ -28,6 +33,135 @@ def mxfp8_trtllm_scale_numel(m: int, k: int, use_8x4: bool) -> int:
     scale_k = k // MXFP8_BLOCK_SIZE
     scale_k_padded = (scale_k + 3) // 4 * 4
     return m_padded * scale_k_padded
+
+
+def _parse_mxfp8_tactic_hints(raw: str) -> dict[tuple[int, int, int], int]:
+    hints: dict[tuple[int, int, int], int] = {}
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        shape_raw, separator, tactic_raw = item.partition(":")
+        if not separator:
+            raise ValueError(
+                "MXFP8 tactic hints must use M,N,K:tactic entries; "
+                f"got {item!r}."
+            )
+        shape = tuple(int(value.strip()) for value in shape_raw.split(","))
+        if len(shape) != 3 or any(value <= 0 for value in shape):
+            raise ValueError(f"Invalid MXFP8 tactic shape {shape_raw!r}.")
+        tactic = int(tactic_raw.strip())
+        if tactic < -1:
+            raise ValueError(f"Invalid MXFP8 tactic {tactic}; expected -1 or greater.")
+        hints[(shape[0], shape[1], shape[2])] = tactic
+    return hints
+
+
+def _resolve_mxfp8_high_m_tactic(
+    m: int,
+    n: int,
+    k: int,
+    hints: dict[tuple[int, int, int], int],
+    fallback: int,
+) -> int:
+    return hints.get((m, n, k), fallback)
+
+
+def mxfp8_trtllm_high_m_static_tactics_enabled() -> bool:
+    return (
+        MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ
+        or bool(os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "").strip())
+    )
+
+
+class _Mxfp8HighMTrtllmState(NamedTuple):
+    workspace: torch.Tensor
+    runner: Any
+    fallback_tactic: int
+    tactic_hints: dict[tuple[int, int, int], int]
+
+
+_MXFP8_HIGH_M_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8HighMTrtllmState] = {}
+
+
+def _mxfp8_cuda_device_key(device: torch.device) -> tuple[str, int]:
+    canonical = torch.device(device)
+    if canonical.type != "cuda":
+        raise RuntimeError(f"MXFP8 TRTLLM tactics require CUDA, got {canonical}.")
+    index = canonical.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return canonical.type, index
+
+
+def prepare_mxfp8_trtllm_high_m_tactic_state(
+    device: torch.device,
+) -> _Mxfp8HighMTrtllmState | None:
+    if not mxfp8_trtllm_high_m_static_tactics_enabled():
+        return None
+
+    device_key = _mxfp8_cuda_device_key(device)
+    existing = _MXFP8_HIGH_M_TRTLLM_STATES.get(device_key)
+    if existing is not None:
+        return existing
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 high-M TRTLLM tactic state must be prepared before "
+            "CUDA Graph capture."
+        )
+
+    fallback_tactic = int(os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, "-1"))
+    if fallback_tactic < -1:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_HIGH_M_TACTIC_ENV} must be -1 or greater."
+        )
+    tactic_hints = _parse_mxfp8_tactic_hints(
+        os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "")
+    )
+
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        _get_cache_buf,
+        get_trtllm_gemm_module,
+    )
+
+    canonical = torch.device(device_key[0], device_key[1])
+    with torch.cuda.device(canonical):
+        workspace = _get_cache_buf(
+            "vllm_mxfp8_trtllm_high_m_static_tactic_workspace",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical,
+        )
+        runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+            use_8x4_sf_layout=False
+        )
+
+    state = _Mxfp8HighMTrtllmState(
+        workspace=workspace,
+        runner=runner,
+        fallback_tactic=fallback_tactic,
+        tactic_hints=tactic_hints,
+    )
+    _MXFP8_HIGH_M_TRTLLM_STATES[device_key] = state
+    return state
+
+
+def _require_mxfp8_trtllm_high_m_tactic_state(
+    device: torch.device,
+) -> _Mxfp8HighMTrtllmState:
+    device_key = _mxfp8_cuda_device_key(device)
+    state = _MXFP8_HIGH_M_TRTLLM_STATES.get(device_key)
+    if state is not None:
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 high-M TRTLLM tactic state was not prepared before "
+            "CUDA Graph capture."
+        )
+    prepared = prepare_mxfp8_trtllm_high_m_tactic_state(device)
+    if prepared is None:
+        raise RuntimeError("MXFP8 high-M static tactic path is not enabled.")
+    return prepared
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
@@ -314,6 +448,32 @@ def _mxfp8_trtllm_linear_fixed_impl(
         backend="cuda",
         sf_swizzle_layout=sf_layout,
     )
+    if not use_8x4_sf_layout and mxfp8_trtllm_high_m_static_tactics_enabled():
+        state = _require_mxfp8_trtllm_high_m_tactic_state(x.device)
+        logical_shape = (int(x.shape[0]), int(output_features), int(x.shape[1]))
+        tactic = _resolve_mxfp8_high_m_tactic(
+            *logical_shape,
+            state.tactic_hints,
+            state.fallback_tactic,
+        )
+        physical_n = int(weight.shape[0])
+        output = torch.empty(
+            (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
+        )
+        output = state.runner.forward(
+            [
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                torch.bfloat16,
+                output,
+                state.workspace,
+            ],
+            tactic=tactic,
+        )
+        return output[:, :output_features].contiguous()
+
     # High-M TRTLLM tactics that win isolated tuning can stall mixed serving
     # schedules. Keep low-M tuning, but use the fallback tactic for 128x4.
     autotune_context = (
