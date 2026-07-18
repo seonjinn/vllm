@@ -290,52 +290,64 @@ direct_register_custom_op(
 )
 
 
-def _mxfp8_e4m3_quantize_trtllm_impl(
+def _mxfp8_trtllm_adaptive_linear_impl(
     x: torch.Tensor,
-    use_8x4_sf_layout: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
     from flashinfer import SfLayout
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 
+    use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
     sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
-    return flashinfer_mxfp8_quantize(
+    input_mxfp8, input_scale = flashinfer_mxfp8_quantize(
         x,
         alignment=MXFP8_BLOCK_SIZE,
         backend="cuda",
         sf_swizzle_layout=sf_layout,
     )
-
-
-def mxfp8_e4m3_quantize_trtllm(
-    x: torch.Tensor,
-    use_8x4_sf_layout: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.mxfp8_quantize_trtllm(x, use_8x4_sf_layout)
-
-
-def mxfp8_e4m3_quantize_trtllm_fake(
-    x: torch.Tensor,
-    use_8x4_sf_layout: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.ndim != 2:
-        raise ValueError(f"TRTLLM MXFP8 quantization requires 2D input, got {x.ndim}D.")
-    m, k = x.shape
-    m_tile = 8 if use_8x4_sf_layout else 128
-    m_padded = (m + m_tile - 1) // m_tile * m_tile
-    scale_k = k // MXFP8_BLOCK_SIZE
-    scale_k_padded = (scale_k + 3) // 4 * 4
-    scales = torch.empty(
-        m_padded * scale_k_padded,
-        dtype=MXFP8_SCALE_DTYPE,
-        device=x.device,
+    output = flashinfer_mm_mxfp8(
+        input_mxfp8,
+        weight.t(),
+        input_scale,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        backend="trtllm",
     )
-    return torch.empty_like(x, dtype=MXFP8_VALUE_DTYPE), scales
+    return output[:, :output_features]
+
+
+def mxfp8_trtllm_adaptive_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
+        x, weight, weight_scale, output_features
+    )
+
+
+def mxfp8_trtllm_adaptive_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    if x.ndim != 2:
+        raise ValueError(f"TRTLLM MXFP8 linear requires 2D input, got {x.ndim}D.")
+    return torch.empty(
+        (x.shape[0], output_features), dtype=torch.bfloat16, device=x.device
+    )
 
 
 direct_register_custom_op(
-    op_name="mxfp8_quantize_trtllm",
-    op_func=_mxfp8_e4m3_quantize_trtllm_impl,
-    fake_impl=mxfp8_e4m3_quantize_trtllm_fake,
+    op_name="mxfp8_trtllm_adaptive_linear",
+    op_func=_mxfp8_trtllm_adaptive_linear_impl,
+    fake_impl=mxfp8_trtllm_adaptive_linear_fake,
 )
 
 

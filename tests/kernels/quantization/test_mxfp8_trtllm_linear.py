@@ -82,7 +82,7 @@ def test_mxfp8_trtllm_linear_matches_bf16(m: int, n: int) -> None:
     kernel.process_weights_after_loading(layer)
 
     compiled_apply = torch.compile(
-        lambda input_: kernel.apply_weights(layer, input_), fullgraph=True
+        lambda input_: kernel.apply_weights(layer, input_), fullgraph=True, dynamic=True
     )
     with flashinfer.autotune(False):
         output = compiled_apply(x)

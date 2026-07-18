@@ -7,8 +7,7 @@ from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     mxfp8_e4m3_quantize,
-    mxfp8_e4m3_quantize_trtllm,
-    mxfp8_trtllm_use_8x4_sf_layout,
+    mxfp8_trtllm_adaptive_linear,
     swizzle_mxfp8_scale,
 )
 from vllm.platforms import current_platform
@@ -250,29 +249,17 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
             )
         weight = layer.weight  # shuffled [N_padded, K]
         weight_scale = layer.weight_scale
-        out_dtype = x.dtype
         n_padded, k = weight.shape
         output_features = layer._mxfp8_trtllm_output_features
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
-        use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(input_2d.shape[0])
-        input_mxfp8, input_scale = mxfp8_e4m3_quantize_trtllm(
+        output = mxfp8_trtllm_adaptive_linear(
             input_2d,
-            use_8x4_sf_layout,
-        )
-
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight.t(),
-            input_scale,
+            weight,
             weight_scale,
-            out_dtype=out_dtype,
-            backend="trtllm",
-            use_8x4_sf_layout=use_8x4_sf_layout,
+            output_features,
         )
-        if output_features != n_padded:
-            output = output[:, :output_features]
         if bias is not None:
             output = output + bias
 
