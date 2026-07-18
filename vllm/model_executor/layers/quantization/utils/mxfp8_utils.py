@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 
+from vllm.compilation.passes.inductor_pass import InductorPass, get_pass_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # MXFP8 constants
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
-MXFP8_TRTLLM_8X4_MAX_M = 32
+MXFP8_TRTLLM_8X4_MAX_M = 256
 
 
 def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
@@ -290,17 +293,18 @@ direct_register_custom_op(
 )
 
 
-def _mxfp8_trtllm_adaptive_linear_impl(
+def _mxfp8_trtllm_linear_fixed_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    *,
+    use_8x4_sf_layout: bool,
 ) -> torch.Tensor:
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 
-    use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
     sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
     input_mxfp8, input_scale = flashinfer_mxfp8_quantize(
         x,
@@ -318,6 +322,43 @@ def _mxfp8_trtllm_adaptive_linear_impl(
         backend="trtllm",
     )
     return output[:, :output_features].contiguous()
+
+
+def _mxfp8_trtllm_adaptive_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return _mxfp8_trtllm_linear_fixed_impl(
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        use_8x4_sf_layout=mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0])),
+    )
+
+
+def _mxfp8_trtllm_linear_8x4_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return _mxfp8_trtllm_linear_fixed_impl(
+        x, weight, weight_scale, output_features, use_8x4_sf_layout=True
+    )
+
+
+def _mxfp8_trtllm_linear_128x4_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return _mxfp8_trtllm_linear_fixed_impl(
+        x, weight, weight_scale, output_features, use_8x4_sf_layout=False
+    )
 
 
 def mxfp8_trtllm_adaptive_linear(
@@ -349,6 +390,105 @@ direct_register_custom_op(
     op_func=_mxfp8_trtllm_adaptive_linear_impl,
     fake_impl=mxfp8_trtllm_adaptive_linear_fake,
 )
+
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_linear_8x4",
+    op_func=_mxfp8_trtllm_linear_8x4_impl,
+    fake_impl=mxfp8_trtllm_adaptive_linear_fake,
+)
+
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_linear_128x4",
+    op_func=_mxfp8_trtllm_linear_128x4_impl,
+    fake_impl=mxfp8_trtllm_adaptive_linear_fake,
+)
+
+
+def _mxfp8_layout_for_compile_range(
+    range_start: int, range_end: int, switch_m: int
+) -> bool:
+    if range_end <= switch_m:
+        return True
+    if range_start > switch_m:
+        return False
+    raise RuntimeError(
+        f"MXFP8 compile range [{range_start}, {range_end}] straddles "
+        f"adaptive layout switch M={switch_m}."
+    )
+
+
+def _specialize_mxfp8_adaptive_layout_graph(
+    graph: Any, *, marker_op: Any, fixed_op: Any
+) -> int:
+    replaced = 0
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target == marker_op:
+            node.target = fixed_op
+            replaced += 1
+    return replaced
+
+
+class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
+    def __init__(self, switch_m: int) -> None:
+        self.switch_m = switch_m
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        compile_range = get_pass_context().compile_range
+        use_8x4_sf_layout = _mxfp8_layout_for_compile_range(
+            compile_range.start, compile_range.end, self.switch_m
+        )
+        replaced = _specialize_mxfp8_adaptive_layout_graph(
+            graph,
+            marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+            fixed_op=(
+                torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
+                if use_8x4_sf_layout
+                else torch.ops.vllm.mxfp8_trtllm_linear_128x4.default
+            ),
+        )
+        if replaced == 0:
+            return
+
+    def uuid(self) -> str:
+        return self.hash_dict(
+            {
+                "source": self.hash_source(self),
+                "switch_m": self.switch_m,
+                "phase": "joint_custom_pre_pass",
+                "schema_version": 1,
+            }
+        )
+
+
+def configure_mxfp8_trtllm_adaptive_compilation() -> None:
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    compilation_config = vllm_config.compilation_config
+    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    if max_num_batched_tokens is None:
+        raise RuntimeError(
+            "TRTLLM MXFP8 adaptive layout requires finite max_num_batched_tokens."
+        )
+
+    endpoints = list(compilation_config.compile_ranges_endpoints or [])
+    if max_num_batched_tokens > MXFP8_TRTLLM_8X4_MAX_M:
+        endpoints.append(MXFP8_TRTLLM_8X4_MAX_M)
+    compilation_config.compile_ranges_endpoints = sorted(set(endpoints))
+
+    pass_key = "joint_custom_pre_pass"
+    existing_pass = compilation_config.inductor_compile_config.get(pass_key)
+    if existing_pass is None:
+        compilation_config.inductor_compile_config[pass_key] = (
+            _Mxfp8AdaptiveLayoutSpecializationPass(MXFP8_TRTLLM_8X4_MAX_M)
+        )
+    elif not isinstance(existing_pass, _Mxfp8AdaptiveLayoutSpecializationPass):
+        raise RuntimeError(
+            "TRTLLM MXFP8 adaptive layout cannot replace an existing "
+            "Inductor joint custom pre-pass."
+        )
+    elif existing_pass.switch_m != MXFP8_TRTLLM_8X4_MAX_M:
+        raise RuntimeError("TRTLLM MXFP8 adaptive layout switch changed after setup.")
 
 
 def xpu_mxfp8_quantize(

@@ -11,17 +11,19 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferTrtllmMxfp8LinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    _mxfp8_layout_for_compile_range,
+    _specialize_mxfp8_adaptive_layout_graph,
     mxfp8_trtllm_scale_numel,
     mxfp8_trtllm_use_8x4_sf_layout,
 )
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 128, 256])
 def test_mxfp8_trtllm_uses_8x4_for_low_m(m: int) -> None:
     assert mxfp8_trtllm_use_8x4_sf_layout(m)
 
 
-@pytest.mark.parametrize("m", [33, 64, 128, 1024])
+@pytest.mark.parametrize("m", [257, 512, 1024])
 def test_mxfp8_trtllm_uses_128x4_above_threshold(m: int) -> None:
     assert not mxfp8_trtllm_use_8x4_sf_layout(m)
 
@@ -31,9 +33,10 @@ def test_mxfp8_trtllm_uses_128x4_above_threshold(m: int) -> None:
     [
         (1, 5120, True, 8 * 160),
         (32, 5120, True, 32 * 160),
-        (33, 5120, False, 128 * 160),
-        (128, 5120, False, 128 * 160),
-        (129, 5120, False, 256 * 160),
+        (33, 5120, True, 40 * 160),
+        (128, 5120, True, 128 * 160),
+        (129, 5120, True, 136 * 160),
+        (257, 5120, False, 384 * 160),
         (8, 5184, True, 8 * 164),
     ],
 )
@@ -49,6 +52,49 @@ def test_mxfp8_trtllm_scale_numel(
 def test_mxfp8_trtllm_scale_numel_rejects_invalid_k() -> None:
     with pytest.raises(ValueError, match="divisible by 32"):
         mxfp8_trtllm_scale_numel(8, 5130, True)
+
+
+def test_mxfp8_layout_compile_ranges_do_not_straddle_switch() -> None:
+    assert _mxfp8_layout_for_compile_range(1, 256, 256)
+    assert not _mxfp8_layout_for_compile_range(257, 8480, 256)
+    with pytest.raises(RuntimeError, match="straddles"):
+        _mxfp8_layout_for_compile_range(1, 2048, 256)
+
+
+@pytest.mark.parametrize(
+    ("fixed_op", "expected_op"),
+    [
+        (
+            torch.ops.vllm.mxfp8_trtllm_linear_8x4.default,
+            torch.ops.vllm.mxfp8_trtllm_linear_8x4.default,
+        ),
+        (
+            torch.ops.vllm.mxfp8_trtllm_linear_128x4.default,
+            torch.ops.vllm.mxfp8_trtllm_linear_128x4.default,
+        ),
+    ],
+)
+def test_mxfp8_adaptive_marker_is_specialized(
+    fixed_op: object, expected_op: object
+) -> None:
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    scale = graph.placeholder("scale")
+    node = graph.call_function(
+        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        (x, weight, scale, 512),
+    )
+    graph.output(node)
+
+    replaced = _specialize_mxfp8_adaptive_layout_graph(
+        graph,
+        marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        fixed_op=fixed_op,
+    )
+
+    assert replaced == 1
+    assert node.target == expected_op
 
 
 def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:

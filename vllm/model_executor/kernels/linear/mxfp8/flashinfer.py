@@ -6,6 +6,7 @@ from torch.nn.parameter import Parameter
 
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
+    configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_e4m3_quantize,
     mxfp8_trtllm_adaptive_linear,
     swizzle_mxfp8_scale,
@@ -178,6 +179,10 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
 class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer's TensorRT-LLM runner."""
+
+    def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
+        super().__init__(c)
+        configure_mxfp8_trtllm_adaptive_compilation()
 
     @classmethod
     def is_supported(
