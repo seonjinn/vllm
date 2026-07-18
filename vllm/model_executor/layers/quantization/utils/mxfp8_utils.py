@@ -63,8 +63,13 @@ def _resolve_mxfp8_high_m_tactic(
     k: int,
     hints: dict[tuple[int, int, int], int],
     fallback: int,
-) -> int:
-    return hints.get((m, n, k), fallback)
+    *,
+    use_global_fallback: bool,
+) -> int | None:
+    shape = (m, n, k)
+    if shape in hints:
+        return hints[shape]
+    return fallback if use_global_fallback else None
 
 
 def mxfp8_trtllm_high_m_static_tactics_enabled() -> bool:
@@ -79,6 +84,7 @@ class _Mxfp8HighMTrtllmState(NamedTuple):
     runner: Any
     fallback_tactic: int
     tactic_hints: dict[tuple[int, int, int], int]
+    use_global_fallback: bool
 
 
 _MXFP8_HIGH_M_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8HighMTrtllmState] = {}
@@ -141,6 +147,7 @@ def prepare_mxfp8_trtllm_high_m_tactic_state(
         runner=runner,
         fallback_tactic=fallback_tactic,
         tactic_hints=tactic_hints,
+        use_global_fallback=MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ,
     )
     _MXFP8_HIGH_M_TRTLLM_STATES[device_key] = state
     return state
@@ -455,27 +462,28 @@ def _mxfp8_trtllm_linear_fixed_impl(
             *logical_shape,
             state.tactic_hints,
             state.fallback_tactic,
+            use_global_fallback=state.use_global_fallback,
         )
-        physical_n = int(weight.shape[0])
-        output = torch.empty(
-            (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
-        )
-        output = state.runner.forward(
-            [
-                input_mxfp8,
-                weight.t(),
-                input_scale,
-                weight_scale,
-                torch.bfloat16,
-                output,
-                state.workspace,
-            ],
-            tactic=tactic,
-        )
-        return output[:, :output_features].contiguous()
+        if tactic is not None:
+            physical_n = int(weight.shape[0])
+            output = torch.empty(
+                (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
+            )
+            output = state.runner.forward(
+                [
+                    input_mxfp8,
+                    weight.t(),
+                    input_scale,
+                    weight_scale,
+                    torch.bfloat16,
+                    output,
+                    state.workspace,
+                ],
+                tactic=tactic,
+            )
+            return output[:, :output_features].contiguous()
 
-    # High-M TRTLLM tactics that win isolated tuning can stall mixed serving
-    # schedules. Keep low-M tuning, but use the fallback tactic for 128x4.
+    # Exact-hint misses keep the serving-stable FlashInfer wrapper path.
     autotune_context = (
         nullcontext()
         if use_8x4_sf_layout

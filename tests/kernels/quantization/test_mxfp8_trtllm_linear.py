@@ -78,8 +78,39 @@ def test_mxfp8_high_m_tactic_hints_use_logical_shape() -> None:
 
 def test_mxfp8_high_m_tactic_exact_hit_and_global_fallback() -> None:
     hints = {(1000, 8768, 8192): 92}
-    assert _resolve_mxfp8_high_m_tactic(1000, 8768, 8192, hints, -1) == 92
-    assert _resolve_mxfp8_high_m_tactic(2002, 8768, 8192, hints, 91) == 91
+    assert (
+        _resolve_mxfp8_high_m_tactic(
+            1000,
+            8768,
+            8192,
+            hints,
+            -1,
+            use_global_fallback=False,
+        )
+        == 92
+    )
+    assert (
+        _resolve_mxfp8_high_m_tactic(
+            2002,
+            8768,
+            8192,
+            hints,
+            91,
+            use_global_fallback=False,
+        )
+        is None
+    )
+    assert (
+        _resolve_mxfp8_high_m_tactic(
+            2002,
+            8768,
+            8192,
+            hints,
+            91,
+            use_global_fallback=True,
+        )
+        == 91
+    )
 
 
 def test_mxfp8_high_m_static_tactics_are_opt_in(
