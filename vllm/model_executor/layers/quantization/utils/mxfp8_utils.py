@@ -9,6 +9,21 @@ from vllm.utils.torch_utils import direct_register_custom_op
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+MXFP8_TRTLLM_8X4_MAX_M = 32
+
+
+def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
+    return m <= MXFP8_TRTLLM_8X4_MAX_M
+
+
+def mxfp8_trtllm_scale_numel(m: int, k: int, use_8x4: bool) -> int:
+    if k % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(f"MXFP8 K must be divisible by 32, got K={k}.")
+    m_tile = 8 if use_8x4 else 128
+    m_padded = (m + m_tile - 1) // m_tile * m_tile
+    scale_k = k // MXFP8_BLOCK_SIZE
+    scale_k_padded = (scale_k + 3) // 4 * 4
+    return m_padded * scale_k_padded
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
@@ -272,6 +287,55 @@ direct_register_custom_op(
     op_name="mxfp8_quantize",
     op_func=_mxfp8_e4m3_quantize_impl,
     fake_impl=mxfp8_e4m3_quantize_fake,
+)
+
+
+def _mxfp8_e4m3_quantize_trtllm_impl(
+    x: torch.Tensor,
+    use_8x4_sf_layout: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from flashinfer import SfLayout
+    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+
+    sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
+    return flashinfer_mxfp8_quantize(
+        x,
+        alignment=MXFP8_BLOCK_SIZE,
+        backend="cuda",
+        sf_swizzle_layout=sf_layout,
+    )
+
+
+def mxfp8_e4m3_quantize_trtllm(
+    x: torch.Tensor,
+    use_8x4_sf_layout: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.vllm.mxfp8_quantize_trtllm(x, use_8x4_sf_layout)
+
+
+def mxfp8_e4m3_quantize_trtllm_fake(
+    x: torch.Tensor,
+    use_8x4_sf_layout: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.ndim != 2:
+        raise ValueError(f"TRTLLM MXFP8 quantization requires 2D input, got {x.ndim}D.")
+    m, k = x.shape
+    m_tile = 8 if use_8x4_sf_layout else 128
+    m_padded = (m + m_tile - 1) // m_tile * m_tile
+    scale_k = k // MXFP8_BLOCK_SIZE
+    scale_k_padded = (scale_k + 3) // 4 * 4
+    scales = torch.empty(
+        m_padded * scale_k_padded,
+        dtype=MXFP8_SCALE_DTYPE,
+        device=x.device,
+    )
+    return torch.empty_like(x, dtype=MXFP8_VALUE_DTYPE), scales
+
+
+direct_register_custom_op(
+    op_name="mxfp8_quantize_trtllm",
+    op_func=_mxfp8_e4m3_quantize_trtllm_impl,
+    fake_impl=mxfp8_e4m3_quantize_trtllm_fake,
 )
 
 

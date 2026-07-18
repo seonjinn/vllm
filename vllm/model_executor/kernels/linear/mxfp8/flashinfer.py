@@ -7,11 +7,13 @@ from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     mxfp8_e4m3_quantize,
+    mxfp8_e4m3_quantize_trtllm,
+    mxfp8_trtllm_use_8x4_sf_layout,
     swizzle_mxfp8_scale,
 )
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
-from vllm.utils.flashinfer import has_flashinfer_cutedsl
+from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -172,4 +174,107 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             output = output + bias
 
         output_shape = (*input_shape[:-1], N)
+        return output.view(output_shape)
+
+
+class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
+    """MXFP8 W8A8 GEMM via FlashInfer's TensorRT-LLM runner."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not has_flashinfer():
+            return False, "requires FlashInfer"
+        if current_platform.is_device_capability(
+            100
+        ) or current_platform.is_device_capability(103):
+            return True, None
+        return False, "requires sm_100 or sm_103 (Blackwell)"
+
+    @classmethod
+    def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+        weight = layer.weight.data  # [N, K]
+        n, k = weight.shape
+        if k % 256 != 0:
+            raise ValueError(
+                "TRTLLM MXFP8 dense weights require K to be divisible by 256, "
+                f"got N={n}, K={k}."
+            )
+
+        scale_k = k // MXFP8_BLOCK_SIZE
+        weight_scale = layer.weight_scale.data[:n, :scale_k].contiguous()
+        n_padded = (n + 127) // 128 * 128
+
+        if n_padded != n:
+            padded_weight = torch.zeros(
+                (n_padded, k), dtype=weight.dtype, device=weight.device
+            )
+            padded_weight[:n].copy_(weight)
+            padded_scale = torch.zeros(
+                (n_padded, scale_k),
+                dtype=weight_scale.dtype,
+                device=weight_scale.device,
+            )
+            padded_scale[:n].copy_(weight_scale)
+        else:
+            padded_weight = weight.contiguous()
+            padded_scale = weight_scale
+
+        shuffled_weight = shuffle_matrix_a(padded_weight, 128).reshape(n_padded, k)
+        shuffled_scale = shuffle_matrix_sf_a(
+            padded_scale,
+            128,
+            num_elts_per_sf=MXFP8_BLOCK_SIZE,
+        ).reshape(-1)
+
+        layer.weight = Parameter(shuffled_weight.contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(shuffled_scale.contiguous(), requires_grad=False)
+        layer._mxfp8_trtllm_output_features = n
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dtype != torch.bfloat16:
+            raise ValueError(
+                "FlashInfer TRTLLM MXFP8 dense GEMM requires BF16 activations, "
+                f"got {x.dtype}."
+            )
+        weight = layer.weight  # shuffled [N_padded, K]
+        weight_scale = layer.weight_scale
+        out_dtype = x.dtype
+        n_padded, k = weight.shape
+        output_features = layer._mxfp8_trtllm_output_features
+
+        input_shape = x.shape
+        input_2d = x.view(-1, k)
+        use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(input_2d.shape[0])
+        input_mxfp8, input_scale = mxfp8_e4m3_quantize_trtllm(
+            input_2d,
+            use_8x4_sf_layout,
+        )
+
+        output = vllm_flashinfer.mm_mxfp8(
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            backend="trtllm",
+            use_8x4_sf_layout=use_8x4_sf_layout,
+        )
+        if output_features != n_padded:
+            output = output[:, :output_features]
+        if bias is not None:
+            output = output + bias
+
+        output_shape = (*input_shape[:-1], output_features)
         return output.view(output_shape)
