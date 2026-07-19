@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+import socket
+from pathlib import Path
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -17,6 +22,79 @@ from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+_MXFP8_DENSE_TRACE_SEEN: set[tuple[str, str, int, int, int, int, str]] = set()
+_MXFP8_DENSE_TRACE_WRITTEN = 0
+
+
+def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
+    prefix = str(getattr(layer, "prefix", "")).lower()
+    if any(token in prefix for token in ("qkv_proj", "query_key_value")):
+        return "QKV"
+    if any(token in prefix for token in ("q_proj", "k_proj", "v_proj")):
+        return "QKV"
+    if any(token in prefix for token in ("o_proj", "out_proj", "attention.dense")):
+        return "O"
+    if any(token in prefix for token in ("gate_up_proj", "gate_proj", "up_proj")):
+        return "FC1"
+    if any(token in prefix for token in ("fc1", ".w1", ".w3")):
+        return "FC1"
+    if any(token in prefix for token in ("down_proj", "fc2", ".w2")):
+        return "FC2"
+    if "mamba" in prefix and any(
+        token in prefix
+        for token in ("proj", "linear", "in_proj", "out_proj", "x_proj", "dt_proj")
+    ):
+        return "MambaProjection"
+    if any(token in prefix for token in ("mlp", "ffn", "expert")):
+        return "MLPOrExpertDense"
+    return "OtherDense"
+
+
+def _trace_mxfp8_dense_shape(
+    *,
+    prefix: str,
+    family: str,
+    m: int,
+    n_logical: int,
+    n_physical: int,
+    k: int,
+    layout: str,
+) -> None:
+    enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "")
+    if enabled.strip().lower() in ("", "0", "false", "no", "off"):
+        return
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return
+    trace_dir = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", "").strip()
+    if not trace_dir:
+        return
+
+    key = (prefix, family, m, n_logical, n_physical, k, layout)
+    max_records = int(os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"))
+    global _MXFP8_DENSE_TRACE_WRITTEN
+    if key in _MXFP8_DENSE_TRACE_SEEN or max_records <= _MXFP8_DENSE_TRACE_WRITTEN:
+        return
+    _MXFP8_DENSE_TRACE_SEEN.add(key)
+    _MXFP8_DENSE_TRACE_WRITTEN += 1
+
+    output_dir = Path(trace_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "event": "mxfp8_dense_shape",
+        "family": family,
+        "hostname": socket.gethostname(),
+        "k": int(k),
+        "layout": layout,
+        "m": int(m),
+        "n_logical": int(n_logical),
+        "n_physical": int(n_physical),
+        "pid": os.getpid(),
+        "prefix": prefix,
+    }
+    output = output_dir / f"dense_shapes_{record['hostname']}_{record['pid']}.jsonl"
+    with output.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -261,6 +339,16 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
+        use_8x4 = int(input_2d.shape[0]) <= 256
+        _trace_mxfp8_dense_shape(
+            prefix=str(getattr(layer, "prefix", "unknown")),
+            family=_mxfp8_dense_family(layer),
+            m=int(input_2d.shape[0]),
+            n_logical=int(output_features),
+            n_physical=int(n_padded),
+            k=int(k),
+            layout="8x4" if use_8x4 else "128x4",
+        )
         output = mxfp8_trtllm_adaptive_linear(
             input_2d,
             weight,
