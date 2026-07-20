@@ -411,6 +411,7 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
     workspace = torch.empty((4096,), dtype=torch.uint8, device=device)
     quantized_a = torch.empty((8, 512), dtype=torch.float8_e4m3fn, device=device)
     quantized_a_scale = torch.empty((8, 16), dtype=torch.uint8, device=device)
+    bias = torch.ones((130,), dtype=torch.bfloat16, device=device)
     forwarded: dict[str, int | torch.dtype] = {}
 
     def dynamic_a_cutlass_mxfp8(
@@ -456,7 +457,7 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
             quant_out_scale=quantized_a_scale,
             out_dtype=torch.bfloat16,
         )
-        return result.reshape(a_bf16.shape[0], 13, 10).sum(dim=-1)
+        return (result + bias).sum(dim=1)
 
     compiled = torch.compile(run, fullgraph=True, dynamic=True)
     compiled(a)
@@ -477,7 +478,8 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
     a.fill_(2)
     graph.replay()
 
-    assert result.shape == (8, 13)
+    assert result.shape == (8,)
     assert forwarded == expected_pointers
     torch.testing.assert_close(first_output, torch.ones_like(first_output))
     torch.testing.assert_close(out, torch.full_like(out, 2))
+    torch.testing.assert_close(result, torch.full_like(result, 390))
