@@ -641,6 +641,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         ] = {}
         self._dynamic_a_telemetry: tuple[torch.Tensor, ...] = ()
         self._dynamic_a_owner_key = f"mxfp8-dynamic-a:{next(_DYNAMIC_A_OWNER_IDS)}"
+        self._dynamic_a_reservation_complete = False
 
     @classmethod
     def is_supported(
@@ -681,6 +682,8 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         activation_dtype: torch.dtype,
         output_dtype: torch.dtype,
     ) -> None:
+        if getattr(self, "_dynamic_a_reservation_complete", False):
+            return
         artifact_path = self._dynamic_a_artifact_path
         if not artifact_path:
             return
@@ -809,6 +812,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
                 _register_execution_telemetry_tensor(
                     policy.telemetry_key, telemetry
                 )
+        self._dynamic_a_reservation_complete = True
 
         if dynamic_enabled and _env_flag_enabled(_DYNAMIC_A_TELEMETRY_ENV):
             logger.info_once(

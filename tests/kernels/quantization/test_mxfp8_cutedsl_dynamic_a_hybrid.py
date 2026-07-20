@@ -86,6 +86,25 @@ def _runtime_resources(
     }
 
 
+def _enable_supported_reservation_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hybrid, "_mxfp8_dynamic_a_runtime_metadata", lambda *_: _RUNTIME
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda capability: capability == 100,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer, "has_flashinfer_mxfp8_dynamic_a_cutlass", lambda: True
+    )
+
+
 def _make_physical_layer() -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.weight = Parameter(
@@ -661,6 +680,119 @@ def test_runtime_resource_mismatch_fails_before_dynamic_allocation(
 
     assert kernel._dynamic_a_buffers == {}
     assert manager._owner_specs["layer.0"] == (((3,), torch.int64),)
+
+
+def test_second_reservation_reuses_first_success_when_query_would_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = _make_reservation_kernel(_write_artifact(tmp_path))
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=2)
+    _enable_supported_reservation_runtime(monkeypatch)
+    query_calls = 0
+
+    def transition_query(*_: object, **__: object) -> dict[str, int]:
+        nonlocal query_calls
+        query_calls += 1
+        if query_calls > 1:
+            raise RuntimeError("second query failed")
+        return _runtime_resources(8, 130, 512, 4096)
+
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "get_flashinfer_mxfp8_dynamic_a_resources",
+        transition_query,
+    )
+    layer = _make_physical_layer()
+
+    kernel.reserve_dynamic_a_workspaces(
+        layer,
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+    first_specs = manager._owner_specs["layer.0"]
+    first_owner_ptrs = tuple(
+        workspace.data_ptr() for workspace in manager._owner_workspaces["layer.0"]
+    )
+    first_buffer_ptrs = tuple(
+        buffer.data_ptr()
+        for slot in kernel._dynamic_a_buffers[(8, 130, 512)]
+        for buffer in slot.values()
+    )
+
+    kernel.reserve_dynamic_a_workspaces(
+        layer,
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert query_calls == 1
+    assert manager._owner_specs["layer.0"] == first_specs
+    assert tuple(
+        workspace.data_ptr() for workspace in manager._owner_workspaces["layer.0"]
+    ) == first_owner_ptrs
+    assert tuple(
+        buffer.data_ptr()
+        for slot in kernel._dynamic_a_buffers[(8, 130, 512)]
+        for buffer in slot.values()
+    ) == first_buffer_ptrs
+
+
+def test_second_reservation_keeps_first_query_failure_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = _make_reservation_kernel(_write_artifact(tmp_path))
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=2)
+    _enable_supported_reservation_runtime(monkeypatch)
+    query_calls = 0
+
+    def transition_query(*_: object, **__: object) -> dict[str, int]:
+        nonlocal query_calls
+        query_calls += 1
+        if query_calls == 1:
+            raise RuntimeError("first query failed")
+        return _runtime_resources(8, 130, 512, 4096)
+
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "get_flashinfer_mxfp8_dynamic_a_resources",
+        transition_query,
+    )
+    layer = _make_physical_layer()
+
+    kernel.reserve_dynamic_a_workspaces(
+        layer,
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+    first_specs = manager._owner_specs["layer.0"]
+    first_owner_ptrs = tuple(
+        workspace.data_ptr() for workspace in manager._owner_workspaces["layer.0"]
+    )
+    first_telemetry_ptrs = tuple(
+        telemetry.data_ptr() for telemetry in kernel._dynamic_a_telemetry
+    )
+
+    kernel.reserve_dynamic_a_workspaces(
+        layer,
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert query_calls == 1
+    assert kernel._dynamic_a_buffers == {}
+    assert manager._owner_specs["layer.0"] == first_specs == (
+        ((3,), torch.int64),
+    )
+    assert tuple(
+        workspace.data_ptr() for workspace in manager._owner_workspaces["layer.0"]
+    ) == first_owner_ptrs
+    assert tuple(
+        telemetry.data_ptr() for telemetry in kernel._dynamic_a_telemetry
+    ) == first_telemetry_ptrs
 
 
 def test_policy_records_dynamic_hits_stock_misses_and_incompatibility_fallbacks(
