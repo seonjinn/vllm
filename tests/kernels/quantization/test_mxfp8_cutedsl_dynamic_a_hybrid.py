@@ -3,6 +3,7 @@
 
 import inspect
 import json
+import logging
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
 )
 from vllm.utils import flashinfer as vllm_flashinfer
+from vllm.v1.worker.workspace import WorkspaceManager
 
 _RUNTIME = {
     "gpu_sm": "sm_100",
@@ -46,6 +48,42 @@ def _write_artifact(tmp_path: Path) -> str:
     path = tmp_path / "dynamic_a_allowlist.json"
     path.write_text(json.dumps(artifact), encoding="utf-8")
     return str(path)
+
+
+def _write_artifact_shapes(
+    tmp_path: Path, shapes: dict[str, dict[str, object]]
+) -> str:
+    path = tmp_path / "dynamic_a_shapes.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "runtime": _RUNTIME, "shapes": shapes}),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def _make_reservation_kernel(
+    artifact_path: str,
+) -> hybrid.FlashInferCutedslMxfp8LinearKernel:
+    kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
+    kernel._dynamic_a_artifact_path = artifact_path
+    kernel._dynamic_a_policy = None
+    kernel._dynamic_a_buffers = {}
+    kernel._dynamic_a_telemetry = ()
+    kernel._dynamic_a_owner_key = "layer.0"
+    return kernel
+
+
+def _runtime_resources(
+    m: int, n: int, k: int, workspace_bytes: int
+) -> dict[str, int]:
+    scale_rows = (m + 7) // 8 * 8
+    scale_cols = ((k // MXFP8_BLOCK_SIZE + 3) // 4) * 4
+    return {
+        "workspace_bytes": workspace_bytes,
+        "activation_value_elements": m * k,
+        "activation_scale_elements": scale_rows * scale_cols,
+        "output_elements": m * n,
+    }
 
 
 def _make_physical_layer() -> torch.nn.Module:
@@ -352,20 +390,109 @@ def test_dynamic_api_prefers_complete_gemm_pair_over_partial_top_level(
     ) == resources
 
 
-def test_runtime_resource_mismatch_fails_before_owner_allocation(
+def test_compatibility_dynamic_api_forwards_qualified_tactic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forwarded_tactics: list[int] = []
+
+    def compatibility_api(
+        *_: object,
+        out: torch.Tensor,
+        tactic: int,
+        **__: object,
+    ) -> torch.Tensor:
+        forwarded_tactics.append(tactic)
+        return out
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(dynamic_a_cutlass_mxfp8=compatibility_api),
+    )
+    out = torch.empty((8, 130), dtype=torch.bfloat16)
+    vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
+        torch.ones((8, 512), dtype=torch.bfloat16),
+        torch.empty((512, 130), dtype=torch.float8_e4m3fn),
+        torch.empty((4096,), dtype=torch.uint8),
+        out=out,
+        workspace=torch.empty((4096,), dtype=torch.uint8),
+        quant_out_value=torch.empty((8, 512), dtype=torch.float8_e4m3fn),
+        quant_out_scale=torch.empty((8, 16), dtype=torch.uint8),
+        out_dtype=torch.bfloat16,
+        tactic=7,
+    )
+
+    assert forwarded_tactics == [7]
+
+
+def test_compatibility_dynamic_api_without_tactic_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def compatibility_api(
+        *_: object,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        quant_out_value: torch.Tensor,
+        quant_out_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return out
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(
+            dynamic_a_cutlass_mxfp8=compatibility_api,
+            get_mm_mxfp8_dynamic_activation_resources=lambda *_args, **_kwargs: (
+                _runtime_resources(8, 130, 512, 4096)
+            ),
+        ),
+    )
+
+    assert (
+        vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
+            8,
+            130,
+            512,
+            tactic=7,
+            activation_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+        is None
+    )
+
+
+def test_reservation_filters_artifact_shapes_by_layer_physical_nk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
-    kernel._dynamic_a_artifact_path = _write_artifact(tmp_path)
-    kernel._dynamic_a_policy = None
-    kernel._dynamic_a_buffers = {}
-    kernel._dynamic_a_telemetry = ()
-    kernel._dynamic_a_owner_key = "layer.0"
-    manager = SimpleNamespace(
-        reserve_owner_for_all_ubatches=lambda *_args, **_kwargs: pytest.fail(
-            "resource mismatch must fail before allocation"
-        )
+    artifact_path = _write_artifact_shapes(
+        tmp_path,
+        {
+            "8,130,512": {
+                "status": "qualified",
+                "tactic": 7,
+                "workspace_bytes": 4096,
+            },
+            "32,130,512": {
+                "status": "qualified",
+                "tactic": 8,
+                "workspace_bytes": 8192,
+            },
+            "8,256,512": {
+                "status": "qualified",
+                "tactic": 9,
+                "workspace_bytes": 4096,
+            },
+            "8,130,1024": {
+                "status": "qualified",
+                "tactic": 10,
+                "workspace_bytes": 4096,
+            },
+        },
     )
+    kernel = _make_reservation_kernel(artifact_path)
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=2)
+    queried: list[tuple[int, int, int]] = []
     monkeypatch.setattr(
         hybrid, "_mxfp8_dynamic_a_runtime_metadata", lambda *_: _RUNTIME
     )
@@ -383,22 +510,158 @@ def test_runtime_resource_mismatch_fails_before_owner_allocation(
     monkeypatch.setattr(
         vllm_flashinfer,
         "get_flashinfer_mxfp8_dynamic_a_resources",
-        lambda *_args, **_kwargs: {
-            "workspace_bytes": 8192,
-            "activation_value_elements": 4096,
-            "activation_scale_elements": 128,
-            "output_elements": 1040,
-        },
+        lambda m, n, k, **_: (
+            queried.append((m, n, k))
+            or _runtime_resources(m, n, k, 4096 if m == 8 else 8192)
+        ),
     )
 
     kernel.reserve_dynamic_a_workspaces(
-        torch.nn.Module(),
+        _make_physical_layer(),
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert queried == [(8, 130, 512), (32, 130, 512)]
+    assert set(kernel._dynamic_a_buffers) == {(8, 130, 512), (32, 130, 512)}
+    assert len(manager._owner_specs["layer.0"]) == 9
+
+
+def test_incompatible_reservation_keeps_per_slot_device_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = _make_reservation_kernel(_write_artifact(tmp_path))
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=2)
+    monkeypatch.setattr(
+        hybrid,
+        "_mxfp8_dynamic_a_runtime_metadata",
+        lambda *_: _RUNTIME | {"cuda_version": "mismatch"},
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "_record_host_counter",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capturable fallback must use device telemetry"
+        ),
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "_stock_cutedsl_mxfp8",
+        lambda input_2d, weight, *_: torch.zeros(
+            (input_2d.shape[0], weight.shape[1]), dtype=input_2d.dtype
+        ),
+    )
+
+    kernel.reserve_dynamic_a_workspaces(
+        _make_physical_layer(),
         manager,
         activation_dtype=torch.bfloat16,
         output_dtype=torch.bfloat16,
     )
 
     assert kernel._dynamic_a_buffers == {}
+    assert len(kernel._dynamic_a_telemetry) == 2
+    assert manager._owner_specs["layer.0"] == (((3,), torch.int64),)
+
+    telemetry = kernel._dynamic_a_telemetry[0]
+    torch.ops.vllm.mxfp8_cutedsl_dynamic_a_hybrid(
+        torch.ones((8, 512), dtype=torch.bfloat16),
+        _make_physical_layer().weight,
+        torch.empty((4096,), dtype=torch.uint8),
+        [],
+        [8, 130, 512],
+        [],
+        [-1],
+        [7],
+        False,
+        kernel._dynamic_a_policy.telemetry_key,
+        telemetry,
+        torch.bfloat16,
+    )
+    assert telemetry.tolist() == [0, 0, 1]
+
+
+def test_runtime_resource_query_exception_fails_closed_with_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    kernel = _make_reservation_kernel(_write_artifact(tmp_path))
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=1)
+    monkeypatch.setattr(
+        hybrid, "_mxfp8_dynamic_a_runtime_metadata", lambda *_: _RUNTIME
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda capability: capability == 100,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer, "has_flashinfer_mxfp8_dynamic_a_cutlass", lambda: True
+    )
+
+    def raise_query(*_: object, **__: object) -> None:
+        raise RuntimeError("query failed")
+
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "get_flashinfer_mxfp8_dynamic_a_resources",
+        raise_query,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        kernel.reserve_dynamic_a_workspaces(
+            _make_physical_layer(),
+            manager,
+            activation_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+
+    assert kernel._dynamic_a_buffers == {}
+    assert len(kernel._dynamic_a_telemetry) == 1
+    assert manager._owner_specs["layer.0"] == (((3,), torch.int64),)
+    assert "runtime resource query failed" in caplog.text
+
+
+def test_runtime_resource_mismatch_fails_before_dynamic_allocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = _make_reservation_kernel(_write_artifact(tmp_path))
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=1)
+    monkeypatch.setattr(
+        hybrid, "_mxfp8_dynamic_a_runtime_metadata", lambda *_: _RUNTIME
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda capability: capability == 100,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer, "has_flashinfer_mxfp8_dynamic_a_cutlass", lambda: True
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "get_flashinfer_mxfp8_dynamic_a_resources",
+        lambda *_args, **_kwargs: _runtime_resources(8, 130, 512, 8192),
+    )
+
+    kernel.reserve_dynamic_a_workspaces(
+        _make_physical_layer(),
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert kernel._dynamic_a_buffers == {}
+    assert manager._owner_specs["layer.0"] == (((3,), torch.int64),)
+
 
 def test_policy_records_dynamic_hits_stock_misses_and_incompatibility_fallbacks(
     tmp_path: Path,
@@ -532,6 +795,39 @@ def test_apply_weights_updates_telemetry_for_dynamic_miss_and_incompatible_paths
     )
 
 
+def test_opaque_dynamic_dispatch_propagates_execution_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_execution(*_: object, **__: object) -> torch.Tensor:
+        raise RuntimeError("dynamic execution failed")
+
+    monkeypatch.setattr(
+        vllm_flashinfer, "mm_mxfp8_dynamic_a_cutlass", raise_execution
+    )
+    dynamic_buffers = [
+        torch.empty((8, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((8, 16), dtype=torch.uint8),
+        torch.empty((4096,), dtype=torch.uint8),
+        torch.empty((8, 130), dtype=torch.bfloat16),
+    ]
+
+    with pytest.raises(RuntimeError, match="dynamic execution failed"):
+        torch.ops.vllm.mxfp8_cutedsl_dynamic_a_hybrid(
+            torch.ones((8, 512), dtype=torch.bfloat16),
+            torch.empty((512, 130), dtype=torch.float8_e4m3fn),
+            torch.empty((4096,), dtype=torch.uint8),
+            dynamic_buffers,
+            [8, 130, 512],
+            [],
+            [0],
+            [7],
+            True,
+            "execution-error",
+            torch.zeros((3,), dtype=torch.int64),
+            torch.bfloat16,
+        )
+
+
 def test_post_load_keeps_one_unpadded_stock_b_and_b_scale_storage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -636,6 +932,7 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
         quant_out_value: torch.Tensor,
         quant_out_scale: torch.Tensor,
         out_dtype: torch.dtype,
+        tactic: int,
     ) -> torch.Tensor:
         forwarded.update(
             {
@@ -647,6 +944,7 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
                 "quantized_a": quant_out_value.data_ptr(),
                 "quantized_a_scale": quant_out_scale.data_ptr(),
                 "out_dtype": out_dtype,
+                "tactic": tactic,
             }
         )
         out.copy_(a_bf16[:, :1].expand_as(out))
@@ -687,6 +985,7 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
         "quantized_a": quantized_a.data_ptr(),
         "quantized_a_scale": quantized_a_scale.data_ptr(),
         "out_dtype": torch.bfloat16,
+        "tactic": -1,
     }
     a.fill_(2)
     graph.replay()
@@ -696,3 +995,104 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
     torch.testing.assert_close(first_output, torch.ones_like(first_output))
     torch.testing.assert_close(out, torch.full_like(out, 2))
     torch.testing.assert_close(result, torch.full_like(result, 390))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_opaque_hybrid_op_fullgraph_dispatch_and_fallback_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    activation = torch.ones((8, 512), dtype=torch.bfloat16, device=device)
+    weight = torch.empty((512, 130), dtype=torch.float8_e4m3fn, device=device)
+    weight_scale = torch.empty((4096,), dtype=torch.uint8, device=device)
+    owner_out = torch.empty((8, 130), dtype=torch.bfloat16, device=device)
+    dynamic_buffers = [
+        torch.empty((8, 512), dtype=torch.float8_e4m3fn, device=device),
+        torch.empty((8, 16), dtype=torch.uint8, device=device),
+        torch.empty((4096,), dtype=torch.uint8, device=device),
+        owner_out,
+    ]
+    dynamic_telemetry = torch.zeros((3,), dtype=torch.int64, device=device)
+    fallback_telemetry = torch.zeros((3,), dtype=torch.int64, device=device)
+
+    def dynamic_mm(
+        input_2d: torch.Tensor,
+        *_: object,
+        out: torch.Tensor,
+        tactic: int,
+        **__: object,
+    ) -> torch.Tensor:
+        assert tactic == 7
+        out.copy_(input_2d[:, :1].expand_as(out))
+        return out.clone()
+
+    def stock_mm(
+        input_2d: torch.Tensor,
+        weight_tensor: torch.Tensor,
+        *_: object,
+    ) -> torch.Tensor:
+        return input_2d[:, :1].expand(
+            input_2d.shape[0], weight_tensor.shape[1]
+        ) + 4
+
+    monkeypatch.setattr(
+        vllm_flashinfer, "mm_mxfp8_dynamic_a_cutlass", dynamic_mm
+    )
+    monkeypatch.setattr(hybrid, "_stock_cutedsl_mxfp8", stock_mm)
+
+    schema = torch.ops.vllm.mxfp8_cutedsl_dynamic_a_hybrid.default._schema
+    arguments = {argument.name: argument for argument in schema.arguments}
+    assert arguments["dynamic_buffers"].alias_info.is_write
+    assert arguments["telemetry"].alias_info.is_write
+    assert schema.returns[0].alias_info is None
+
+    def run_dynamic(input_2d: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.mxfp8_cutedsl_dynamic_a_hybrid(
+            input_2d,
+            weight,
+            weight_scale,
+            dynamic_buffers,
+            [8, 130, 512],
+            [],
+            [0],
+            [7],
+            True,
+            "cuda-dynamic",
+            dynamic_telemetry,
+            torch.bfloat16,
+        )
+
+    compiled_dynamic = torch.compile(run_dynamic, fullgraph=True, dynamic=True)
+    dynamic_result = compiled_dynamic(activation)
+    assert dynamic_result.data_ptr() != owner_out.data_ptr()
+    torch.testing.assert_close(dynamic_result, torch.ones_like(dynamic_result))
+    assert dynamic_telemetry.tolist() == [1, 0, 0]
+
+    def run_fallback(input_2d: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.mxfp8_cutedsl_dynamic_a_hybrid(
+            input_2d,
+            weight,
+            weight_scale,
+            [],
+            [8, 130, 512],
+            [],
+            [-1],
+            [7],
+            False,
+            "cuda-fallback",
+            fallback_telemetry,
+            torch.bfloat16,
+        )
+
+    compiled_fallback = torch.compile(run_fallback, fullgraph=True, dynamic=True)
+    compiled_fallback(activation)
+    fallback_telemetry.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fallback_result = compiled_fallback(activation)
+    activation.fill_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(fallback_result, torch.full_like(fallback_result, 6))
+    assert fallback_telemetry.tolist() == [0, 0, 2]

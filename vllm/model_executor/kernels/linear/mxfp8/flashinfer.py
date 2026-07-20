@@ -693,62 +693,94 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         )
         self._dynamic_a_policy = policy
         self._dynamic_a_buffers = {}
-        if (
-            not policy.runtime_compatible
-            or not current_platform.is_cuda()
-            or not current_platform.is_device_capability_family(100)
-            or not vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass()
-        ):
-            return
-
+        weight = layer.weight
+        if weight.ndim != 2:
+            raise ValueError(
+                "MXFP8 dynamic-A reservation requires a rank-2 physical weight"
+            )
+        k, n = weight.shape
         qualified = sorted(
             (shape, config)
             for shape, config in policy.shapes.items()
-            if config.status == "qualified"
+            if config.status == "qualified" and shape[1:] == (n, k)
         )
-        if not qualified:
-            return
 
         queried_resources: dict[tuple[int, int, int], dict[str, int]] = {}
-        for shape, config in qualified:
-            m, n, k = shape
-            resources = vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
-                m,
-                n,
-                k,
-                tactic=config.tactic,
-                activation_dtype=activation_dtype,
-                output_dtype=output_dtype,
-            )
-            buffer_specs = _dynamic_a_buffer_specs(
-                shape, config.workspace_bytes, output_dtype
-            )
-            expected_resources = {
-                "workspace_bytes": config.workspace_bytes,
-                "activation_value_elements": m * k,
-                "activation_scale_elements": int(
-                    torch.Size(buffer_specs[1][0]).numel()
-                ),
-                "output_elements": m * n,
-            }
-            if resources is None or resources != expected_resources:
-                logger.warning_once(
-                    "MXFP8 dynamic-A disabled because runtime resources do not "
-                    "match the artifact for physical shape %s: expected=%s, got=%s",
-                    shape,
-                    tuple(sorted(expected_resources.items())),
-                    None if resources is None else tuple(sorted(resources.items())),
+        dynamic_enabled = (
+            policy.runtime_compatible
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+            and vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass()
+            and bool(qualified)
+        )
+        if dynamic_enabled:
+            for shape, config in qualified:
+                m, shape_n, shape_k = shape
+                try:
+                    resources = (
+                        vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
+                            m,
+                            shape_n,
+                            shape_k,
+                            tactic=config.tactic,
+                            activation_dtype=activation_dtype,
+                            output_dtype=output_dtype,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning_once(
+                        "MXFP8 dynamic-A disabled because the runtime resource "
+                        "query failed for physical shape %s: %s: %s",
+                        shape,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                    dynamic_enabled = False
+                    queried_resources.clear()
+                    break
+                buffer_specs = _dynamic_a_buffer_specs(
+                    shape, config.workspace_bytes, output_dtype
                 )
-                return
-            queried_resources[shape] = resources
+                expected_resources = {
+                    "workspace_bytes": config.workspace_bytes,
+                    "activation_value_elements": m * shape_k,
+                    "activation_scale_elements": int(
+                        torch.Size(buffer_specs[1][0]).numel()
+                    ),
+                    "output_elements": m * shape_n,
+                }
+                if resources is None or resources != expected_resources:
+                    logger.warning_once(
+                        "MXFP8 dynamic-A disabled because runtime resources do not "
+                        "match the artifact for physical shape %s: expected=%s, "
+                        "got=%s",
+                        shape,
+                        tuple(sorted(expected_resources.items())),
+                        (
+                            None
+                            if resources is None
+                            else tuple(sorted(resources.items()))
+                        ),
+                    )
+                    dynamic_enabled = False
+                    queried_resources.clear()
+                    break
+                queried_resources[shape] = resources
 
-        specs = tuple(
-            spec
-            for shape, _ in qualified
-            for spec in _dynamic_a_buffer_specs(
-                shape, queried_resources[shape]["workspace_bytes"], output_dtype
+        dynamic_specs = (
+            tuple(
+                spec
+                for shape, _ in qualified
+                for spec in _dynamic_a_buffer_specs(
+                    shape,
+                    queried_resources[shape]["workspace_bytes"],
+                    output_dtype,
+                )
             )
-        ) + (((len(_COUNTER_NAMES),), torch.int64),)
+            if dynamic_enabled
+            else ()
+        )
+        specs = dynamic_specs + (((len(_COUNTER_NAMES),), torch.int64),)
         owner_key = self._dynamic_a_owner_key
         reserved_by_slot = manager.reserve_owner_for_all_ubatches(owner_key, *specs)
         buffers: dict[
@@ -756,17 +788,18 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], ...],
         ] = {}
         names = ("quant_out_value", "quant_out_scale", "workspace", "out")
-        for shape_index, (shape, _) in enumerate(qualified):
-            offset = shape_index * len(names)
-            shape_buffers: list[dict[str, torch.Tensor]] = []
-            for slot in reserved_by_slot:
-                slot_buffers: dict[str, torch.Tensor] = {}
-                for name, tensor in zip(
-                    names, slot[offset : offset + len(names)]
-                ):
-                    slot_buffers[name] = tensor
-                shape_buffers.append(slot_buffers)
-            buffers[shape] = tuple(shape_buffers)
+        if dynamic_enabled:
+            for shape_index, (shape, _) in enumerate(qualified):
+                offset = shape_index * len(names)
+                shape_buffers: list[dict[str, torch.Tensor]] = []
+                for slot in reserved_by_slot:
+                    slot_buffers: dict[str, torch.Tensor] = {}
+                    for name, tensor in zip(
+                        names, slot[offset : offset + len(names)]
+                    ):
+                        slot_buffers[name] = tensor
+                    shape_buffers.append(slot_buffers)
+                buffers[shape] = tuple(shape_buffers)
         self._dynamic_a_buffers = buffers
 
         if not self._dynamic_a_telemetry:
@@ -777,7 +810,7 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
                     policy.telemetry_key, telemetry
                 )
 
-        if _env_flag_enabled(_DYNAMIC_A_TELEMETRY_ENV):
+        if dynamic_enabled and _env_flag_enabled(_DYNAMIC_A_TELEMETRY_ENV):
             logger.info_once(
                 "MXFP8 dynamic-A reserved physical shapes: %s",
                 ";".join(",".join(map(str, shape)) for shape, _ in qualified),
@@ -837,12 +870,12 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             qualified = sorted(
                 (shape, config)
                 for shape, config in policy.shapes.items()
-                if config.status == "qualified"
+                if config.status == "qualified" and shape[1:] == (N, K)
             )
             rejected = sorted(
                 shape
                 for shape, config in policy.shapes.items()
-                if config.status == "rejected"
+                if config.status == "rejected" and shape[1:] == (N, K)
             )
             dynamic_buffers: list[torch.Tensor] = []
             buffer_offsets: list[int] = []

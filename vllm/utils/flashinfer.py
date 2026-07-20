@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 from collections.abc import Callable, Mapping
@@ -264,7 +265,9 @@ def _resolve_mxfp8_dynamic_a_api() -> tuple[
         compatibility_api = False
         if not callable(operation):
             operation = getattr(module, "dynamic_a_cutlass_mxfp8", None)
-            compatibility_api = callable(operation)
+            compatibility_api = callable(operation) and _accepts_tactic(operation)
+            if not compatibility_api:
+                operation = None
         if not callable(operation):
             continue
         resource_query = getattr(
@@ -278,6 +281,21 @@ def _resolve_mxfp8_dynamic_a_api() -> tuple[
         operation, compatibility_api = operation_without_query
         return operation, None, compatibility_api
     return None, None, False
+
+
+def _accepts_tactic(operation: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(operation).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "tactic"
+            and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+        )
+        for parameter in parameters
+    )
 
 
 def get_flashinfer_mxfp8_dynamic_a_resources(
@@ -354,6 +372,7 @@ def _mm_mxfp8_dynamic_a_cutlass_impl(
             quant_out_value=quant_out_value,
             quant_out_scale=quant_out_scale,
             out_dtype=out_dtype,
+            tactic=tactic,
         )
     if result is not None and (
         not isinstance(result, torch.Tensor) or result.data_ptr() != out.data_ptr()
