@@ -71,6 +71,18 @@ def _guard_trtllm_helpers() -> SimpleNamespace:
     )
 
 
+def _guard_imported_trtllm_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_helper_use(*_: object, **__: object) -> None:
+        pytest.fail("imported TRTLLM helper was invoked")
+
+    for helper_name in (
+        "configure_mxfp8_trtllm_adaptive_compilation",
+        "mxfp8_trtllm_adaptive_linear",
+        "prepare_mxfp8_trtllm_high_m_tactic_state",
+    ):
+        monkeypatch.setattr(hybrid, helper_name, fail_helper_use)
+
+
 def _run_apply_weights(
     monkeypatch: pytest.MonkeyPatch,
     policy: object | None,
@@ -86,8 +98,16 @@ def _run_apply_weights(
     kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
     kernel._dynamic_a_policy = policy
     x = torch.ones((m, 512), dtype=dtype)
+    pre_reserved = {
+        "out": torch.empty((m, 130), dtype=dtype),
+        "workspace": torch.empty((8192,), dtype=torch.uint8),
+        "quant_out_value": torch.empty((m, 512), dtype=torch.float8_e4m3fn),
+        "quant_out_scale": torch.empty((m, 16), dtype=torch.uint8),
+    }
+    kernel._dynamic_a_buffers = {(m, 130, 512): pre_reserved}
 
     monkeypatch.setitem(sys.modules, "flashinfer", _guard_trtllm_helpers())
+    _guard_imported_trtllm_helpers(monkeypatch)
     monkeypatch.setattr(
         hybrid,
         "current_platform",
@@ -126,10 +146,22 @@ def _run_apply_weights(
         a: torch.Tensor,
         b: torch.Tensor,
         b_scale: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        quant_out_value: torch.Tensor,
+        quant_out_scale: torch.Tensor,
         **_: object,
     ) -> torch.Tensor:
+        assert {
+            "out": out.data_ptr(),
+            "workspace": workspace.data_ptr(),
+            "quant_out_value": quant_out_value.data_ptr(),
+            "quant_out_scale": quant_out_scale.data_ptr(),
+        } == {name: buffer.data_ptr() for name, buffer in pre_reserved.items()}
         dynamic_shapes.append((a.shape[0], b.shape[1], b.shape[0]))
-        return torch.zeros((a.shape[0], b.shape[1]), dtype=a.dtype)
+        out.zero_()
+        return out
 
     monkeypatch.setattr(vllm_flashinfer, "mm_mxfp8", stock_mm)
     monkeypatch.setattr(vllm_flashinfer, "mm_mxfp8_dynamic_a_cutlass", dynamic_mm)
@@ -356,6 +388,7 @@ def test_post_load_keeps_one_unpadded_stock_b_and_b_scale_storage(
         requires_grad=False,
     )
     monkeypatch.setitem(sys.modules, "flashinfer", _guard_trtllm_helpers())
+    _guard_imported_trtllm_helpers(monkeypatch)
 
     kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
     kernel.process_weights_after_loading(layer)
@@ -430,51 +463,21 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
     with torch.cuda.graph(graph):
         result = compiled(a)
     first_output = out.clone()
-    pointers_before_replay = (
-        {
-            "a": a.data_ptr(),
-            "weight": weight.data_ptr(),
-            "weight_scale": weight_scale.data_ptr(),
-            "out": out.data_ptr(),
-            "workspace": workspace.data_ptr(),
-            "quantized_a": quantized_a.data_ptr(),
-            "quantized_a_scale": quantized_a_scale.data_ptr(),
-            "out_dtype": torch.bfloat16,
-        },
-    )
+    expected_pointers = {
+        "a": a.data_ptr(),
+        "weight": weight.data_ptr(),
+        "weight_scale": weight_scale.data_ptr(),
+        "out": out.data_ptr(),
+        "workspace": workspace.data_ptr(),
+        "quantized_a": quantized_a.data_ptr(),
+        "quantized_a_scale": quantized_a_scale.data_ptr(),
+        "out_dtype": torch.bfloat16,
+    }
     a.fill_(2)
     graph.replay()
 
-    assert (
-        result.data_ptr(),
-        forwarded,
-        pointers_before_replay,
-        out,
-        first_output,
-    ) == (
-        out.data_ptr(),
-        {
-            "a": a.data_ptr(),
-            "weight": weight.data_ptr(),
-            "weight_scale": weight_scale.data_ptr(),
-            "out": out.data_ptr(),
-            "workspace": workspace.data_ptr(),
-            "quantized_a": quantized_a.data_ptr(),
-            "quantized_a_scale": quantized_a_scale.data_ptr(),
-            "out_dtype": torch.bfloat16,
-        },
-        (
-            {
-                "a": a.data_ptr(),
-                "weight": weight.data_ptr(),
-                "weight_scale": weight_scale.data_ptr(),
-                "out": out.data_ptr(),
-                "workspace": workspace.data_ptr(),
-                "quantized_a": quantized_a.data_ptr(),
-                "quantized_a_scale": quantized_a_scale.data_ptr(),
-                "out_dtype": torch.bfloat16,
-            },
-        ),
-        torch.full_like(out, 2),
-        torch.full_like(first_output, 1),
-    )
+    assert result.data_ptr() == out.data_ptr()
+    assert result.shape == (8, 130)
+    assert forwarded == expected_pointers
+    torch.testing.assert_close(first_output, torch.ones_like(first_output))
+    torch.testing.assert_close(out, torch.full_like(out, 2))

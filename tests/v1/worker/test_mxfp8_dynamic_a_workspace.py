@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 import vllm.v1.worker.workspace as workspace
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.workspace import WorkspaceManager
@@ -60,7 +64,7 @@ class _DynamicAReservationProbe:
         manager.reserve_simultaneous_for_all_ubatches(*_allowlisted_dynamic_a_buffers())
 
 
-def test_gpu_model_runner_reserves_dynamic_a_before_workspace_lock(
+def test_capture_model_reserves_dynamic_a_before_workspace_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace.reset_workspace_manager()
@@ -75,12 +79,45 @@ def test_gpu_model_runner_reserves_dynamic_a_before_workspace_lock(
     model.add_module("physical_n_tail", layer)
     runner = object.__new__(GPUModelRunner)
     runner.model = model
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=object())
+    runner.device = torch.device("cpu")
+    runner.encoder_cudagraph_manager = None
+    runner.cudagraph_dispatcher = SimpleNamespace(get_capture_descs=lambda: [])
+    runner._maybe_init_encoder_cudagraph_manager = lambda: None
+    runner._freeze_gc = nullcontext
     slot = 0
+    lifecycle: list[str] = []
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: slot)
 
-    try:
-        runner._reserve_mxfp8_dynamic_a_workspaces()
+    original_reserve = runner._reserve_mxfp8_dynamic_a_workspaces
+
+    def reserve_spy() -> None:
+        lifecycle.append("reserve")
+        original_reserve()
+
+    def lock_spy() -> None:
+        lifecycle.append("lock")
         manager.lock()
+
+    monkeypatch.setattr(runner, "_reserve_mxfp8_dynamic_a_workspaces", reserve_spy)
+    monkeypatch.setattr(gpu_model_runner_module, "lock_workspace", lock_spy)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "graph_capture",
+        lambda **_: nullcontext(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch,
+        "accelerator",
+        SimpleNamespace(
+            synchronize=lambda: None,
+            empty_cache=lambda: None,
+            get_memory_info=lambda: (1024, 1024),
+        ),
+    )
+
+    try:
+        runner.capture_model()
         before = [
             current.untyped_storage().data_ptr()
             for current in manager._current_workspaces
@@ -96,8 +133,16 @@ def test_gpu_model_runner_reserves_dynamic_a_before_workspace_lock(
     finally:
         workspace.reset_workspace_manager()
 
-    assert (probe.calls, len(before), before == after) == (
+    assert (
+        probe.calls,
+        lifecycle,
+        manager.is_locked(),
+        len(before),
+        before == after,
+    ) == (
         [((512, 130), (4096,))],
+        ["reserve", "lock"],
+        True,
         2,
         True,
     )
