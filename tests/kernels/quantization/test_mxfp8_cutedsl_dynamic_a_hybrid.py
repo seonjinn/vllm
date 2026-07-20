@@ -457,6 +457,7 @@ def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
             quant_out_scale=quantized_a_scale,
             out_dtype=torch.bfloat16,
         )
+        torch._assert(result.ndim == 2, "dynamic-A custom op must return [M, N]")
         return (result + bias).sum(dim=1)
 
     compiled = torch.compile(run, fullgraph=True, dynamic=True)
