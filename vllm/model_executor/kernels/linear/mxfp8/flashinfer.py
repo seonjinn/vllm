@@ -7,8 +7,12 @@ import importlib.metadata
 import json
 import os
 import socket
+import threading
+import weakref
+from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -28,6 +32,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
+from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from vllm.v1.worker.workspace import WorkspaceManager
@@ -52,6 +57,22 @@ _DYNAMIC_A_RUNTIME_FIELDS = frozenset(
         "weight_scale_layout",
     }
 )
+_COUNTER_NAMES = (
+    "dynamic_hits",
+    "stock_misses",
+    "incompatibility_fallbacks",
+)
+_TELEMETRY_LOCK = threading.Lock()
+_POLICY_REQUEST_COUNTERS: dict[str, dict[str, int]] = defaultdict(
+    lambda: dict.fromkeys(_COUNTER_NAMES, 0)
+)
+_EXECUTION_COUNTERS: dict[str, dict[str, int]] = defaultdict(
+    lambda: dict.fromkeys(_COUNTER_NAMES, 0)
+)
+_EXECUTION_TELEMETRY_TENSORS: dict[
+    str, list[weakref.ReferenceType[torch.Tensor]]
+] = defaultdict(list)
+_DYNAMIC_A_OWNER_IDS = count()
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -77,14 +98,13 @@ class Mxfp8CutedslDynamicAPolicy:
         shapes: Mapping[tuple[int, int, int], _DynamicAShapeConfig],
         *,
         runtime_compatible: bool,
+        runtime_metadata: Mapping[str, str],
+        telemetry_key: str,
     ) -> None:
         self._shapes = MappingProxyType(dict(shapes))
         self._runtime_compatible = runtime_compatible
-        self._counters = {
-            "dynamic_hits": 0,
-            "stock_misses": 0,
-            "incompatibility_fallbacks": 0,
-        }
+        self._runtime_metadata = MappingProxyType(dict(runtime_metadata))
+        self._telemetry_key = telemetry_key
 
     @property
     def shapes(self) -> Mapping[tuple[int, int, int], _DynamicAShapeConfig]:
@@ -94,21 +114,77 @@ class Mxfp8CutedslDynamicAPolicy:
     def runtime_compatible(self) -> bool:
         return self._runtime_compatible
 
+    @property
+    def runtime_metadata(self) -> Mapping[str, str]:
+        return self._runtime_metadata
+
+    @property
+    def telemetry_key(self) -> str:
+        return self._telemetry_key
+
     def select(self, shape: tuple[int, int, int]) -> str:
         config = self._shapes.get(shape)
         if not self._runtime_compatible or (
             config is not None and config.status != "qualified"
         ):
-            self._counters["incompatibility_fallbacks"] += 1
+            _record_host_counter(
+                _POLICY_REQUEST_COUNTERS,
+                self._telemetry_key,
+                "incompatibility_fallbacks",
+            )
             return "stock_cutedsl"
         if config is None:
-            self._counters["stock_misses"] += 1
+            _record_host_counter(
+                _POLICY_REQUEST_COUNTERS, self._telemetry_key, "stock_misses"
+            )
             return "stock_cutedsl"
-        self._counters["dynamic_hits"] += 1
+        _record_host_counter(
+            _POLICY_REQUEST_COUNTERS, self._telemetry_key, "dynamic_hits"
+        )
         return "dynamic_cutlass_8x4"
 
+    def selection_counters(self) -> dict[str, int]:
+        with _TELEMETRY_LOCK:
+            return dict(_POLICY_REQUEST_COUNTERS[self._telemetry_key])
+
     def dispatch_counters(self) -> dict[str, int]:
-        return dict(self._counters)
+        with _TELEMETRY_LOCK:
+            counters = dict(_EXECUTION_COUNTERS[self._telemetry_key])
+            refs = list(_EXECUTION_TELEMETRY_TENSORS[self._telemetry_key])
+        for tensor_ref in refs:
+            tensor = tensor_ref()
+            if tensor is not None:
+                values = tensor.detach().cpu().tolist()
+                for name, value in zip(_COUNTER_NAMES, values):
+                    counters[name] += int(value)
+        return counters
+
+
+def _record_host_counter(
+    registry: dict[str, dict[str, int]], telemetry_key: str, counter: str
+) -> None:
+    with _TELEMETRY_LOCK:
+        registry[telemetry_key][counter] += 1
+
+
+def _register_execution_telemetry_tensor(
+    telemetry_key: str, tensor: torch.Tensor
+) -> None:
+    with _TELEMETRY_LOCK:
+        refs = _EXECUTION_TELEMETRY_TENSORS[telemetry_key]
+        if not any(existing() is tensor for existing in refs):
+            refs.append(weakref.ref(tensor))
+
+
+def _record_execution(
+    telemetry_key: str,
+    counter: str,
+    telemetry: torch.Tensor | None,
+) -> None:
+    if telemetry is None:
+        _record_host_counter(_EXECUTION_COUNTERS, telemetry_key, counter)
+        return
+    telemetry[_COUNTER_NAMES.index(counter)].add_(1)
 
 
 def _parse_physical_shape(raw_shape: str) -> tuple[int, int, int]:
@@ -133,6 +209,15 @@ def _require_json_object(value: object, context: str) -> dict[str, Any]:
     return value
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
 def load_mxfp8_cutedsl_dynamic_a_policy(
     path: str,
     *,
@@ -150,7 +235,10 @@ def _load_mxfp8_cutedsl_dynamic_a_policy(
 ) -> Mxfp8CutedslDynamicAPolicy:
     runtime_metadata = dict(runtime_items)
     with Path(artifact_path).open(encoding="utf-8") as stream:
-        artifact = _require_json_object(json.load(stream), "MXFP8 artifact")
+        artifact = _require_json_object(
+            json.load(stream, object_pairs_hook=_reject_duplicate_json_keys),
+            "MXFP8 artifact",
+        )
 
     if set(artifact) != {"schema_version", "runtime", "shapes"}:
         raise ValueError(
@@ -217,18 +305,32 @@ def _load_mxfp8_cutedsl_dynamic_a_policy(
     return Mxfp8CutedslDynamicAPolicy(
         shapes,
         runtime_compatible=runtime_compatible,
+        runtime_metadata=runtime_metadata,
+        telemetry_key=f"{artifact_path}|{runtime_items!r}",
     )
 
 
-def _mxfp8_dynamic_a_runtime_metadata() -> dict[str, str]:
-    flashinfer = importlib.import_module("flashinfer")
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _mxfp8_dynamic_a_runtime_metadata(
+    activation_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+) -> dict[str, str]:
+    try:
+        flashinfer = importlib.import_module("flashinfer")
+    except ModuleNotFoundError:
+        flashinfer = None
     flashinfer_revision = getattr(flashinfer, "__version__", None)
     if flashinfer_revision is None:
         try:
             flashinfer_revision = importlib.metadata.version("flashinfer-python")
         except importlib.metadata.PackageNotFoundError:
             flashinfer_revision = "unknown"
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = (
+        torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+    )
     cutlass_version = os.environ.get(
         _DYNAMIC_A_CUTLASS_VERSION_ENV,
         str(getattr(flashinfer, "__cutlass_version__", "unknown")),
@@ -238,15 +340,15 @@ def _mxfp8_dynamic_a_runtime_metadata() -> dict[str, str]:
         "flashinfer_revision": str(flashinfer_revision),
         "cuda_version": str(torch.version.cuda or "unknown"),
         "cutlass_version": cutlass_version,
-        "activation_dtype": "bfloat16",
-        "output_dtype": "bfloat16",
+        "activation_dtype": _dtype_name(activation_dtype),
+        "output_dtype": _dtype_name(output_dtype),
         "activation_scale_layout": "8x4",
         "weight_scale_layout": "128x4",
     }
 
 
 def _dynamic_a_buffer_specs(
-    shape: tuple[int, int, int], workspace_bytes: int
+    shape: tuple[int, int, int], workspace_bytes: int, output_dtype: torch.dtype
 ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
     m, n, k = shape
     scale_rows = (m + 7) // 8 * 8
@@ -255,8 +357,125 @@ def _dynamic_a_buffer_specs(
         ((m, k), torch.float8_e4m3fn),
         ((scale_rows, scale_cols), torch.uint8),
         ((workspace_bytes,), torch.uint8),
-        ((m, n), torch.bfloat16),
+        ((m, n), output_dtype),
     )
+
+
+def _stock_cutedsl_mxfp8(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    input_mxfp8, input_scale = mxfp8_e4m3_quantize(
+        input_2d, is_sf_swizzled_layout=True
+    )
+    return vllm_flashinfer.mm_mxfp8(
+        input_mxfp8,
+        weight,
+        input_scale,
+        weight_scale,
+        out_dtype=out_dtype,
+        backend="cute-dsl",
+    )
+
+
+def _mxfp8_cutedsl_dynamic_a_hybrid_impl(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dynamic_buffers: list[torch.Tensor],
+    qualified_shapes: list[int],
+    rejected_shapes: list[int],
+    buffer_offsets: list[int],
+    tactics: list[int],
+    dynamic_enabled: bool,
+    telemetry_key: str,
+    telemetry: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    problem = (input_2d.shape[0], weight.shape[1], weight.shape[0])
+
+    if not dynamic_enabled:
+        output = _stock_cutedsl_mxfp8(
+            input_2d, weight, weight_scale, out_dtype
+        )
+        _record_execution(telemetry_key, "incompatibility_fallbacks", telemetry)
+        return output
+
+    for index in range(0, len(qualified_shapes), 3):
+        if problem != tuple(qualified_shapes[index : index + 3]):
+            continue
+        shape_index = index // 3
+        buffer_offset = buffer_offsets[shape_index]
+        if buffer_offset < 0:
+            output = _stock_cutedsl_mxfp8(
+                input_2d, weight, weight_scale, out_dtype
+            )
+            _record_execution(
+                telemetry_key, "incompatibility_fallbacks", telemetry
+            )
+            return output
+        quant_out_value, quant_out_scale, workspace, out = dynamic_buffers[
+            buffer_offset : buffer_offset + 4
+        ]
+        output = vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
+            input_2d,
+            weight,
+            weight_scale,
+            out=out,
+            workspace=workspace,
+            quant_out_value=quant_out_value,
+            quant_out_scale=quant_out_scale,
+            out_dtype=out_dtype,
+            tactic=tactics[shape_index],
+        )
+        _record_execution(telemetry_key, "dynamic_hits", telemetry)
+        return output
+
+    for index in range(0, len(rejected_shapes), 3):
+        if problem == tuple(rejected_shapes[index : index + 3]):
+            output = _stock_cutedsl_mxfp8(
+                input_2d, weight, weight_scale, out_dtype
+            )
+            _record_execution(
+                telemetry_key, "incompatibility_fallbacks", telemetry
+            )
+            return output
+
+    output = _stock_cutedsl_mxfp8(input_2d, weight, weight_scale, out_dtype)
+    _record_execution(telemetry_key, "stock_misses", telemetry)
+    return output
+
+
+def _mxfp8_cutedsl_dynamic_a_hybrid_fake(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dynamic_buffers: list[torch.Tensor],
+    qualified_shapes: list[int],
+    rejected_shapes: list[int],
+    buffer_offsets: list[int],
+    tactics: list[int],
+    dynamic_enabled: bool,
+    telemetry_key: str,
+    telemetry: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty(
+        input_2d.shape[0],
+        weight.shape[1],
+        dtype=out_dtype,
+        device=input_2d.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="mxfp8_cutedsl_dynamic_a_hybrid",
+    op_func=_mxfp8_cutedsl_dynamic_a_hybrid_impl,
+    mutates_args=["dynamic_buffers", "telemetry"],
+    fake_impl=_mxfp8_cutedsl_dynamic_a_hybrid_fake,
+)
 
 
 def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
@@ -412,19 +631,16 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
     def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
         super().__init__(c)
-        artifact_path = os.environ.get(_DYNAMIC_A_ARTIFACT_ENV, "").strip()
-        self._dynamic_a_policy = (
-            load_mxfp8_cutedsl_dynamic_a_policy(
-                artifact_path,
-                runtime_metadata=_mxfp8_dynamic_a_runtime_metadata(),
-            )
-            if artifact_path
-            else None
-        )
+        self._dynamic_a_artifact_path = os.environ.get(
+            _DYNAMIC_A_ARTIFACT_ENV, ""
+        ).strip()
+        self._dynamic_a_policy: Mxfp8CutedslDynamicAPolicy | None = None
         self._dynamic_a_buffers: dict[
             tuple[int, int, int],
             dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], ...],
         ] = {}
+        self._dynamic_a_telemetry: tuple[torch.Tensor, ...] = ()
+        self._dynamic_a_owner_key = f"mxfp8-dynamic-a:{next(_DYNAMIC_A_OWNER_IDS)}"
 
     @classmethod
     def is_supported(
@@ -458,35 +674,108 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         )
 
     def reserve_dynamic_a_workspaces(
-        self, layer: torch.nn.Module, manager: "WorkspaceManager"
+        self,
+        layer: torch.nn.Module,
+        manager: "WorkspaceManager",
+        *,
+        activation_dtype: torch.dtype,
+        output_dtype: torch.dtype,
     ) -> None:
-        policy = self._dynamic_a_policy
-        if policy is None or not policy.runtime_compatible:
+        artifact_path = self._dynamic_a_artifact_path
+        if not artifact_path:
             return
 
-        qualified = [
+        policy = load_mxfp8_cutedsl_dynamic_a_policy(
+            artifact_path,
+            runtime_metadata=_mxfp8_dynamic_a_runtime_metadata(
+                activation_dtype, output_dtype
+            ),
+        )
+        self._dynamic_a_policy = policy
+        self._dynamic_a_buffers = {}
+        if (
+            not policy.runtime_compatible
+            or not current_platform.is_cuda()
+            or not current_platform.is_device_capability_family(100)
+            or not vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass()
+        ):
+            return
+
+        qualified = sorted(
             (shape, config)
             for shape, config in policy.shapes.items()
             if config.status == "qualified"
-        ]
+        )
         if not qualified:
             return
 
+        queried_resources: dict[tuple[int, int, int], dict[str, int]] = {}
+        for shape, config in qualified:
+            m, n, k = shape
+            resources = vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
+                m,
+                n,
+                k,
+                tactic=config.tactic,
+                activation_dtype=activation_dtype,
+                output_dtype=output_dtype,
+            )
+            buffer_specs = _dynamic_a_buffer_specs(
+                shape, config.workspace_bytes, output_dtype
+            )
+            expected_resources = {
+                "workspace_bytes": config.workspace_bytes,
+                "activation_value_elements": m * k,
+                "activation_scale_elements": int(
+                    torch.Size(buffer_specs[1][0]).numel()
+                ),
+                "output_elements": m * n,
+            }
+            if resources is None or resources != expected_resources:
+                logger.warning_once(
+                    "MXFP8 dynamic-A disabled because runtime resources do not "
+                    "match the artifact for physical shape %s: expected=%s, got=%s",
+                    shape,
+                    tuple(sorted(expected_resources.items())),
+                    None if resources is None else tuple(sorted(resources.items())),
+                )
+                return
+            queried_resources[shape] = resources
+
         specs = tuple(
             spec
-            for shape, config in qualified
-            for spec in _dynamic_a_buffer_specs(shape, config.workspace_bytes)
-        )
-        reserved_by_slot = manager.reserve_simultaneous_for_all_ubatches(*specs)
-        buffers: dict[tuple[int, int, int], tuple[dict[str, torch.Tensor], ...]] = {}
+            for shape, _ in qualified
+            for spec in _dynamic_a_buffer_specs(
+                shape, queried_resources[shape]["workspace_bytes"], output_dtype
+            )
+        ) + (((len(_COUNTER_NAMES),), torch.int64),)
+        owner_key = self._dynamic_a_owner_key
+        reserved_by_slot = manager.reserve_owner_for_all_ubatches(owner_key, *specs)
+        buffers: dict[
+            tuple[int, int, int],
+            dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], ...],
+        ] = {}
         names = ("quant_out_value", "quant_out_scale", "workspace", "out")
         for shape_index, (shape, _) in enumerate(qualified):
             offset = shape_index * len(names)
-            buffers[shape] = tuple(
-                dict(zip(names, slot[offset : offset + len(names)]))
-                for slot in reserved_by_slot
-            )
-        self._dynamic_a_buffers.update(buffers)
+            shape_buffers: list[dict[str, torch.Tensor]] = []
+            for slot in reserved_by_slot:
+                slot_buffers: dict[str, torch.Tensor] = {}
+                for name, tensor in zip(
+                    names, slot[offset : offset + len(names)]
+                ):
+                    slot_buffers[name] = tensor
+                shape_buffers.append(slot_buffers)
+            buffers[shape] = tuple(shape_buffers)
+        self._dynamic_a_buffers = buffers
+
+        if not self._dynamic_a_telemetry:
+            self._dynamic_a_telemetry = tuple(slot[-1] for slot in reserved_by_slot)
+            for telemetry in self._dynamic_a_telemetry:
+                telemetry.zero_()
+                _register_execution_telemetry_tensor(
+                    policy.telemetry_key, telemetry
+                )
 
         if _env_flag_enabled(_DYNAMIC_A_TELEMETRY_ENV):
             logger.info_once(
@@ -504,6 +793,14 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
         return buffers[workspace_module.dbo_current_ubatch_id()]
 
+    def _dynamic_a_telemetry_for_current_slot(self) -> torch.Tensor | None:
+        telemetry = getattr(self, "_dynamic_a_telemetry", ())
+        if not telemetry:
+            return None
+        from vllm.v1.worker import workspace as workspace_module
+
+        return telemetry[workspace_module.dbo_current_ubatch_id()]
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -517,7 +814,6 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, K)
-        problem = (input_2d.shape[0], N, K)
         min_dim = 128
 
         assert min_dim <= K, (
@@ -532,52 +828,62 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             f"out_features is too small for mm_mxfp8."
         )
 
-        dynamic_buffers = self._dynamic_a_buffers_for_shape(problem)
-        use_dynamic_a = (
-            self._dynamic_a_policy is not None
-            and dynamic_buffers is not None
-            and x.dtype == torch.bfloat16
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
-            and vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass()
-            and self._dynamic_a_policy.select(problem) == "dynamic_cutlass_8x4"
-        )
-        if use_dynamic_a:
-            assert dynamic_buffers is not None
-            config = self._dynamic_a_policy.shapes[problem]
-            output = vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
+        policy = getattr(self, "_dynamic_a_policy", None)
+        if policy is None:
+            output = _stock_cutedsl_mxfp8(
+                input_2d, weight, weight_scale, out_dtype
+            )
+        else:
+            qualified = sorted(
+                (shape, config)
+                for shape, config in policy.shapes.items()
+                if config.status == "qualified"
+            )
+            rejected = sorted(
+                shape
+                for shape, config in policy.shapes.items()
+                if config.status == "rejected"
+            )
+            dynamic_buffers: list[torch.Tensor] = []
+            buffer_offsets: list[int] = []
+            for shape, _ in qualified:
+                buffers = self._dynamic_a_buffers_for_shape(shape)
+                if buffers is None:
+                    buffer_offsets.append(-1)
+                    continue
+                buffer_offsets.append(len(dynamic_buffers))
+                dynamic_buffers.extend(
+                    buffers[name]
+                    for name in (
+                        "quant_out_value",
+                        "quant_out_scale",
+                        "workspace",
+                        "out",
+                    )
+                )
+
+            runtime_metadata = policy.runtime_metadata
+            dynamic_enabled = (
+                policy.runtime_compatible
+                and runtime_metadata["activation_dtype"] == _dtype_name(x.dtype)
+                and runtime_metadata["output_dtype"] == _dtype_name(out_dtype)
+                and current_platform.is_cuda()
+                and current_platform.is_device_capability_family(100)
+                and vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass()
+            )
+            output = torch.ops.vllm.mxfp8_cutedsl_dynamic_a_hybrid(
                 input_2d,
                 weight,
                 weight_scale,
-                out=dynamic_buffers["out"],
-                workspace=dynamic_buffers["workspace"],
-                quant_out_value=dynamic_buffers["quant_out_value"],
-                quant_out_scale=dynamic_buffers["quant_out_scale"],
-                out_dtype=out_dtype,
-                tactic=config.tactic,
-            )
-        else:
-            if (
-                self._dynamic_a_policy is not None
-                and dynamic_buffers is not None
-                and (
-                    not current_platform.is_cuda()
-                    or not current_platform.is_device_capability_family(100)
-                    or x.dtype != torch.bfloat16
-                    or not vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass()
-                )
-            ):
-                self._dynamic_a_policy.select(problem)
-            input_mxfp8, input_scale = mxfp8_e4m3_quantize(
-                input_2d, is_sf_swizzled_layout=True
-            )
-            output = vllm_flashinfer.mm_mxfp8(
-                input_mxfp8,
-                weight,
-                input_scale,
-                weight_scale,
-                out_dtype=out_dtype,
-                backend="cute-dsl",
+                dynamic_buffers,
+                [dimension for shape, _ in qualified for dimension in shape],
+                [dimension for shape in rejected for dimension in shape],
+                buffer_offsets,
+                [config.tactic for _, config in qualified],
+                dynamic_enabled,
+                policy.telemetry_key,
+                self._dynamic_a_telemetry_for_current_slot(),
+                out_dtype,
             )
 
         if bias is not None:

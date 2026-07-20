@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -98,4 +98,10 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
     def reserve_dynamic_a_workspaces(
         self, layer: torch.nn.Module, manager: "WorkspaceManager"
     ) -> None:
-        self.kernel.reserve_dynamic_a_workspaces(layer, manager)
+        dtype = cast(torch.dtype, layer.params_dtype)
+        self.kernel.reserve_dynamic_a_workspaces(
+            layer,
+            manager,
+            activation_dtype=dtype,
+            output_dtype=dtype,
+        )

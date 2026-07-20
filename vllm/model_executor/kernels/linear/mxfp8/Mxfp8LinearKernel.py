@@ -51,7 +51,12 @@ class Mxfp8LinearKernel(ABC):
         raise NotImplementedError
 
     def reserve_dynamic_a_workspaces(
-        self, layer: torch.nn.Module, manager: "WorkspaceManager"
+        self,
+        layer: torch.nn.Module,
+        manager: "WorkspaceManager",
+        *,
+        activation_dtype: torch.dtype,
+        output_dtype: torch.dtype,
     ) -> None:
         return
 

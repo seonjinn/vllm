@@ -45,6 +45,10 @@ class WorkspaceManager:
         self._max_tensor_bytes_by_dtype: list[dict[torch.dtype, int]] = [
             {} for _ in range(self._num_ubatches)
         ]
+        self._owner_workspaces: dict[str, list[torch.Tensor]] = {}
+        self._owner_specs: dict[
+            str, tuple[tuple[tuple[int, ...], torch.dtype], ...]
+        ] = {}
         self._locked: bool = False
 
     @staticmethod
@@ -114,6 +118,50 @@ class WorkspaceManager:
         return [
             self._get_simultaneous_for_ubatch(ubatch_id, shapes_and_dtypes)
             for ubatch_id in range(self._num_ubatches)
+        ]
+
+    def reserve_owner_for_all_ubatches(
+        self,
+        owner: str,
+        *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype],
+    ) -> list[list[torch.Tensor]]:
+        """Reserve graph-stable storage disjoint from all other owners."""
+        specs = tuple(shapes_and_dtypes)
+        existing_specs = self._owner_specs.get(owner)
+        if existing_specs is not None and existing_specs != specs:
+            raise AssertionError(
+                f"Owner workspace {owner!r} cannot change its reserved layout"
+            )
+
+        actual_bytes = [
+            _compute_bytes(shape, dtype) for shape, dtype in shapes_and_dtypes
+        ]
+        aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
+        offsets = list(accumulate([0] + aligned_bytes[:-1]))
+        total_bytes = sum(aligned_bytes)
+
+        workspaces = self._owner_workspaces.get(owner)
+        if workspaces is None:
+            if self._locked:
+                raise AssertionError(
+                    "Workspace growth is not allowed after locking: "
+                    f"owner {owner!r} was not reserved before capture"
+                )
+            workspaces = [
+                torch.empty((total_bytes,), dtype=torch.uint8, device=self._device)
+                for _ in range(self._num_ubatches)
+            ]
+            self._owner_workspaces[owner] = workspaces
+            self._owner_specs[owner] = specs
+
+        return [
+            [
+                workspace[offsets[i] : offsets[i] + actual_bytes[i]]
+                .view(shapes_and_dtypes[i][1])
+                .reshape(shapes_and_dtypes[i][0])
+                for i in range(len(shapes_and_dtypes))
+            ]
+            for workspace in workspaces
         ]
 
     def _get_simultaneous_for_ubatch(
@@ -223,6 +271,7 @@ class WorkspaceManager:
                     ubatch_id,
                 )
 
+        assert current_workspace is not None
         return current_workspace
 
 

@@ -113,6 +113,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 logger = init_logger(__name__)
 
@@ -304,6 +305,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+        self._reserve_mxfp8_dynamic_a_workspaces()
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
@@ -367,6 +369,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+
+    def _reserve_mxfp8_dynamic_a_workspaces(self) -> None:
+        manager = current_workspace_manager()
+        models = [self.model]
+        speculator_model = getattr(getattr(self, "speculator", None), "model", None)
+        if isinstance(speculator_model, torch.nn.Module):
+            models.append(speculator_model)
+
+        seen_models: set[int] = set()
+        for model in models:
+            if id(model) in seen_models:
+                continue
+            seen_models.add(id(model))
+            for layer in model.modules():
+                quant_method = getattr(layer, "quant_method", None)
+                reserve = getattr(
+                    quant_method, "reserve_dynamic_a_workspaces", None
+                )
+                if reserve is not None:
+                    reserve(layer, manager)
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -691,6 +713,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             return 0
 
+        self._reserve_mxfp8_dynamic_a_workspaces()
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
@@ -713,6 +736,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture(attn_states)
+
+        lock_workspace()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]

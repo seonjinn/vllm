@@ -97,7 +97,12 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
     def reserve_dynamic_a_workspaces(
         self, layer: torch.nn.Module, manager: "WorkspaceManager"
     ) -> None:
-        self.kernel.reserve_dynamic_a_workspaces(layer, manager)
+        self.kernel.reserve_dynamic_a_workspaces(
+            layer,
+            manager,
+            activation_dtype=self.input_dtype,
+            output_dtype=self.input_dtype,
+        )
 
 
 class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):

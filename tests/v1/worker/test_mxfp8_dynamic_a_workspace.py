@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.v1.worker.gpu.model_runner as gpu_model_runner_v2_module
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 import vllm.v1.worker.workspace as workspace
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -41,6 +42,31 @@ def test_pre_capture_reservation_allocates_buffers_per_dbo_slot() -> None:
     ]
 
 
+def test_owner_reservations_are_disjoint_and_stable() -> None:
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=2)
+
+    first = manager.reserve_owner_for_all_ubatches(
+        "layer.0", *_allowlisted_dynamic_a_buffers()
+    )
+    second = manager.reserve_owner_for_all_ubatches(
+        "layer.1", *_allowlisted_dynamic_a_buffers()
+    )
+    first_again = manager.reserve_owner_for_all_ubatches(
+        "layer.0", *_allowlisted_dynamic_a_buffers()
+    )
+
+    first_storages = {
+        buffer.untyped_storage().data_ptr() for slot in first for buffer in slot
+    }
+    second_storages = {
+        buffer.untyped_storage().data_ptr() for slot in second for buffer in slot
+    }
+    assert first_storages.isdisjoint(second_storages)
+    assert [buffer.data_ptr() for slot in first for buffer in slot] == [
+        buffer.data_ptr() for slot in first_again for buffer in slot
+    ]
+
+
 def test_locked_workspace_rejects_growth_after_pre_capture_reservation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -62,6 +88,31 @@ class _DynamicAReservationProbe:
     ) -> None:
         self.calls.append((tuple(layer.weight.shape), tuple(layer.weight_scale.shape)))
         manager.reserve_simultaneous_for_all_ubatches(*_allowlisted_dynamic_a_buffers())
+
+
+def test_v1_reservation_traverses_separately_held_drafter_model() -> None:
+    workspace.reset_workspace_manager()
+    workspace.init_workspace_manager(torch.device("cpu"), num_ubatches=1)
+    probe = _DynamicAReservationProbe()
+
+    def make_model(n: int) -> torch.nn.Module:
+        model = torch.nn.Module()
+        layer = torch.nn.Module()
+        layer.weight = torch.empty((512, n), dtype=torch.float8_e4m3fn)
+        layer.weight_scale = torch.empty((4096,), dtype=torch.uint8)
+        layer.quant_method = probe
+        model.add_module("linear", layer)
+        return model
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = make_model(130)
+    runner.drafter = SimpleNamespace(model=make_model(256))
+    try:
+        runner._reserve_mxfp8_dynamic_a_workspaces()
+    finally:
+        workspace.reset_workspace_manager()
+
+    assert probe.calls == [((512, 130), (4096,)), ((512, 256), (4096,))]
 
 
 def test_capture_model_reserves_dynamic_a_before_workspace_lock(
@@ -151,3 +202,65 @@ def test_capture_model_reserves_dynamic_a_before_workspace_lock(
         2,
         True,
     )
+
+
+def test_v2_capture_reserves_model_and_speculator_before_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace.reset_workspace_manager()
+    workspace.init_workspace_manager(torch.device("cpu"), num_ubatches=1)
+    manager = workspace.current_workspace_manager()
+    calls: list[str] = []
+
+    def make_model(name: str) -> torch.nn.Module:
+        model = torch.nn.Module()
+        layer = torch.nn.Module()
+        layer.weight = torch.empty((512, 130), dtype=torch.float8_e4m3fn)
+        layer.quant_method = SimpleNamespace(
+            reserve_dynamic_a_workspaces=lambda *_: calls.append(name)
+        )
+        model.add_module("linear", layer)
+        return model
+
+    runner = object.__new__(gpu_model_runner_v2_module.GPUModelRunner)
+    runner.model = make_model("model")
+    runner.speculator = SimpleNamespace(
+        model=make_model("speculator"), capture=lambda _: None
+    )
+    runner.cudagraph_manager = SimpleNamespace(
+        needs_capture=lambda: True,
+        capture=lambda *_args, **_kwargs: None,
+    )
+    runner.model_state = object()
+    runner.input_buffers = object()
+    runner.intermediate_tensors = object()
+    runner.block_tables = object()
+    runner.attn_groups = object()
+    runner.kv_cache_config = object()
+    runner.lora_config = None
+    runner.use_aux_hidden_state_outputs = False
+    runner.device = torch.device("cpu")
+    runner.maybe_setup_dummy_loras = lambda _: nullcontext()
+
+    monkeypatch.setattr(gpu_model_runner_v2_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module.torch,
+        "accelerator",
+        SimpleNamespace(
+            empty_cache=lambda: None,
+            get_memory_info=lambda: (1024, 1024),
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2_module,
+        "create_lora_capture_hook",
+        lambda *_: None,
+    )
+
+    try:
+        runner.capture_model()
+    finally:
+        workspace.reset_workspace_manager()
+
+    assert calls == ["model", "speculator"]
+    assert manager.is_locked()

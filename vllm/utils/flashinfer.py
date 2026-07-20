@@ -11,7 +11,7 @@ import importlib
 import importlib.util
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, NoReturn
 
 import requests
@@ -243,18 +243,78 @@ def has_flashinfer_cutedsl() -> bool:
 
 @functools.cache
 def has_flashinfer_mxfp8_dynamic_a_cutlass() -> bool:
-    """Return whether the caller-owned-buffer dynamic-A API is available."""
+    """Return whether dynamic-A execution and resource-query APIs exist."""
     if not has_flashinfer():
         return False
-    module = _get_submodule("flashinfer.gemm")
-    if module is not None and callable(
-        getattr(module, "mm_mxfp8_dynamic_activation", None)
-    ):
-        return True
-    module = _get_submodule("flashinfer")
-    return module is not None and callable(
-        getattr(module, "mm_mxfp8_dynamic_activation", None)
+    operation, resource_query, _ = _resolve_mxfp8_dynamic_a_api()
+    return operation is not None and resource_query is not None
+
+
+def _resolve_mxfp8_dynamic_a_api() -> tuple[
+    Callable[..., Any] | None,
+    Callable[..., Any] | None,
+    bool,
+]:
+    operation_without_query: tuple[Callable[..., Any], bool] | None = None
+    for module_name in ("flashinfer", "flashinfer.gemm"):
+        module = _get_submodule(module_name)
+        if module is None:
+            continue
+        operation = getattr(module, "mm_mxfp8_dynamic_activation", None)
+        compatibility_api = False
+        if not callable(operation):
+            operation = getattr(module, "dynamic_a_cutlass_mxfp8", None)
+            compatibility_api = callable(operation)
+        if not callable(operation):
+            continue
+        resource_query = getattr(
+            module, "get_mm_mxfp8_dynamic_activation_resources", None
+        )
+        if callable(resource_query):
+            return operation, resource_query, compatibility_api
+        if operation_without_query is None:
+            operation_without_query = operation, compatibility_api
+    if operation_without_query is not None:
+        operation, compatibility_api = operation_without_query
+        return operation, None, compatibility_api
+    return None, None, False
+
+
+def get_flashinfer_mxfp8_dynamic_a_resources(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    tactic: int,
+    activation_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+) -> dict[str, int] | None:
+    """Query exact dynamic-A resources without allocating device storage."""
+    operation, resource_query, _ = _resolve_mxfp8_dynamic_a_api()
+    if operation is None or resource_query is None:
+        return None
+    resources = resource_query(
+        m,
+        n,
+        k,
+        tactic=tactic,
+        activation_dtype=activation_dtype,
+        output_dtype=output_dtype,
     )
+    if not isinstance(resources, Mapping):
+        return None
+    expected_keys = {
+        "workspace_bytes",
+        "activation_value_elements",
+        "activation_scale_elements",
+        "output_elements",
+    }
+    if set(resources) != expected_keys or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in resources.values()
+    ):
+        return None
+    return {key: int(resources[key]) for key in expected_keys}
 
 
 def _mm_mxfp8_dynamic_a_cutlass_impl(
@@ -268,9 +328,12 @@ def _mm_mxfp8_dynamic_a_cutlass_impl(
     out_dtype: torch.dtype,
     tactic: int,
 ) -> torch.Tensor:
-    flashinfer = importlib.import_module("flashinfer")
-    dynamic_a = getattr(flashinfer, "mm_mxfp8_dynamic_activation", None)
-    if callable(dynamic_a):
+    dynamic_a, _, compatibility_api = _resolve_mxfp8_dynamic_a_api()
+    if dynamic_a is None:
+        raise RuntimeError(
+            "FlashInfer dynamic-A MXFP8 API is unavailable at execution time"
+        )
+    if not compatibility_api:
         result = dynamic_a(
             a_bf16,
             weight_col_major,
@@ -282,12 +345,7 @@ def _mm_mxfp8_dynamic_a_cutlass_impl(
             tactic=tactic,
         )
     else:
-        compatibility_api = getattr(flashinfer, "dynamic_a_cutlass_mxfp8", None)
-        if not callable(compatibility_api):
-            raise RuntimeError(
-                "FlashInfer dynamic-A MXFP8 API is unavailable at execution time"
-            )
-        result = compatibility_api(
+        result = dynamic_a(
             a_bf16,
             weight_col_major,
             weight_scale_128x4,
@@ -297,7 +355,13 @@ def _mm_mxfp8_dynamic_a_cutlass_impl(
             quant_out_scale=quant_out_scale,
             out_dtype=out_dtype,
         )
-    return out if result is None else result
+    if result is not None and (
+        not isinstance(result, torch.Tensor) or result.data_ptr() != out.data_ptr()
+    ):
+        raise RuntimeError(
+            "FlashInfer dynamic-A result must alias caller-owned out storage"
+        )
+    return out.clone()
 
 
 def _mm_mxfp8_dynamic_a_cutlass_fake(
@@ -1159,6 +1223,7 @@ __all__ = [
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_mxfp8_dynamic_a_cutlass",
+    "get_flashinfer_mxfp8_dynamic_a_resources",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",
     "has_flashinfer_fp8_blockscale_gemm",

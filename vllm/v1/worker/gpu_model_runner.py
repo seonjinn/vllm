@@ -5383,11 +5383,27 @@ class GPUModelRunner(
 
     def _reserve_mxfp8_dynamic_a_workspaces(self) -> None:
         manager = current_workspace_manager()
-        for layer in self.model.modules():
-            quant_method = getattr(layer, "quant_method", None)
-            reserve = getattr(quant_method, "reserve_dynamic_a_workspaces", None)
-            if reserve is not None:
-                reserve(layer, manager)
+        model = self.model
+        if model is None:
+            return
+        models = [model]
+        drafter = getattr(self, "drafter", None)
+        drafter_model = getattr(drafter, "model", None)
+        if isinstance(drafter_model, torch.nn.Module):
+            models.append(drafter_model)
+
+        seen_models: set[int] = set()
+        for model in models:
+            if id(model) in seen_models:
+                continue
+            seen_models.add(id(model))
+            for layer in model.modules():
+                quant_method = getattr(layer, "quant_method", None)
+                reserve = getattr(
+                    quant_method, "reserve_dynamic_a_workspaces", None
+                )
+                if reserve is not None:
+                    reserve(layer, manager)
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:

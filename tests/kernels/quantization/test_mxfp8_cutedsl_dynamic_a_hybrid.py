@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import json
 import sys
 from collections.abc import Iterator
@@ -250,6 +251,155 @@ def test_malformed_physical_shape_key_is_rejected(tmp_path: Path) -> None:
         hybrid.load_mxfp8_cutedsl_dynamic_a_policy(str(path), runtime_metadata=_RUNTIME)
 
 
+def test_duplicate_physical_shape_key_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_dynamic_a_allowlist.json"
+    path.write_text(
+        '{"schema_version":1,"runtime":'
+        + json.dumps(_RUNTIME)
+        + ',"shapes":{"8,130,512":{"status":"rejected"},'
+        '"8,130,512":{"status":"rejected"}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate JSON key"):
+        hybrid.load_mxfp8_cutedsl_dynamic_a_policy(
+            str(path), runtime_metadata=_RUNTIME
+        )
+
+
+def test_runtime_metadata_uses_configured_dtypes() -> None:
+    metadata = hybrid._mxfp8_dynamic_a_runtime_metadata(
+        torch.float16, torch.float32
+    )
+
+    assert (metadata["activation_dtype"], metadata["output_dtype"]) == (
+        "float16",
+        "float32",
+    )
+
+
+def test_dynamic_resources_require_same_module_runtime_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resources = {
+        "workspace_bytes": 4096,
+        "activation_value_elements": 4096,
+        "activation_scale_elements": 128,
+        "output_elements": 1040,
+    }
+    module = SimpleNamespace(
+        mm_mxfp8_dynamic_activation=lambda *_args, **_kwargs: None,
+        get_mm_mxfp8_dynamic_activation_resources=lambda *_args, **_kwargs: resources,
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer", module)
+    vllm_flashinfer.has_flashinfer_mxfp8_dynamic_a_cutlass.cache_clear()
+
+    assert vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
+        8,
+        130,
+        512,
+        tactic=7,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    ) == resources
+
+    delattr(module, "get_mm_mxfp8_dynamic_activation_resources")
+    assert (
+        vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
+            8,
+            130,
+            512,
+            tactic=7,
+            activation_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+        is None
+    )
+
+
+def test_dynamic_api_prefers_complete_gemm_pair_over_partial_top_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resources = {
+        "workspace_bytes": 4096,
+        "activation_value_elements": 4096,
+        "activation_scale_elements": 128,
+        "output_elements": 1040,
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(mm_mxfp8_dynamic_activation=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.gemm",
+        SimpleNamespace(
+            mm_mxfp8_dynamic_activation=lambda *_args, **_kwargs: None,
+            get_mm_mxfp8_dynamic_activation_resources=(
+                lambda *_args, **_kwargs: resources
+            ),
+        ),
+    )
+
+    assert vllm_flashinfer.get_flashinfer_mxfp8_dynamic_a_resources(
+        8,
+        130,
+        512,
+        tactic=7,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    ) == resources
+
+
+def test_runtime_resource_mismatch_fails_before_owner_allocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
+    kernel._dynamic_a_artifact_path = _write_artifact(tmp_path)
+    kernel._dynamic_a_policy = None
+    kernel._dynamic_a_buffers = {}
+    kernel._dynamic_a_telemetry = ()
+    kernel._dynamic_a_owner_key = "layer.0"
+    manager = SimpleNamespace(
+        reserve_owner_for_all_ubatches=lambda *_args, **_kwargs: pytest.fail(
+            "resource mismatch must fail before allocation"
+        )
+    )
+    monkeypatch.setattr(
+        hybrid, "_mxfp8_dynamic_a_runtime_metadata", lambda *_: _RUNTIME
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda capability: capability == 100,
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer, "has_flashinfer_mxfp8_dynamic_a_cutlass", lambda: True
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "get_flashinfer_mxfp8_dynamic_a_resources",
+        lambda *_args, **_kwargs: {
+            "workspace_bytes": 8192,
+            "activation_value_elements": 4096,
+            "activation_scale_elements": 128,
+            "output_elements": 1040,
+        },
+    )
+
+    kernel.reserve_dynamic_a_workspaces(
+        torch.nn.Module(),
+        manager,
+        activation_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert kernel._dynamic_a_buffers == {}
+
 def test_policy_records_dynamic_hits_stock_misses_and_incompatibility_fallbacks(
     tmp_path: Path,
 ) -> None:
@@ -260,7 +410,7 @@ def test_policy_records_dynamic_hits_stock_misses_and_incompatibility_fallbacks(
     policy.select((8, 256, 512))
     policy.select((16, 130, 512))
 
-    assert policy.dispatch_counters() == {
+    assert policy.selection_counters() == {
         "dynamic_hits": 1,
         "stock_misses": 1,
         "incompatibility_fallbacks": 1,
@@ -281,6 +431,13 @@ def test_apply_weights_uses_physical_n_for_dynamic_a_dispatch(
         [],
         [(8, 130, 512)],
     )
+
+
+def test_apply_weights_delegates_runtime_shape_choice_to_opaque_op() -> None:
+    source = inspect.getsource(hybrid.FlashInferCutedslMxfp8LinearKernel.apply_weights)
+
+    assert ".select(" not in source
+    assert "mxfp8_cutedsl_dynamic_a_hybrid" in source
 
 
 @pytest.mark.parametrize(
@@ -397,6 +554,61 @@ def test_post_load_keeps_one_unpadded_stock_b_and_b_scale_storage(
         (layer.weight.untyped_storage().data_ptr(), n * k),
         (layer.weight_scale.untyped_storage().data_ptr(), 4096),
     }
+
+
+def test_dynamic_custom_op_returns_fresh_output_and_validates_upstream_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = torch.ones((8, 512), dtype=torch.bfloat16)
+    weight = torch.empty((512, 130), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty((4096,), dtype=torch.uint8)
+    out = torch.empty((8, 130), dtype=torch.bfloat16)
+    workspace = torch.empty((4096,), dtype=torch.uint8)
+    quantized_a = torch.empty((8, 512), dtype=torch.float8_e4m3fn)
+    quantized_a_scale = torch.empty((8, 16), dtype=torch.uint8)
+
+    def dynamic_a_cutlass_mxfp8(*_: object, out: torch.Tensor, **__: object):
+        out.fill_(3)
+        return out
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(dynamic_a_cutlass_mxfp8=dynamic_a_cutlass_mxfp8),
+    )
+    result = vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
+        a,
+        weight,
+        weight_scale,
+        out=out,
+        workspace=workspace,
+        quant_out_value=quantized_a,
+        quant_out_scale=quantized_a_scale,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert result.data_ptr() != out.data_ptr()
+    torch.testing.assert_close(result, out)
+
+    def nonalias_dynamic_a(*_: object, out: torch.Tensor, **__: object):
+        return torch.empty_like(out)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(dynamic_a_cutlass_mxfp8=nonalias_dynamic_a),
+    )
+    with pytest.raises(RuntimeError, match="must alias caller-owned out"):
+        vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
+            a,
+            weight,
+            weight_scale,
+            out=out,
+            workspace=workspace,
+            quant_out_value=quantized_a,
+            quant_out_scale=quantized_a_scale,
+            out_dtype=torch.bfloat16,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
