@@ -3,6 +3,7 @@
 
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +45,129 @@ def _write_artifact(tmp_path: Path) -> str:
     path = tmp_path / "dynamic_a_allowlist.json"
     path.write_text(json.dumps(artifact), encoding="utf-8")
     return str(path)
+
+
+def _make_physical_layer() -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.ones((512, 130), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = Parameter(
+        torch.ones((4096,), dtype=torch.float8_e8m0fnu), requires_grad=False
+    )
+    # This is intentionally not the physical output width. Dispatch must use
+    # layer.weight.shape, not a logical/checkpoint-derived output width.
+    layer.output_size_per_partition = 256
+    return layer
+
+
+def _guard_trtllm_helpers() -> SimpleNamespace:
+    def fail_helper_use(*_: object, **__: object) -> None:
+        pytest.fail("TRTLLM weight helper was invoked")
+
+    return SimpleNamespace(
+        shuffle_matrix_a=fail_helper_use,
+        shuffle_matrix_sf_a=fail_helper_use,
+    )
+
+
+def _run_apply_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: object | None,
+    *,
+    api_available: bool = True,
+    is_sm100: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
+    m: int = 8,
+) -> tuple[torch.Tensor, list[dict[str, object]], list[tuple[int, int, int]]]:
+    stock_calls: list[dict[str, object]] = []
+    dynamic_shapes: list[tuple[int, int, int]] = []
+    layer = _make_physical_layer()
+    kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
+    kernel._dynamic_a_policy = policy
+    x = torch.ones((m, 512), dtype=dtype)
+
+    monkeypatch.setitem(sys.modules, "flashinfer", _guard_trtllm_helpers())
+    monkeypatch.setattr(
+        hybrid,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: is_sm100,
+            is_device_capability_family=lambda capability: (
+                is_sm100 and capability == 100
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        hybrid,
+        "mxfp8_e4m3_quantize",
+        lambda value, **_: (
+            value.to(torch.float8_e4m3fn),
+            torch.ones((4096,), dtype=torch.float8_e8m0fnu),
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_flashinfer,
+        "has_flashinfer_mxfp8_dynamic_a_cutlass",
+        lambda: api_available,
+    )
+
+    def stock_mm(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        stock_calls.append({"backend": kwargs["backend"], "b_shape": tuple(b.shape)})
+        return torch.zeros((a.shape[0], b.shape[1]), dtype=kwargs["out_dtype"])
+
+    def dynamic_mm(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        **_: object,
+    ) -> torch.Tensor:
+        dynamic_shapes.append((a.shape[0], b.shape[1], b.shape[0]))
+        return torch.zeros((a.shape[0], b.shape[1]), dtype=a.dtype)
+
+    monkeypatch.setattr(vllm_flashinfer, "mm_mxfp8", stock_mm)
+    monkeypatch.setattr(vllm_flashinfer, "mm_mxfp8_dynamic_a_cutlass", dynamic_mm)
+
+    return kernel.apply_weights(layer, x), stock_calls, dynamic_shapes
+
+
+def _persistent_tensor_storages(module: torch.nn.Module) -> set[tuple[int, int]]:
+    seen_objects: set[int] = set()
+    storages: set[tuple[int, int]] = set()
+
+    def visit(value: object) -> Iterator[torch.Tensor]:
+        if id(value) in seen_objects:
+            return
+        seen_objects.add(id(value))
+        if isinstance(value, torch.Tensor):
+            yield value
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                yield from visit(child)
+
+    values: list[object] = [
+        dict(module.named_parameters(remove_duplicate=False)),
+        dict(module.named_buffers(remove_duplicate=False)),
+        {
+            name: value
+            for name, value in vars(module).items()
+            if name not in {"_parameters", "_buffers", "_modules"}
+        },
+    ]
+    for value in values:
+        for tensor in visit(value):
+            storage = tensor.untyped_storage()
+            storages.add((storage.data_ptr(), storage.nbytes()))
+    return storages
 
 
 @pytest.mark.parametrize(
@@ -111,6 +235,114 @@ def test_policy_records_dynamic_hits_stock_misses_and_incompatibility_fallbacks(
     }
 
 
+def test_apply_weights_uses_physical_n_for_dynamic_a_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    policy = hybrid.load_mxfp8_cutedsl_dynamic_a_policy(
+        _write_artifact(tmp_path), runtime_metadata=_RUNTIME
+    )
+
+    output, stock_calls, dynamic_shapes = _run_apply_weights(monkeypatch, policy)
+
+    assert (tuple(output.shape), stock_calls, dynamic_shapes) == (
+        (8, 130),
+        [],
+        [(8, 130, 512)],
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime_override",
+    [{field: "mismatch"} for field in _RUNTIME],
+)
+def test_apply_weights_uses_stock_for_each_runtime_metadata_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    runtime_override: dict[str, str],
+) -> None:
+    policy = hybrid.load_mxfp8_cutedsl_dynamic_a_policy(
+        _write_artifact(tmp_path), runtime_metadata=_RUNTIME | runtime_override
+    )
+
+    _, stock_calls, dynamic_shapes = _run_apply_weights(monkeypatch, policy)
+
+    assert (stock_calls, dynamic_shapes) == (
+        [{"backend": "cute-dsl", "b_shape": (512, 130)}],
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "api_available", "is_sm100", "dtype"),
+    [
+        (None, True, True, torch.bfloat16),
+        ("matching", True, False, torch.bfloat16),
+        ("matching", True, True, torch.float16),
+        ("matching", False, True, torch.bfloat16),
+    ],
+    ids=["absent-artifact", "unsupported-sm", "unsupported-dtype", "missing-api"],
+)
+def test_apply_weights_falls_back_to_stock_when_dynamic_a_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    policy: object | str | None,
+    api_available: bool,
+    is_sm100: bool,
+    dtype: torch.dtype,
+) -> None:
+    if policy is None:
+        monkeypatch.delenv("VLLM_MXFP8_CUTEDSL_DYNAMIC_A_ARTIFACT", raising=False)
+    resolved_policy = (
+        hybrid.load_mxfp8_cutedsl_dynamic_a_policy(
+            _write_artifact(tmp_path), runtime_metadata=_RUNTIME
+        )
+        if policy == "matching"
+        else policy
+    )
+
+    _, stock_calls, dynamic_shapes = _run_apply_weights(
+        monkeypatch,
+        resolved_policy,
+        api_available=api_available,
+        is_sm100=is_sm100,
+        dtype=dtype,
+    )
+
+    assert (stock_calls, dynamic_shapes) == (
+        [{"backend": "cute-dsl", "b_shape": (512, 130)}],
+        [],
+    )
+
+
+def test_apply_weights_updates_telemetry_for_dynamic_miss_and_incompatible_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    qualified = hybrid.load_mxfp8_cutedsl_dynamic_a_policy(
+        _write_artifact(tmp_path), runtime_metadata=_RUNTIME
+    )
+    incompatible = hybrid.load_mxfp8_cutedsl_dynamic_a_policy(
+        _write_artifact(tmp_path),
+        runtime_metadata=_RUNTIME | {"cuda_version": "mismatch"},
+    )
+    _run_apply_weights(monkeypatch, qualified)
+    _run_apply_weights(monkeypatch, qualified, m=32)
+    _run_apply_weights(monkeypatch, qualified)
+    _run_apply_weights(monkeypatch, incompatible)
+
+    assert (qualified.dispatch_counters(), incompatible.dispatch_counters()) == (
+        {
+            "dynamic_hits": 2,
+            "stock_misses": 1,
+            "incompatibility_fallbacks": 0,
+        },
+        {
+            "dynamic_hits": 0,
+            "stock_misses": 0,
+            "incompatibility_fallbacks": 1,
+        },
+    )
+
+
 def test_post_load_keeps_one_unpadded_stock_b_and_b_scale_storage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -123,37 +355,23 @@ def test_post_load_keeps_one_unpadded_stock_b_and_b_scale_storage(
         torch.ones((n, k // MXFP8_BLOCK_SIZE), dtype=torch.float8_e8m0fnu),
         requires_grad=False,
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "flashinfer",
-        SimpleNamespace(
-            shuffle_matrix_a=lambda *_: pytest.fail("TRTLLM shuffle called"),
-            shuffle_matrix_sf_a=lambda *_: pytest.fail("TRTLLM scale shuffle called"),
-        ),
-    )
+    monkeypatch.setitem(sys.modules, "flashinfer", _guard_trtllm_helpers())
 
     kernel = object.__new__(hybrid.FlashInferCutedslMxfp8LinearKernel)
     kernel.process_weights_after_loading(layer)
 
-    assert {
-        name: (
-            tuple(parameter.shape),
-            parameter.ndim,
-            parameter.untyped_storage().nbytes(),
-        )
-        for name, parameter in layer.named_parameters()
-    } == {
-        "weight": ((k, n), 2, n * k),
-        "weight_scale": ((4096,), 1, 4096),
+    assert _persistent_tensor_storages(layer) == {
+        (layer.weight.untyped_storage().data_ptr(), n * k),
+        (layer.weight_scale.untyped_storage().data_ptr(), 4096),
     }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dynamic_custom_op_forwards_all_caller_owned_buffers(
+def test_dynamic_custom_op_is_compile_and_cuda_graph_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     device = torch.device("cuda")
-    a = torch.empty((8, 512), dtype=torch.bfloat16, device=device)
+    a = torch.ones((8, 512), dtype=torch.bfloat16, device=device)
     weight = torch.empty((512, 130), dtype=torch.float8_e4m3fn, device=device)
     weight_scale = torch.empty((4096,), dtype=torch.float8_e8m0fnu, device=device)
     out = torch.empty((8, 130), dtype=torch.bfloat16, device=device)
@@ -185,6 +403,7 @@ def test_dynamic_custom_op_forwards_all_caller_owned_buffers(
                 "out_dtype": out_dtype,
             }
         )
+        out.copy_(a_bf16[:, :1].expand_as(out))
         return out
 
     monkeypatch.setitem(
@@ -193,18 +412,46 @@ def test_dynamic_custom_op_forwards_all_caller_owned_buffers(
         SimpleNamespace(dynamic_a_cutlass_mxfp8=dynamic_a_cutlass_mxfp8),
     )
 
-    result = vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
-        a,
-        weight,
-        weight_scale,
-        out=out,
-        workspace=workspace,
-        quant_out_value=quantized_a,
-        quant_out_scale=quantized_a_scale,
-        out_dtype=torch.bfloat16,
-    )
+    def run(a_bf16: torch.Tensor) -> torch.Tensor:
+        return vllm_flashinfer.mm_mxfp8_dynamic_a_cutlass(
+            a_bf16,
+            weight,
+            weight_scale,
+            out=out,
+            workspace=workspace,
+            quant_out_value=quantized_a,
+            quant_out_scale=quantized_a_scale,
+            out_dtype=torch.bfloat16,
+        )
 
-    assert (result.data_ptr(), forwarded) == (
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)
+    compiled(a)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = compiled(a)
+    first_output = out.clone()
+    pointers_before_replay = (
+        {
+            "a": a.data_ptr(),
+            "weight": weight.data_ptr(),
+            "weight_scale": weight_scale.data_ptr(),
+            "out": out.data_ptr(),
+            "workspace": workspace.data_ptr(),
+            "quantized_a": quantized_a.data_ptr(),
+            "quantized_a_scale": quantized_a_scale.data_ptr(),
+            "out_dtype": torch.bfloat16,
+        },
+    )
+    a.fill_(2)
+    graph.replay()
+
+    assert (
+        result.data_ptr(),
+        forwarded,
+        pointers_before_replay,
+        out,
+        first_output,
+    ) == (
         out.data_ptr(),
         {
             "a": a.data_ptr(),
@@ -216,4 +463,18 @@ def test_dynamic_custom_op_forwards_all_caller_owned_buffers(
             "quantized_a_scale": quantized_a_scale.data_ptr(),
             "out_dtype": torch.bfloat16,
         },
+        (
+            {
+                "a": a.data_ptr(),
+                "weight": weight.data_ptr(),
+                "weight_scale": weight_scale.data_ptr(),
+                "out": out.data_ptr(),
+                "workspace": workspace.data_ptr(),
+                "quantized_a": quantized_a.data_ptr(),
+                "quantized_a_scale": quantized_a_scale.data_ptr(),
+                "out_dtype": torch.bfloat16,
+            },
+        ),
+        torch.full_like(out, 2),
+        torch.full_like(first_output, 1),
     )
