@@ -15,6 +15,7 @@ if TYPE_CHECKING:
         RoutedExperts,
     )
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.v1.worker.workspace import WorkspaceManager
 
 from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
@@ -92,6 +93,11 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer, x, bias)
+
+    def reserve_dynamic_a_workspaces(
+        self, layer: torch.nn.Module, manager: "WorkspaceManager"
+    ) -> None:
+        self.kernel.reserve_dynamic_a_workspaces(layer, manager)
 
 
 class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):

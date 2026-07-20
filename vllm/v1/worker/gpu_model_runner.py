@@ -219,7 +219,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 from .utils import (
     AttentionGroup,
@@ -5308,6 +5308,7 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        self._reserve_mxfp8_dynamic_a_workspaces()
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
@@ -5379,6 +5380,14 @@ class GPUModelRunner(
                 )
 
         get_offloader().post_init()
+
+    def _reserve_mxfp8_dynamic_a_workspaces(self) -> None:
+        manager = current_workspace_manager()
+        for layer in self.model.modules():
+            quant_method = getattr(layer, "quant_method", None)
+            reserve = getattr(quant_method, "reserve_dynamic_a_workspaces", None)
+            if reserve is not None:
+                reserve(layer, manager)
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:
@@ -6651,6 +6660,8 @@ class GPUModelRunner(
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
             )
             return 0
+
+        self._reserve_mxfp8_dynamic_a_workspaces()
 
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()

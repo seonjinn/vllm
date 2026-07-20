@@ -21,6 +21,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -237,6 +238,117 @@ def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""
     return (
         has_flashinfer() and importlib.util.find_spec("flashinfer.cute_dsl") is not None
+    )
+
+
+@functools.cache
+def has_flashinfer_mxfp8_dynamic_a_cutlass() -> bool:
+    """Return whether the caller-owned-buffer dynamic-A API is available."""
+    if not has_flashinfer():
+        return False
+    module = _get_submodule("flashinfer.gemm")
+    if module is not None and callable(
+        getattr(module, "mm_mxfp8_dynamic_activation", None)
+    ):
+        return True
+    module = _get_submodule("flashinfer")
+    return module is not None and callable(
+        getattr(module, "mm_mxfp8_dynamic_activation", None)
+    )
+
+
+def _mm_mxfp8_dynamic_a_cutlass_impl(
+    a_bf16: torch.Tensor,
+    weight_col_major: torch.Tensor,
+    weight_scale_128x4: torch.Tensor,
+    out: torch.Tensor,
+    workspace: torch.Tensor,
+    quant_out_value: torch.Tensor,
+    quant_out_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    tactic: int,
+) -> torch.Tensor:
+    flashinfer = importlib.import_module("flashinfer")
+    dynamic_a = getattr(flashinfer, "mm_mxfp8_dynamic_activation", None)
+    if callable(dynamic_a):
+        result = dynamic_a(
+            a_bf16,
+            weight_col_major,
+            weight_scale_128x4,
+            out=out,
+            activation_value_workspace=quant_out_value,
+            activation_scale_workspace=quant_out_scale,
+            workspace_buffer=workspace,
+            tactic=tactic,
+        )
+    else:
+        compatibility_api = getattr(flashinfer, "dynamic_a_cutlass_mxfp8", None)
+        if not callable(compatibility_api):
+            raise RuntimeError(
+                "FlashInfer dynamic-A MXFP8 API is unavailable at execution time"
+            )
+        result = compatibility_api(
+            a_bf16,
+            weight_col_major,
+            weight_scale_128x4,
+            out=out,
+            workspace=workspace,
+            quant_out_value=quant_out_value,
+            quant_out_scale=quant_out_scale,
+            out_dtype=out_dtype,
+        )
+    return out if result is None else result
+
+
+def _mm_mxfp8_dynamic_a_cutlass_fake(
+    a_bf16: torch.Tensor,
+    weight_col_major: torch.Tensor,
+    weight_scale_128x4: torch.Tensor,
+    out: torch.Tensor,
+    workspace: torch.Tensor,
+    quant_out_value: torch.Tensor,
+    quant_out_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    tactic: int,
+) -> torch.Tensor:
+    return torch.empty(
+        a_bf16.shape[0],
+        weight_col_major.shape[1],
+        dtype=out_dtype,
+        device=a_bf16.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="mm_mxfp8_dynamic_a_cutlass",
+    op_func=_mm_mxfp8_dynamic_a_cutlass_impl,
+    mutates_args=["out", "workspace", "quant_out_value", "quant_out_scale"],
+    fake_impl=_mm_mxfp8_dynamic_a_cutlass_fake,
+)
+
+
+def mm_mxfp8_dynamic_a_cutlass(
+    a_bf16: torch.Tensor,
+    weight_col_major: torch.Tensor,
+    weight_scale_128x4: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    workspace: torch.Tensor,
+    quant_out_value: torch.Tensor,
+    quant_out_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    tactic: int = -1,
+) -> torch.Tensor:
+    return torch.ops.vllm.mm_mxfp8_dynamic_a_cutlass(
+        a_bf16,
+        weight_col_major,
+        weight_scale_128x4,
+        out,
+        workspace,
+        quant_out_value,
+        quant_out_scale,
+        out_dtype,
+        tactic,
     )
 
 
@@ -512,7 +624,6 @@ def use_trtllm_attention(
 
 
 if has_flashinfer():
-    from vllm.utils.torch_utils import direct_register_custom_op
 
     def _flashinfer_concat_mla_k(
         k: torch.Tensor,
@@ -740,6 +851,10 @@ if has_flashinfer():
     ) -> torch.Tensor:
         # A is [m, k], B is [k, n] -> output [m, n]
         return torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
+
+
+if not has_flashinfer():
+    mm_mxfp8 = _missing
 
 
 def flashinfer_mm_mxfp8(
@@ -1043,6 +1158,7 @@ __all__ = [
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_cutedsl_moe_nvfp4",
+    "has_flashinfer_mxfp8_dynamic_a_cutlass",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",
     "has_flashinfer_fp8_blockscale_gemm",
@@ -1055,6 +1171,7 @@ __all__ = [
     "flashinfer_scaled_fp4_mm_out",
     "flashinfer_scaled_fp8_mm",
     "flashinfer_scaled_fp8_mm_out",
+    "mm_mxfp8_dynamic_a_cutlass",
     "flashinfer_quant_nvfp4_8x4_sf_layout",
     "flashinfer_fp8_blockscale_gemm",
     "should_use_flashinfer_for_blockscale_fp8_gemm",

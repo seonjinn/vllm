@@ -42,6 +42,9 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [
             None
         ] * self._num_ubatches
+        self._max_tensor_bytes_by_dtype: list[dict[torch.dtype, int]] = [
+            {} for _ in range(self._num_ubatches)
+        ]
         self._locked: bool = False
 
     @staticmethod
@@ -100,15 +103,44 @@ class WorkspaceManager:
         Returns:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
         """
-        actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
+        return self._get_simultaneous_for_ubatch(
+            dbo_current_ubatch_id(), shapes_and_dtypes
+        )
+
+    def reserve_simultaneous_for_all_ubatches(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> list[list[torch.Tensor]]:
+        """Reserve one simultaneous buffer set in every DBO slot."""
+        return [
+            self._get_simultaneous_for_ubatch(ubatch_id, shapes_and_dtypes)
+            for ubatch_id in range(self._num_ubatches)
+        ]
+
+    def _get_simultaneous_for_ubatch(
+        self,
+        ubatch_id: int,
+        shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    ) -> list[torch.Tensor]:
+        actual_bytes = [
+            _compute_bytes(shape, dtype) for shape, dtype in shapes_and_dtypes
+        ]
+        limits = self._max_tensor_bytes_by_dtype[ubatch_id]
+        if self._locked:
+            for actual, (_, dtype) in zip(actual_bytes, shapes_and_dtypes):
+                if actual > limits.get(dtype, 0):
+                    raise AssertionError(
+                        "Workspace is locked and the requested tensor exceeds its "
+                        "pre-capture reservation. Workspace growth is not allowed "
+                        "after locking."
+                    )
+        else:
+            for actual, (_, dtype) in zip(actual_bytes, shapes_and_dtypes):
+                limits[dtype] = max(actual, limits.get(dtype, 0))
         aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
-        total_bytes = sum(aligned_bytes)
-
-        # Calculate cumulative offsets using itertools.accumulate
         offsets = list(accumulate([0] + aligned_bytes[:-1]))
-
-        current_workspace = self._ensure_workspace_size(total_bytes)
-
+        current_workspace = self._ensure_workspace_size(
+            sum(aligned_bytes), ubatch_id=ubatch_id
+        )
         return [
             current_workspace[offsets[i] : offsets[i] + actual_bytes[i]]
             .view(shapes_and_dtypes[i][1])
@@ -116,7 +148,9 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def _ensure_workspace_size(
+        self, required_bytes: int, *, ubatch_id: int | None = None
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
@@ -125,7 +159,8 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
-        ubatch_id = dbo_current_ubatch_id()
+        if ubatch_id is None:
+            ubatch_id = dbo_current_ubatch_id()
         current_workspace = self._current_workspaces[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
 

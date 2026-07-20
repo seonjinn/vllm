@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.workspace import WorkspaceManager
 
 from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -90,3 +94,8 @@ class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer, x, bias)
+
+    def reserve_dynamic_a_workspaces(
+        self, layer: torch.nn.Module, manager: "WorkspaceManager"
+    ) -> None:
+        self.kernel.reserve_dynamic_a_workspaces(layer, manager)

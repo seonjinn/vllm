@@ -3,8 +3,12 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.workspace import WorkspaceManager
 
 
 @dataclass
@@ -45,6 +49,11 @@ class Mxfp8LinearKernel(ABC):
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         raise NotImplementedError
+
+    def reserve_dynamic_a_workspaces(
+        self, layer: torch.nn.Module, manager: "WorkspaceManager"
+    ) -> None:
+        return
 
     @abstractmethod
     def apply_weights(
