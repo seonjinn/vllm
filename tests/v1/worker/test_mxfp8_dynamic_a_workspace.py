@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -101,11 +101,16 @@ def test_capture_model_reserves_dynamic_a_before_workspace_lock(
 
     monkeypatch.setattr(runner, "_reserve_mxfp8_dynamic_a_workspaces", reserve_spy)
     monkeypatch.setattr(gpu_model_runner_module, "lock_workspace", lock_spy)
-    monkeypatch.setattr(
-        gpu_model_runner_module,
-        "graph_capture",
-        lambda **_: nullcontext(),
-    )
+
+    @contextmanager
+    def graph_capture_spy(**_: object):
+        lifecycle.append("capture_enter")
+        try:
+            yield
+        finally:
+            lifecycle.append("capture_exit")
+
+    monkeypatch.setattr(gpu_model_runner_module, "graph_capture", graph_capture_spy)
     monkeypatch.setattr(
         gpu_model_runner_module.torch,
         "accelerator",
@@ -141,7 +146,7 @@ def test_capture_model_reserves_dynamic_a_before_workspace_lock(
         before == after,
     ) == (
         [((512, 130), (4096,))],
-        ["reserve", "lock"],
+        ["reserve", "capture_enter", "capture_exit", "lock"],
         True,
         2,
         True,
