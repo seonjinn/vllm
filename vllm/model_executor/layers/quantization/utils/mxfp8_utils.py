@@ -15,14 +15,49 @@ MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
 MXFP8_TRTLLM_8X4_MAX_M = 256
+MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYOUT"
+MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_DENSE_TRTLLM_SWITCH_M"
 MXFP8_TRTLLM_HIGH_M_TACTIC_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC"
-MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV = (
-    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
-)
+MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
+
+
+def mxfp8_trtllm_layout_policy() -> str:
+    policy = os.environ.get(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive").strip().lower()
+    normalized = policy.replace("_", "").replace("-", "")
+    aliases = {
+        "adaptive": "adaptive",
+        "8x4": "8x4",
+        "8by4": "8x4",
+        "128x4": "128x4",
+        "128by4": "128x4",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_LAYOUT_ENV} must be one of adaptive, 8x4, or "
+            f"128x4; got {policy!r}."
+        )
+    return aliases[normalized]
+
+
+def mxfp8_trtllm_switch_m() -> int:
+    switch_m = int(
+        os.environ.get(
+            MXFP8_TRTLLM_SWITCH_M_ENV,
+            str(MXFP8_TRTLLM_8X4_MAX_M),
+        )
+    )
+    if switch_m <= 0:
+        raise ValueError(f"{MXFP8_TRTLLM_SWITCH_M_ENV} must be positive.")
+    return switch_m
 
 
 def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
-    return m <= MXFP8_TRTLLM_8X4_MAX_M
+    policy = mxfp8_trtllm_layout_policy()
+    if policy == "8x4":
+        return True
+    if policy == "128x4":
+        return False
+    return m <= mxfp8_trtllm_switch_m()
 
 
 def mxfp8_trtllm_scale_numel(m: int, k: int, use_8x4: bool) -> int:
@@ -44,8 +79,7 @@ def _parse_mxfp8_tactic_hints(raw: str) -> dict[tuple[int, int, int], int]:
         shape_raw, separator, tactic_raw = item.partition(":")
         if not separator:
             raise ValueError(
-                "MXFP8 tactic hints must use M,N,K:tactic entries; "
-                f"got {item!r}."
+                f"MXFP8 tactic hints must use M,N,K:tactic entries; got {item!r}."
             )
         shape = tuple(int(value.strip()) for value in shape_raw.split(","))
         if len(shape) != 3 or any(value <= 0 for value in shape):
@@ -73,9 +107,8 @@ def _resolve_mxfp8_high_m_tactic(
 
 
 def mxfp8_trtllm_high_m_static_tactics_enabled() -> bool:
-    return (
-        MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ
-        or bool(os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "").strip())
+    return MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ or bool(
+        os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "").strip()
     )
 
 
@@ -118,9 +151,7 @@ def prepare_mxfp8_trtllm_high_m_tactic_state(
 
     fallback_tactic = int(os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, "-1"))
     if fallback_tactic < -1:
-        raise ValueError(
-            f"{MXFP8_TRTLLM_HIGH_M_TACTIC_ENV} must be -1 or greater."
-        )
+        raise ValueError(f"{MXFP8_TRTLLM_HIGH_M_TACTIC_ENV} must be -1 or greater.")
     tactic_hints = _parse_mxfp8_tactic_hints(
         os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "")
     )
@@ -607,14 +638,20 @@ def _specialize_mxfp8_adaptive_layout_graph(
 
 
 class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
-    def __init__(self, switch_m: int) -> None:
+    def __init__(self, layout_policy: str, switch_m: int) -> None:
+        self.layout_policy = layout_policy
         self.switch_m = switch_m
 
     def __call__(self, graph: torch.fx.Graph) -> None:
         compile_range = get_pass_context().compile_range
-        use_8x4_sf_layout = _mxfp8_layout_for_compile_range(
-            compile_range.start, compile_range.end, self.switch_m
-        )
+        if self.layout_policy == "8x4":
+            use_8x4_sf_layout = True
+        elif self.layout_policy == "128x4":
+            use_8x4_sf_layout = False
+        else:
+            use_8x4_sf_layout = _mxfp8_layout_for_compile_range(
+                compile_range.start, compile_range.end, self.switch_m
+            )
         replaced = _specialize_mxfp8_adaptive_layout_graph(
             graph,
             marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
@@ -631,9 +668,10 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
         return self.hash_dict(
             {
                 "source": self.hash_source(self),
+                "layout_policy": self.layout_policy,
                 "switch_m": self.switch_m,
                 "phase": "joint_custom_pre_pass",
-                "schema_version": 1,
+                "schema_version": 2,
             }
         )
 
@@ -644,29 +682,34 @@ def configure_mxfp8_trtllm_adaptive_compilation() -> None:
     vllm_config = get_current_vllm_config()
     compilation_config = vllm_config.compilation_config
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    layout_policy = mxfp8_trtllm_layout_policy()
+    switch_m = mxfp8_trtllm_switch_m()
     if max_num_batched_tokens is None:
         raise RuntimeError(
             "TRTLLM MXFP8 adaptive layout requires finite max_num_batched_tokens."
         )
 
     endpoints = list(compilation_config.compile_ranges_endpoints or [])
-    if max_num_batched_tokens > MXFP8_TRTLLM_8X4_MAX_M:
-        endpoints.append(MXFP8_TRTLLM_8X4_MAX_M)
+    if layout_policy == "adaptive" and max_num_batched_tokens > switch_m:
+        endpoints.append(switch_m)
     compilation_config.compile_ranges_endpoints = sorted(set(endpoints))
 
     pass_key = "joint_custom_pre_pass"
     existing_pass = compilation_config.inductor_compile_config.get(pass_key)
     if existing_pass is None:
         compilation_config.inductor_compile_config[pass_key] = (
-            _Mxfp8AdaptiveLayoutSpecializationPass(MXFP8_TRTLLM_8X4_MAX_M)
+            _Mxfp8AdaptiveLayoutSpecializationPass(layout_policy, switch_m)
         )
     elif not isinstance(existing_pass, _Mxfp8AdaptiveLayoutSpecializationPass):
         raise RuntimeError(
             "TRTLLM MXFP8 adaptive layout cannot replace an existing "
             "Inductor joint custom pre-pass."
         )
-    elif existing_pass.switch_m != MXFP8_TRTLLM_8X4_MAX_M:
-        raise RuntimeError("TRTLLM MXFP8 adaptive layout switch changed after setup.")
+    elif (
+        existing_pass.layout_policy != layout_policy
+        or existing_pass.switch_m != switch_m
+    ):
+        raise RuntimeError("TRTLLM MXFP8 layout policy changed after setup.")
 
 
 def xpu_mxfp8_quantize(

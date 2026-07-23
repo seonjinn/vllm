@@ -13,6 +13,8 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_TRTLLM_HIGH_M_TACTIC_ENV,
     MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV,
+    MXFP8_TRTLLM_LAYOUT_ENV,
+    MXFP8_TRTLLM_SWITCH_M_ENV,
     _mxfp8_layout_for_compile_range,
     _parse_mxfp8_tactic_hints,
     _resolve_mxfp8_high_m_tactic,
@@ -23,13 +25,59 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 
 
+@pytest.mark.parametrize(
+    ("policy", "m", "expected"),
+    [
+        ("8x4", 1, True),
+        ("8x4", 8480, True),
+        ("128x4", 1, False),
+        ("128x4", 8480, False),
+        ("adaptive", 256, True),
+        ("adaptive", 257, False),
+    ],
+)
+def test_mxfp8_trtllm_layout_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    m: int,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, policy)
+    assert mxfp8_trtllm_use_8x4_sf_layout(m) is expected
+
+
+def test_mxfp8_trtllm_adaptive_switch_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "32")
+    assert mxfp8_trtllm_use_8x4_sf_layout(32)
+    assert not mxfp8_trtllm_use_8x4_sf_layout(33)
+
+
+def test_mxfp8_trtllm_layout_policy_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "invalid")
+    with pytest.raises(ValueError, match=MXFP8_TRTLLM_LAYOUT_ENV):
+        mxfp8_trtllm_use_8x4_sf_layout(1)
+
+
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 128, 256])
-def test_mxfp8_trtllm_uses_8x4_for_low_m(m: int) -> None:
+def test_mxfp8_trtllm_uses_8x4_for_low_m(
+    m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(MXFP8_TRTLLM_LAYOUT_ENV, raising=False)
+    monkeypatch.delenv(MXFP8_TRTLLM_SWITCH_M_ENV, raising=False)
     assert mxfp8_trtllm_use_8x4_sf_layout(m)
 
 
 @pytest.mark.parametrize("m", [257, 512, 1024])
-def test_mxfp8_trtllm_uses_128x4_above_threshold(m: int) -> None:
+def test_mxfp8_trtllm_uses_128x4_above_threshold(
+    m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(MXFP8_TRTLLM_LAYOUT_ENV, raising=False)
+    monkeypatch.delenv(MXFP8_TRTLLM_SWITCH_M_ENV, raising=False)
     assert not mxfp8_trtllm_use_8x4_sf_layout(m)
 
 
@@ -67,9 +115,7 @@ def test_mxfp8_layout_compile_ranges_do_not_straddle_switch() -> None:
 
 
 def test_mxfp8_high_m_tactic_hints_use_logical_shape() -> None:
-    hints = _parse_mxfp8_tactic_hints(
-        "1000,8768,8192:92;4004,8192,4096:91"
-    )
+    hints = _parse_mxfp8_tactic_hints("1000,8768,8192:92;4004,8192,4096:91")
     assert hints == {
         (1000, 8768, 8192): 92,
         (4004, 8192, 4096): 91,
