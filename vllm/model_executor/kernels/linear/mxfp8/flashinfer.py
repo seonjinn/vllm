@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_e4m3_quantize,
     mxfp8_trtllm_adaptive_linear,
+    mxfp8_trtllm_use_8x4_sf_layout,
     prepare_mxfp8_trtllm_high_m_tactic_state,
     swizzle_mxfp8_scale,
 )
@@ -339,7 +340,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
-        use_8x4 = int(input_2d.shape[0]) <= 256
+        use_8x4 = mxfp8_trtllm_use_8x4_sf_layout(int(input_2d.shape[0]))
         _trace_mxfp8_dense_shape(
             prefix=str(getattr(layer, "prefix", "unknown")),
             family=_mxfp8_dense_family(layer),
