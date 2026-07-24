@@ -3,6 +3,7 @@
 
 import os
 from contextlib import nullcontext
+from functools import cache
 from typing import Any, NamedTuple
 
 import torch
@@ -21,7 +22,13 @@ MXFP8_TRTLLM_HIGH_M_TACTIC_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC"
 MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
 
 
-def mxfp8_trtllm_layout_policy() -> str:
+class _Mxfp8TrtllmLayoutConfig(NamedTuple):
+    policy: str
+    switch_m: int | None
+
+
+@cache
+def _mxfp8_trtllm_layout_config() -> _Mxfp8TrtllmLayoutConfig:
     policy = os.environ.get(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive").strip().lower()
     normalized = policy.replace("_", "").replace("-", "")
     aliases = {
@@ -36,28 +43,47 @@ def mxfp8_trtllm_layout_policy() -> str:
             f"{MXFP8_TRTLLM_LAYOUT_ENV} must be one of adaptive, 8x4, or "
             f"128x4; got {policy!r}."
         )
-    return aliases[normalized]
+    resolved_policy = aliases[normalized]
+    if resolved_policy != "adaptive":
+        return _Mxfp8TrtllmLayoutConfig(resolved_policy, None)
+
+    raw_switch_m = os.environ.get(
+        MXFP8_TRTLLM_SWITCH_M_ENV,
+        str(MXFP8_TRTLLM_8X4_MAX_M),
+    )
+    try:
+        switch_m = int(raw_switch_m)
+    except ValueError as exc:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_SWITCH_M_ENV} must be a positive integer; "
+            f"got {raw_switch_m!r}."
+        ) from exc
+    if switch_m <= 0:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_SWITCH_M_ENV} must be positive; got {switch_m}."
+        )
+    return _Mxfp8TrtllmLayoutConfig(resolved_policy, switch_m)
+
+
+def mxfp8_trtllm_layout_policy() -> str:
+    return _mxfp8_trtllm_layout_config().policy
 
 
 def mxfp8_trtllm_switch_m() -> int:
-    switch_m = int(
-        os.environ.get(
-            MXFP8_TRTLLM_SWITCH_M_ENV,
-            str(MXFP8_TRTLLM_8X4_MAX_M),
-        )
-    )
-    if switch_m <= 0:
-        raise ValueError(f"{MXFP8_TRTLLM_SWITCH_M_ENV} must be positive.")
+    switch_m = _mxfp8_trtllm_layout_config().switch_m
+    if switch_m is None:
+        return MXFP8_TRTLLM_8X4_MAX_M
     return switch_m
 
 
 def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
-    policy = mxfp8_trtllm_layout_policy()
-    if policy == "8x4":
+    config = _mxfp8_trtllm_layout_config()
+    if config.policy == "8x4":
         return True
-    if policy == "128x4":
+    if config.policy == "128x4":
         return False
-    return m <= mxfp8_trtllm_switch_m()
+    assert config.switch_m is not None
+    return m <= config.switch_m
 
 
 def mxfp8_trtllm_scale_numel(m: int, k: int, use_8x4: bool) -> int:
@@ -638,7 +664,7 @@ def _specialize_mxfp8_adaptive_layout_graph(
 
 
 class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
-    def __init__(self, layout_policy: str, switch_m: int) -> None:
+    def __init__(self, layout_policy: str, switch_m: int | None) -> None:
         self.layout_policy = layout_policy
         self.switch_m = switch_m
 
@@ -649,6 +675,7 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
         elif self.layout_policy == "128x4":
             use_8x4_sf_layout = False
         else:
+            assert self.switch_m is not None
             use_8x4_sf_layout = _mxfp8_layout_for_compile_range(
                 compile_range.start, compile_range.end, self.switch_m
             )
@@ -682,15 +709,21 @@ def configure_mxfp8_trtllm_adaptive_compilation() -> None:
     vllm_config = get_current_vllm_config()
     compilation_config = vllm_config.compilation_config
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-    layout_policy = mxfp8_trtllm_layout_policy()
-    switch_m = mxfp8_trtllm_switch_m()
-    if max_num_batched_tokens is None:
+    layout_config = _mxfp8_trtllm_layout_config()
+    layout_policy = layout_config.policy
+    switch_m = layout_config.switch_m
+    if layout_policy == "adaptive" and max_num_batched_tokens is None:
         raise RuntimeError(
             "TRTLLM MXFP8 adaptive layout requires finite max_num_batched_tokens."
         )
 
     endpoints = list(compilation_config.compile_ranges_endpoints or [])
-    if layout_policy == "adaptive" and max_num_batched_tokens > switch_m:
+    if (
+        layout_policy == "adaptive"
+        and max_num_batched_tokens is not None
+        and switch_m is not None
+        and max_num_batched_tokens > switch_m
+    ):
         endpoints.append(switch_m)
     compilation_config.compile_ranges_endpoints = sorted(set(endpoints))
 
