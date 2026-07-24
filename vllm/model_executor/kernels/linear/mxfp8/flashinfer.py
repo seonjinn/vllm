@@ -340,16 +340,20 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
-        use_8x4 = mxfp8_trtllm_use_8x4_sf_layout(int(input_2d.shape[0]))
-        _trace_mxfp8_dense_shape(
-            prefix=str(getattr(layer, "prefix", "unknown")),
-            family=_mxfp8_dense_family(layer),
-            m=int(input_2d.shape[0]),
-            n_logical=int(output_features),
-            n_physical=int(n_padded),
-            k=int(k),
-            layout="8x4" if use_8x4 else "128x4",
-        )
+        if (
+            not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            use_8x4 = mxfp8_trtllm_use_8x4_sf_layout(int(input_2d.shape[0]))
+            _trace_mxfp8_dense_shape(
+                prefix=str(getattr(layer, "prefix", "unknown")),
+                family=_mxfp8_dense_family(layer),
+                m=int(input_2d.shape[0]),
+                n_logical=int(output_features),
+                n_physical=int(n_padded),
+                k=int(k),
+                layout="8x4" if use_8x4 else "128x4",
+            )
         output = mxfp8_trtllm_adaptive_linear(
             input_2d,
             weight,

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+import vllm.model_executor.kernels.linear.mxfp8.flashinfer as flashinfer_module
 from vllm.model_executor.kernels.linear.mxfp8 import Mxfp8LinearLayerConfig
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferTrtllmMxfp8LinearKernel,
@@ -247,6 +248,40 @@ def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:
     kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
     with pytest.raises(ValueError, match="requires BF16 activations"):
         kernel.apply_weights(torch.nn.Module(), torch.empty(1, 32, dtype=torch.float16))
+
+
+def test_mxfp8_shape_trace_policy_is_not_evaluated_during_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 256), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = Parameter(
+        torch.empty(1024, dtype=torch.uint8), requires_grad=False
+    )
+    layer._mxfp8_trtllm_output_features = 120
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        flashinfer_module,
+        "mxfp8_trtllm_use_8x4_sf_layout",
+        lambda _: pytest.fail("compile must not evaluate the shape-trace layout"),
+    )
+    monkeypatch.setattr(
+        flashinfer_module,
+        "mxfp8_trtllm_adaptive_linear",
+        lambda x, *_: torch.empty(
+            (x.shape[0], 120), dtype=torch.bfloat16, device=x.device
+        ),
+    )
+
+    output = kernel.apply_weights(
+        layer,
+        torch.empty((4, 256), dtype=torch.bfloat16),
+    )
+    assert output.shape == (4, 120)
 
 
 @pytest.mark.parametrize(("m", "n"), [(4, 512), (64, 520)])
