@@ -120,7 +120,6 @@ def _trace_mxfp8_dense_shape(
         return
 
     key = (
-        prefix,
         family,
         m_logical,
         m_physical,

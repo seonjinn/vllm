@@ -118,6 +118,38 @@ def test_shape_trace_writes_exact_high_m_record_once(
     ]
 
 
+def test_shape_trace_deduplicates_layers_with_same_execution_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE", "1")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRACE_WORKLOAD", "1024/10240")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRACE_BATCH_SIZE", "32")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRACE_SERVING_PHASE", "decode")
+
+    trace_once()
+    flashinfer_kernel._trace_mxfp8_dense_shape(
+        prefix="model.layers.1.mlp.fc1",
+        family="FC1",
+        m_logical=1000,
+        m_physical=1000,
+        n_logical=8768,
+        n_physical=8832,
+        k_logical=8192,
+        k_physical=8192,
+        layout="128x4",
+        output_dtype="bfloat16",
+        tactic_source="exact_table",
+        selected_tactic=17,
+        compilation_state="compiled",
+        cuda_graph_state="pre_capture",
+        runtime_provenance={"topology": "tp4"},
+    )
+
+    path = next(tmp_path.glob("dense_shapes_*.jsonl"))
+    assert len(path.read_text().splitlines()) == 1
+
+
 def test_shape_trace_honors_record_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
