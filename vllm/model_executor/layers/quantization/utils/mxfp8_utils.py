@@ -1,14 +1,231 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from contextlib import nullcontext
+from functools import cache
+from typing import Any, NamedTuple
+
 import torch
 
+from vllm.compilation.passes.inductor_pass import InductorPass, get_pass_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # MXFP8 constants
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+MXFP8_TRTLLM_8X4_MAX_M = 256
+MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYOUT"
+MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_DENSE_TRTLLM_SWITCH_M"
+MXFP8_TRTLLM_HIGH_M_TACTIC_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC"
+MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
+
+
+class _Mxfp8TrtllmLayoutConfig(NamedTuple):
+    policy: str
+    switch_m: int | None
+
+
+@cache
+def _mxfp8_trtllm_layout_config() -> _Mxfp8TrtllmLayoutConfig:
+    policy = os.environ.get(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive").strip().lower()
+    normalized = policy.replace("_", "").replace("-", "")
+    aliases = {
+        "adaptive": "adaptive",
+        "8x4": "8x4",
+        "8by4": "8x4",
+        "128x4": "128x4",
+        "128by4": "128x4",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_LAYOUT_ENV} must be one of adaptive, 8x4, or "
+            f"128x4; got {policy!r}."
+        )
+    resolved_policy = aliases[normalized]
+    if resolved_policy != "adaptive":
+        return _Mxfp8TrtllmLayoutConfig(resolved_policy, None)
+
+    raw_switch_m = os.environ.get(
+        MXFP8_TRTLLM_SWITCH_M_ENV,
+        str(MXFP8_TRTLLM_8X4_MAX_M),
+    )
+    try:
+        switch_m = int(raw_switch_m)
+    except ValueError as exc:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_SWITCH_M_ENV} must be a positive integer; "
+            f"got {raw_switch_m!r}."
+        ) from exc
+    if switch_m <= 0:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_SWITCH_M_ENV} must be positive; got {switch_m}."
+        )
+    return _Mxfp8TrtllmLayoutConfig(resolved_policy, switch_m)
+
+
+def mxfp8_trtllm_layout_policy() -> str:
+    return _mxfp8_trtllm_layout_config().policy
+
+
+def mxfp8_trtllm_switch_m() -> int:
+    switch_m = _mxfp8_trtllm_layout_config().switch_m
+    if switch_m is None:
+        return MXFP8_TRTLLM_8X4_MAX_M
+    return switch_m
+
+
+def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
+    config = _mxfp8_trtllm_layout_config()
+    if config.policy == "8x4":
+        return True
+    if config.policy == "128x4":
+        return False
+    assert config.switch_m is not None
+    return m <= config.switch_m
+
+
+def mxfp8_trtllm_scale_numel(m: int, k: int, use_8x4: bool) -> int:
+    if k % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(f"MXFP8 K must be divisible by 32, got K={k}.")
+    m_tile = 8 if use_8x4 else 128
+    m_padded = (m + m_tile - 1) // m_tile * m_tile
+    scale_k = k // MXFP8_BLOCK_SIZE
+    scale_k_padded = (scale_k + 3) // 4 * 4
+    return m_padded * scale_k_padded
+
+
+def _parse_mxfp8_tactic_hints(raw: str) -> dict[tuple[int, int, int], int]:
+    hints: dict[tuple[int, int, int], int] = {}
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        shape_raw, separator, tactic_raw = item.partition(":")
+        if not separator:
+            raise ValueError(
+                f"MXFP8 tactic hints must use M,N,K:tactic entries; got {item!r}."
+            )
+        shape = tuple(int(value.strip()) for value in shape_raw.split(","))
+        if len(shape) != 3 or any(value <= 0 for value in shape):
+            raise ValueError(f"Invalid MXFP8 tactic shape {shape_raw!r}.")
+        tactic = int(tactic_raw.strip())
+        if tactic < -1:
+            raise ValueError(f"Invalid MXFP8 tactic {tactic}; expected -1 or greater.")
+        hints[(shape[0], shape[1], shape[2])] = tactic
+    return hints
+
+
+def _resolve_mxfp8_high_m_tactic(
+    m: int,
+    n: int,
+    k: int,
+    hints: dict[tuple[int, int, int], int],
+    fallback: int,
+    *,
+    use_global_fallback: bool,
+) -> int | None:
+    shape = (m, n, k)
+    if shape in hints:
+        return hints[shape]
+    return fallback if use_global_fallback else None
+
+
+def mxfp8_trtllm_high_m_static_tactics_enabled() -> bool:
+    return MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ or bool(
+        os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "").strip()
+    )
+
+
+class _Mxfp8HighMTrtllmState(NamedTuple):
+    workspace: torch.Tensor
+    runner: Any
+    fallback_tactic: int
+    tactic_hints: dict[tuple[int, int, int], int]
+    use_global_fallback: bool
+
+
+_MXFP8_HIGH_M_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8HighMTrtllmState] = {}
+
+
+def _mxfp8_cuda_device_key(device: torch.device) -> tuple[str, int]:
+    canonical = torch.device(device)
+    if canonical.type != "cuda":
+        raise RuntimeError(f"MXFP8 TRTLLM tactics require CUDA, got {canonical}.")
+    index = canonical.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return canonical.type, index
+
+
+def prepare_mxfp8_trtllm_high_m_tactic_state(
+    device: torch.device,
+) -> _Mxfp8HighMTrtllmState | None:
+    if not mxfp8_trtllm_high_m_static_tactics_enabled():
+        return None
+
+    device_key = _mxfp8_cuda_device_key(device)
+    existing = _MXFP8_HIGH_M_TRTLLM_STATES.get(device_key)
+    if existing is not None:
+        return existing
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 high-M TRTLLM tactic state must be prepared before "
+            "CUDA Graph capture."
+        )
+
+    fallback_tactic = int(os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, "-1"))
+    if fallback_tactic < -1:
+        raise ValueError(f"{MXFP8_TRTLLM_HIGH_M_TACTIC_ENV} must be -1 or greater.")
+    tactic_hints = _parse_mxfp8_tactic_hints(
+        os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "")
+    )
+
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        _get_cache_buf,
+        get_trtllm_gemm_module,
+    )
+
+    canonical = torch.device(device_key[0], device_key[1])
+    with torch.cuda.device(canonical):
+        workspace = _get_cache_buf(
+            "vllm_mxfp8_trtllm_high_m_static_tactic_workspace",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical,
+        )
+        runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+            use_8x4_sf_layout=False
+        )
+
+    state = _Mxfp8HighMTrtllmState(
+        workspace=workspace,
+        runner=runner,
+        fallback_tactic=fallback_tactic,
+        tactic_hints=tactic_hints,
+        use_global_fallback=MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ,
+    )
+    _MXFP8_HIGH_M_TRTLLM_STATES[device_key] = state
+    return state
+
+
+def _require_mxfp8_trtllm_high_m_tactic_state(
+    device: torch.device,
+) -> _Mxfp8HighMTrtllmState:
+    device_key = _mxfp8_cuda_device_key(device)
+    state = _MXFP8_HIGH_M_TRTLLM_STATES.get(device_key)
+    if state is not None:
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 high-M TRTLLM tactic state was not prepared before "
+            "CUDA Graph capture."
+        )
+    prepared = prepare_mxfp8_trtllm_high_m_tactic_state(device)
+    if prepared is None:
+        raise RuntimeError("MXFP8 high-M static tactic path is not enabled.")
+    return prepared
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
@@ -273,6 +490,259 @@ direct_register_custom_op(
     op_func=_mxfp8_e4m3_quantize_impl,
     fake_impl=mxfp8_e4m3_quantize_fake,
 )
+
+
+def _mxfp8_trtllm_linear_fixed_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+    *,
+    use_8x4_sf_layout: bool,
+) -> torch.Tensor:
+    from flashinfer import SfLayout
+    from flashinfer import autotune as flashinfer_autotune
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
+    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+
+    sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
+    input_mxfp8, input_scale = flashinfer_mxfp8_quantize(
+        x,
+        alignment=MXFP8_BLOCK_SIZE,
+        backend="cuda",
+        sf_swizzle_layout=sf_layout,
+    )
+    if not use_8x4_sf_layout and mxfp8_trtllm_high_m_static_tactics_enabled():
+        state = _require_mxfp8_trtllm_high_m_tactic_state(x.device)
+        logical_shape = (int(x.shape[0]), int(output_features), int(x.shape[1]))
+        tactic = _resolve_mxfp8_high_m_tactic(
+            *logical_shape,
+            state.tactic_hints,
+            state.fallback_tactic,
+            use_global_fallback=state.use_global_fallback,
+        )
+        if tactic is not None:
+            physical_n = int(weight.shape[0])
+            output = torch.empty(
+                (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
+            )
+            output = state.runner.forward(
+                [
+                    input_mxfp8,
+                    weight.t(),
+                    input_scale,
+                    weight_scale,
+                    torch.bfloat16,
+                    output,
+                    state.workspace,
+                ],
+                tactic=tactic,
+            )
+            return output[:, :output_features].contiguous()
+
+    # Exact-hint misses keep the serving-stable FlashInfer wrapper path.
+    autotune_context = (
+        nullcontext()
+        if use_8x4_sf_layout
+        else flashinfer_autotune(skip_ops={"mxfp8_gemm"})
+    )
+    with autotune_context:
+        output = flashinfer_mm_mxfp8(
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype=torch.bfloat16,
+            use_8x4_sf_layout=use_8x4_sf_layout,
+            backend="trtllm",
+        )
+    return output[:, :output_features].contiguous()
+
+
+def _mxfp8_trtllm_adaptive_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return _mxfp8_trtllm_linear_fixed_impl(
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        use_8x4_sf_layout=mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0])),
+    )
+
+
+def _mxfp8_trtllm_linear_8x4_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return _mxfp8_trtllm_linear_fixed_impl(
+        x, weight, weight_scale, output_features, use_8x4_sf_layout=True
+    )
+
+
+def _mxfp8_trtllm_linear_128x4_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return _mxfp8_trtllm_linear_fixed_impl(
+        x, weight, weight_scale, output_features, use_8x4_sf_layout=False
+    )
+
+
+def mxfp8_trtllm_adaptive_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
+        x, weight, weight_scale, output_features
+    )
+
+
+def mxfp8_trtllm_adaptive_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    if x.ndim != 2:
+        raise ValueError(f"TRTLLM MXFP8 linear requires 2D input, got {x.ndim}D.")
+    return torch.empty(
+        (x.shape[0], output_features), dtype=torch.bfloat16, device=x.device
+    )
+
+
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_adaptive_linear",
+    op_func=_mxfp8_trtllm_adaptive_linear_impl,
+    fake_impl=mxfp8_trtllm_adaptive_linear_fake,
+)
+
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_linear_8x4",
+    op_func=_mxfp8_trtllm_linear_8x4_impl,
+    fake_impl=mxfp8_trtllm_adaptive_linear_fake,
+)
+
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_linear_128x4",
+    op_func=_mxfp8_trtllm_linear_128x4_impl,
+    fake_impl=mxfp8_trtllm_adaptive_linear_fake,
+)
+
+
+def _mxfp8_layout_for_compile_range(
+    range_start: int, range_end: int, switch_m: int
+) -> bool:
+    if range_end <= switch_m:
+        return True
+    if range_start > switch_m:
+        return False
+    raise RuntimeError(
+        f"MXFP8 compile range [{range_start}, {range_end}] straddles "
+        f"adaptive layout switch M={switch_m}."
+    )
+
+
+def _specialize_mxfp8_adaptive_layout_graph(
+    graph: Any, *, marker_op: Any, fixed_op: Any
+) -> int:
+    replaced = 0
+    for node in graph.nodes:
+        if node.op == "call_function" and node.target == marker_op:
+            node.target = fixed_op
+            replaced += 1
+    return replaced
+
+
+class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
+    def __init__(self, layout_policy: str, switch_m: int | None) -> None:
+        self.layout_policy = layout_policy
+        self.switch_m = switch_m
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        compile_range = get_pass_context().compile_range
+        if self.layout_policy == "8x4":
+            use_8x4_sf_layout = True
+        elif self.layout_policy == "128x4":
+            use_8x4_sf_layout = False
+        else:
+            assert self.switch_m is not None
+            use_8x4_sf_layout = _mxfp8_layout_for_compile_range(
+                compile_range.start, compile_range.end, self.switch_m
+            )
+        replaced = _specialize_mxfp8_adaptive_layout_graph(
+            graph,
+            marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+            fixed_op=(
+                torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
+                if use_8x4_sf_layout
+                else torch.ops.vllm.mxfp8_trtllm_linear_128x4.default
+            ),
+        )
+        if replaced == 0:
+            return
+
+    def uuid(self) -> str:
+        return self.hash_dict(
+            {
+                "source": self.hash_source(self),
+                "layout_policy": self.layout_policy,
+                "switch_m": self.switch_m,
+                "phase": "joint_custom_pre_pass",
+                "schema_version": 2,
+            }
+        )
+
+
+def configure_mxfp8_trtllm_adaptive_compilation() -> None:
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    compilation_config = vllm_config.compilation_config
+    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    layout_config = _mxfp8_trtllm_layout_config()
+    layout_policy = layout_config.policy
+    switch_m = layout_config.switch_m
+    if layout_policy == "adaptive" and max_num_batched_tokens is None:
+        raise RuntimeError(
+            "TRTLLM MXFP8 adaptive layout requires finite max_num_batched_tokens."
+        )
+
+    endpoints = list(compilation_config.compile_ranges_endpoints or [])
+    if (
+        layout_policy == "adaptive"
+        and max_num_batched_tokens is not None
+        and switch_m is not None
+        and max_num_batched_tokens > switch_m
+    ):
+        endpoints.append(switch_m)
+    compilation_config.compile_ranges_endpoints = sorted(set(endpoints))
+
+    pass_key = "joint_custom_pre_pass"
+    existing_pass = compilation_config.inductor_compile_config.get(pass_key)
+    if existing_pass is None:
+        compilation_config.inductor_compile_config[pass_key] = (
+            _Mxfp8AdaptiveLayoutSpecializationPass(layout_policy, switch_m)
+        )
+    elif not isinstance(existing_pass, _Mxfp8AdaptiveLayoutSpecializationPass):
+        raise RuntimeError(
+            "TRTLLM MXFP8 adaptive layout cannot replace an existing "
+            "Inductor joint custom pre-pass."
+        )
+    elif (
+        existing_pass.layout_policy != layout_policy
+        or existing_pass.switch_m != switch_m
+    ):
+        raise RuntimeError("TRTLLM MXFP8 layout policy changed after setup.")
 
 
 def xpu_mxfp8_quantize(
