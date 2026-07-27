@@ -7,11 +7,12 @@ import json
 import os
 import socket
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, fields
 from dataclasses import field as dataclass_field
 from functools import cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 import torch
@@ -167,6 +168,12 @@ class _Mxfp8TrtllmTacticState(NamedTuple):
     resolution_lock: threading.RLock
 
 
+@dataclass(frozen=True)
+class _Mxfp8TrtllmTacticSpecialization:
+    fingerprint: str
+    tactics: Mapping[Mxfp8TacticKey, tuple[int, str]]
+
+
 class _Mxfp8RunnerProfile:
     def __init__(self, key: Mxfp8TacticKey) -> None:
         self._shapes = (
@@ -284,6 +291,9 @@ class _Mxfp8TacticAudit:
 _MXFP8_TRTLLM_STATE_LOCK = threading.RLock()
 _MXFP8_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8TrtllmTacticState] = {}
 _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX: list[_Mxfp8TrtllmTacticState | None] = []
+_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX: list[
+    _Mxfp8TrtllmTacticSpecialization | None
+] = []
 _MXFP8_TACTIC_SOURCES: dict[
     tuple[int, Mxfp8TacticKey],
     tuple[str, int | None, bool | None],
@@ -422,6 +432,133 @@ def finalize_mxfp8_trtllm_tactic_audit() -> None:
     audit.finalize()
 
 
+def _mxfp8_tactic_rows(
+    tactics: dict[Mxfp8TacticKey, int],
+    state: _Mxfp8TrtllmTacticState,
+) -> list[dict[str, Any]]:
+    rows = []
+    for key, selected_tactic in tactics.items():
+        tactic_source, requested_tactic, artifact_lookup_hit = (
+            _MXFP8_TACTIC_SOURCES.get(
+                (id(state), key),
+                ("pre_resolved", selected_tactic, None),
+            )
+        )
+        rows.append(
+            {
+                "key": asdict(key),
+                "selected_tactic": selected_tactic,
+                "tactic_source": tactic_source,
+                "requested_tactic": requested_tactic,
+                "artifact_lookup_hit": artifact_lookup_hit,
+            }
+        )
+    rows.sort(key=lambda row: json.dumps(row["key"], sort_keys=True))
+    return rows
+
+
+def _mxfp8_artifact_payload(
+    artifact: Mxfp8TacticArtifact | None,
+) -> dict[str, Any] | None:
+    if artifact is None:
+        return None
+    entries = [
+        {
+            "key": asdict(key),
+            "selected_tactic": selected_tactic,
+        }
+        for key, selected_tactic in artifact.tactics.items()
+    ]
+    entries.sort(key=lambda row: json.dumps(row["key"], sort_keys=True))
+    return {
+        "provenance": asdict(artifact.provenance),
+        "entries": entries,
+    }
+
+
+def _mxfp8_tactic_specialization_fingerprint(
+    state: _Mxfp8TrtllmTacticState,
+    resolved_tactics: dict[Mxfp8TacticKey, int],
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "artifact_configuration_present": _MXFP8_ARTIFACT_CONFIGURATION_PRESENT,
+        "artifact_sha256": (envs.VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256),
+        "runtime_provenance_sha256": (
+            envs.VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256
+        ),
+        "runtime_provenance": (
+            asdict(_MXFP8_RUNTIME_PROVENANCE)
+            if _MXFP8_RUNTIME_PROVENANCE is not None
+            else None
+        ),
+        "accepted_artifact": _mxfp8_artifact_payload(state.artifact),
+        "resolved_legality": _mxfp8_tactic_rows(resolved_tactics, state),
+        "legacy_fallback_tactic": _MXFP8_LEGACY_FALLBACK_TACTIC,
+        "legacy_global_fallback": _MXFP8_LEGACY_GLOBAL_FALLBACK,
+        "legacy_tactic_hints": sorted(
+            (*shape, tactic) for shape, tactic in _MXFP8_LEGACY_TACTIC_HINTS.items()
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def finalize_mxfp8_trtllm_tactic_specialization() -> None:
+    """Freeze worker-validated static tactics for compilation and capture."""
+    global _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX
+    with _MXFP8_TRTLLM_STATE_LOCK:
+        specializations: list[_Mxfp8TrtllmTacticSpecialization | None] = []
+        for state in _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX:
+            if state is None:
+                specializations.append(None)
+                continue
+            with state.resolution_lock:
+                resolved_tactics = dict(state.resolved_tactics)
+                tactics = {
+                    key: (
+                        selected_tactic,
+                        _MXFP8_TACTIC_SOURCES.get(
+                            (id(state), key),
+                            ("pre_resolved", selected_tactic, None),
+                        )[0],
+                    )
+                    for key, selected_tactic in resolved_tactics.items()
+                }
+                fingerprint = _mxfp8_tactic_specialization_fingerprint(
+                    state,
+                    resolved_tactics,
+                )
+            specializations.append(
+                _Mxfp8TrtllmTacticSpecialization(
+                    fingerprint=fingerprint,
+                    tactics=MappingProxyType(tactics),
+                )
+            )
+        _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX = specializations
+
+
+def prewarm_mxfp8_trtllm_tactic_specializations(model_runner: Any) -> None:
+    """Resolve exact static contracts eagerly before the first compilation."""
+    with _MXFP8_TRTLLM_STATE_LOCK:
+        has_prepared_state = any(
+            state is not None for state in _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX
+        )
+    if not has_prepared_state:
+        return
+
+    compile_sizes = model_runner.compilation_config.compile_sizes or []
+    for size in sorted(set(compile_sizes), reverse=True):
+        model_runner._dummy_run(
+            size,
+            skip_attn=True,
+            skip_eplb=True,
+            is_profile=True,
+            skip_compiled_for_mxfp8_prewarm=True,
+        )
+    finalize_mxfp8_trtllm_tactic_specialization()
+
+
 atexit.register(finalize_mxfp8_trtllm_tactic_audit)
 
 
@@ -450,6 +587,7 @@ def _prepare_mxfp8_trtllm_tactic_state_locked(
     global _MXFP8_LEGACY_TACTIC_HINTS
     global _MXFP8_RUNTIME_PROVENANCE
     global _MXFP8_TACTIC_AUDIT
+    global _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX
     existing = _MXFP8_TRTLLM_STATES.get(device_key)
     if existing is not None:
         return existing
@@ -519,6 +657,9 @@ def _prepare_mxfp8_trtllm_tactic_state_locked(
             [None] * (device_index + 1 - len(_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX))
         )
     _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX[device_index] = state
+    _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX = [
+        None for _ in _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX
+    ]
     return state
 
 
@@ -980,6 +1121,7 @@ def _mxfp8_trtllm_linear_fixed_impl(
     output_features: int,
     tactic: int,
     tactic_source: str,
+    tactic_specialization_fingerprint: str,
     layer_prefix: str,
     normalized_family: str,
     compilation_state: str,
@@ -987,10 +1129,6 @@ def _mxfp8_trtllm_linear_fixed_impl(
     *,
     use_8x4_sf_layout: bool,
 ) -> torch.Tensor:
-    # Cached compiled scalars cannot carry current worker legality evidence.
-    if tactic >= 0:
-        tactic = -1
-        tactic_source = "compiled_direct_default"
     is_capturing = torch.cuda.is_current_stream_capturing()
     if is_capturing and tactic == _MXFP8_TRTLLM_UNRESOLVED_TACTIC:
         raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
@@ -1005,6 +1143,23 @@ def _mxfp8_trtllm_linear_fixed_impl(
         if is_capturing:
             raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
         state = prepare_mxfp8_trtllm_tactic_state(x.device)
+
+    if tactic != _MXFP8_TRTLLM_UNRESOLVED_TACTIC:
+        specialization = (
+            _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX[device_index]
+            if 0 <= device_index < len(_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX)
+            else None
+        )
+        if (
+            specialization is None
+            or not tactic_specialization_fingerprint
+            or specialization.fingerprint != tactic_specialization_fingerprint
+        ):
+            raise RuntimeError(
+                "stale MXFP8 tactic specialization does not match this worker"
+            )
+    elif tactic_specialization_fingerprint:
+        raise RuntimeError("unresolved MXFP8 tactic has a specialization fingerprint")
 
     physical_n = int(weight.shape[0])
     key = (
@@ -1054,36 +1209,6 @@ def _mxfp8_trtllm_linear_fixed_impl(
                 key,
                 runner_inputs,
             )
-        else:
-            with state.resolution_lock:
-                (
-                    resolved_source,
-                    requested_tactic,
-                    artifact_lookup_hit,
-                ) = _MXFP8_TACTIC_SOURCES.get(
-                    (id(state), key),
-                    (
-                        tactic_source,
-                        None,
-                        None,
-                    ),
-                )
-                state.resolved_tactics.setdefault(key, tactic)
-                _MXFP8_TACTIC_SOURCES.setdefault(
-                    (id(state), key),
-                    (
-                        resolved_source,
-                        requested_tactic,
-                        artifact_lookup_hit,
-                    ),
-                )
-                _record_mxfp8_tactic_resolution(
-                    key,
-                    selected_tactic=tactic,
-                    tactic_source=resolved_source,
-                    requested_tactic=requested_tactic,
-                    artifact_lookup_hit=artifact_lookup_hit,
-                )
     output = _run_mxfp8_trtllm_pre_resolved(
         state,
         use_8x4_sf_layout=use_8x4_sf_layout,
@@ -1127,6 +1252,7 @@ def _mxfp8_trtllm_adaptive_linear_impl(
     output_features: int,
     tactic: int,
     tactic_source: str,
+    tactic_specialization_fingerprint: str,
     layer_prefix: str,
     normalized_family: str,
     compilation_state: str,
@@ -1139,6 +1265,7 @@ def _mxfp8_trtllm_adaptive_linear_impl(
         output_features,
         tactic,
         tactic_source,
+        tactic_specialization_fingerprint,
         layer_prefix,
         normalized_family,
         compilation_state,
@@ -1154,6 +1281,7 @@ def _mxfp8_trtllm_linear_8x4_impl(
     output_features: int,
     tactic: int,
     tactic_source: str,
+    tactic_specialization_fingerprint: str,
     layer_prefix: str,
     normalized_family: str,
     compilation_state: str,
@@ -1166,6 +1294,7 @@ def _mxfp8_trtllm_linear_8x4_impl(
         output_features,
         tactic,
         tactic_source,
+        tactic_specialization_fingerprint,
         layer_prefix,
         normalized_family,
         compilation_state,
@@ -1181,6 +1310,7 @@ def _mxfp8_trtllm_linear_128x4_impl(
     output_features: int,
     tactic: int,
     tactic_source: str,
+    tactic_specialization_fingerprint: str,
     layer_prefix: str,
     normalized_family: str,
     compilation_state: str,
@@ -1193,6 +1323,7 @@ def _mxfp8_trtllm_linear_128x4_impl(
         output_features,
         tactic,
         tactic_source,
+        tactic_specialization_fingerprint,
         layer_prefix,
         normalized_family,
         compilation_state,
@@ -1216,6 +1347,7 @@ def mxfp8_trtllm_adaptive_linear(
         output_features,
         _MXFP8_TRTLLM_UNRESOLVED_TACTIC,
         "unresolved_eager",
+        "",
         layer_prefix,
         normalized_family,
         "eager",
@@ -1230,6 +1362,7 @@ def mxfp8_trtllm_adaptive_linear_fake(
     output_features: int,
     tactic: int,
     tactic_source: str,
+    tactic_specialization_fingerprint: str,
     layer_prefix: str,
     normalized_family: str,
     compilation_state: str,
@@ -1279,8 +1412,8 @@ def _specialize_mxfp8_adaptive_layout_graph(
     *,
     marker_op: Any,
     fixed_op: Any,
-    tactic_override: tuple[int, str] | None = None,
-    tactic_resolver: Callable[[Any], tuple[int, str]] | None = None,
+    tactic_override: tuple[int, str, str] | None = None,
+    tactic_resolver: Callable[[Any], tuple[int, str, str]] | None = None,
     execution_context: tuple[str, str] | None = None,
 ) -> int:
     if tactic_override is not None and tactic_resolver is not None:
@@ -1295,27 +1428,75 @@ def _specialize_mxfp8_adaptive_layout_graph(
                 else tactic_override
             )
             if node_tactic is not None:
-                if len(node.args) < 6:
+                if len(node.args) < 7:
                     raise RuntimeError(
                         "MXFP8 adaptive marker is missing bound tactic arguments."
                     )
                 node.args = (
                     *node.args[:4],
                     *node_tactic,
-                    *node.args[6:],
+                    *node.args[7:],
                 )
             if execution_context is not None:
-                if len(node.args) < 8:
+                if len(node.args) < 11:
                     raise RuntimeError(
                         "MXFP8 adaptive marker is missing layer context arguments."
                     )
                 node.args = (
-                    *node.args[:8],
+                    *node.args[:9],
                     *execution_context,
-                    *node.args[10:],
+                    *node.args[11:],
                 )
             replaced += 1
     return replaced
+
+
+def _mxfp8_node_tensor_value(node: Any, argument_name: str) -> Any:
+    value = node.meta.get("val")
+    if value is None:
+        value = node.meta.get("tensor_meta")
+    if value is None:
+        raise RuntimeError(
+            f"MXFP8 static specialization is missing {argument_name} metadata"
+        )
+    return value
+
+
+def _mxfp8_static_tactic_binding(
+    node: Any,
+    *,
+    m_logical: int,
+    use_8x4_sf_layout: bool,
+) -> tuple[int, str, str]:
+    x = _mxfp8_node_tensor_value(node.args[0], "activation")
+    weight = _mxfp8_node_tensor_value(node.args[1], "weight")
+    device_index = _mxfp8_cuda_device_key(weight.device)[1]
+    specialization = (
+        _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX[device_index]
+        if 0 <= device_index < len(_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX)
+        else None
+    )
+    if specialization is None:
+        raise RuntimeError(
+            "MXFP8 static tactics must be legality-validated during eager "
+            "pre-capture warmup before compilation"
+        )
+    key = Mxfp8TacticKey(
+        m_logical=m_logical,
+        n_logical=int(node.args[3]),
+        k_logical=int(x.shape[-1]),
+        n_physical=int(weight.shape[0]),
+        k_physical=int(weight.shape[1]),
+        activation_scale_layout=("8x4" if use_8x4_sf_layout else "128x4"),
+        output_dtype="bfloat16",
+    )
+    binding = specialization.tactics.get(key)
+    if binding is None:
+        raise RuntimeError(
+            f"MXFP8 static tactic has no exact worker-validated prewarm contract: {key}"
+        )
+    tactic, tactic_source = binding
+    return tactic, tactic_source, specialization.fingerprint
 
 
 class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
@@ -1349,7 +1530,6 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
                 else "not_captured"
             ),
         )
-        # FX metadata cannot provide the eventual seven runtime runner inputs.
         replaced = _specialize_mxfp8_adaptive_layout_graph(
             graph,
             marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
@@ -1358,15 +1538,24 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
                 if use_8x4_sf_layout
                 else torch.ops.vllm.mxfp8_trtllm_linear_128x4.default
             ),
-            tactic_override=(
+            tactic_resolver=(
                 (
-                    -1,
-                    "compiled_direct_default",
+                    lambda node: _mxfp8_static_tactic_binding(
+                        node,
+                        m_logical=compile_range.start,
+                        use_8x4_sf_layout=use_8x4_sf_layout,
+                    )
                 )
+                if is_single_size
+                else None
+            ),
+            tactic_override=(
+                None
                 if is_single_size
                 else (
                     _MXFP8_TRTLLM_UNRESOLVED_TACTIC,
                     "unresolved_dynamic_compile",
+                    "",
                 )
             ),
             execution_context=execution_context,
@@ -1375,15 +1564,21 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
             return
 
     def uuid(self) -> str:
+        with _MXFP8_TRTLLM_STATE_LOCK:
+            specialization_fingerprints = [
+                specialization.fingerprint if specialization is not None else None
+                for specialization in (_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX)
+            ]
         return self.hash_dict(
             {
                 "source": self.hash_source(self),
                 "layout_policy": self.layout_policy,
                 "switch_m": self.switch_m,
                 "capture_sizes": sorted(self.capture_sizes),
-                "tactic_binding": "direct_default_only",
+                "tactic_binding": "worker_validated_static_snapshot",
+                "specialization_fingerprints": specialization_fingerprints,
                 "phase": "joint_custom_pre_pass",
-                "schema_version": 4,
+                "schema_version": 5,
             }
         )
 

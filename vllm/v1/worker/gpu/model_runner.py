@@ -535,6 +535,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        skip_compiled_for_mxfp8_prewarm: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -587,6 +588,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
+                skip_compiled_for_mxfp8_prewarm=skip_compiled_for_mxfp8_prewarm,
             )
         self.kv_connector.set_disabled(False)
 
@@ -671,6 +673,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            prewarm_mxfp8_trtllm_tactic_specializations,
+        )
+
+        prewarm_mxfp8_trtllm_tactic_specializations(self)
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -1155,6 +1162,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        skip_compiled_for_mxfp8_prewarm: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -1182,7 +1190,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
-        skip_compiled = False
+        skip_compiled = skip_compiled_for_mxfp8_prewarm
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates

@@ -17,6 +17,9 @@ from vllm.model_executor.kernels.linear.mxfp8 import Mxfp8LinearLayerConfig
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferTrtllmMxfp8LinearKernel,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
+    Mxfp8TacticKey,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_TRTLLM_HIGH_M_TACTIC_ENV,
     MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV,
@@ -25,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     _mxfp8_layout_for_compile_range,
     _mxfp8_trtllm_layout_config,
     _Mxfp8AdaptiveLayoutSpecializationPass,
+    _Mxfp8TrtllmTacticSpecialization,
     _parse_mxfp8_tactic_hints,
     _resolve_mxfp8_high_m_tactic,
     _specialize_mxfp8_adaptive_layout_graph,
@@ -252,46 +256,114 @@ def test_mxfp8_adaptive_marker_is_specialized(
     assert node.target == expected_op
 
 
-@pytest.mark.parametrize(
-    "m",
-    [32, 1024],
-)
-def test_mxfp8_static_compile_ranges_bind_only_direct_default(
+@pytest.mark.parametrize(("m", "layout"), [(32, "8x4"), (1024, "128x4")])
+def test_mxfp8_static_compile_ranges_bind_worker_validated_tactic(
     monkeypatch: pytest.MonkeyPatch,
     m: int,
+    layout: str,
 ) -> None:
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     weight = graph.placeholder("weight")
     scale = graph.placeholder("scale")
+    x.meta["val"] = SimpleNamespace(
+        shape=(m, 256),
+        device=torch.device("cuda", 0),
+    )
+    weight.meta["val"] = SimpleNamespace(
+        shape=(640, 256),
+        device=torch.device("cuda", 0),
+    )
+    tactic_key = Mxfp8TacticKey(
+        m_logical=m,
+        n_logical=512,
+        k_logical=256,
+        n_physical=640,
+        k_physical=256,
+        activation_scale_layout=layout,
+        output_dtype="bfloat16",
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX",
+        [
+            _Mxfp8TrtllmTacticSpecialization(
+                fingerprint=f"worker-{m}",
+                tactics={tactic_key: (65, "exact_table")},
+            )
+        ],
+    )
     node = graph.call_function(
         torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
-        (x, weight, scale, 512, 99, "trace_m_tactic", "layer", "FC1"),
+        (
+            x,
+            weight,
+            scale,
+            512,
+            99,
+            "trace_m_tactic",
+            "trace-fingerprint",
+            "layer",
+            "FC1",
+            "eager",
+            "eager",
+        ),
     )
     graph.output(node)
     monkeypatch.setattr(
         mxfp8_utils,
         "_select_mxfp8_trtllm_tactic_candidate",
         lambda *_args, **_kwargs: pytest.fail(
-            "static compilation must not bind worker-derived tactics"
+            "static compilation must not validate with stand-in inputs"
         ),
     )
 
     with pass_context(Range(m, m)):
         _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)(graph)
 
-    assert node.args[4:6] == (-1, "compiled_direct_default")
+    assert node.args[4:7] == (65, "exact_table", f"worker-{m}")
 
 
-def test_mxfp8_static_compile_cache_reuse_cannot_retain_worker_tactic() -> None:
+def test_mxfp8_static_compile_cache_identity_rejects_stale_worker_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     specialization_pass = _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)
+    tactic_key = Mxfp8TacticKey(
+        m_logical=32,
+        n_logical=512,
+        k_logical=256,
+        n_physical=640,
+        k_physical=256,
+        activation_scale_layout="8x4",
+        output_dtype="bfloat16",
+    )
     bound_tactics: list[tuple[object, ...]] = []
+    cache_identities: list[str] = []
 
-    for traced_tactic in (65, -2):
+    for fingerprint, selected_tactic in (("worker-a", 65), ("worker-b", -1)):
+        monkeypatch.setattr(
+            mxfp8_utils,
+            "_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX",
+            [
+                _Mxfp8TrtllmTacticSpecialization(
+                    fingerprint=fingerprint,
+                    tactics={tactic_key: (selected_tactic, "exact_table")},
+                )
+            ],
+        )
+        cache_identities.append(specialization_pass.uuid())
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
         weight = graph.placeholder("weight")
         scale = graph.placeholder("scale")
+        x.meta["val"] = SimpleNamespace(
+            shape=(32, 256),
+            device=torch.device("cuda", 0),
+        )
+        weight.meta["val"] = SimpleNamespace(
+            shape=(640, 256),
+            device=torch.device("cuda", 0),
+        )
         node = graph.call_function(
             torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
             (
@@ -299,22 +371,26 @@ def test_mxfp8_static_compile_cache_reuse_cannot_retain_worker_tactic() -> None:
                 weight,
                 scale,
                 512,
-                traced_tactic,
-                "exact_table" if traced_tactic == 65 else "artifact_disabled",
+                -2,
+                "unresolved_eager",
+                "",
                 "layer",
                 "FC1",
+                "eager",
+                "eager",
             ),
         )
         graph.output(node)
 
         with pass_context(Range(32, 32)):
             specialization_pass(graph)
-        bound_tactics.append(node.args[4:6])
+        bound_tactics.append(node.args[4:7])
 
     assert bound_tactics == [
-        (-1, "compiled_direct_default"),
-        (-1, "compiled_direct_default"),
+        (65, "exact_table", "worker-a"),
+        (-1, "exact_table", "worker-b"),
     ]
+    assert cache_identities[0] != cache_identities[1]
 
 
 def test_mxfp8_dynamic_compile_range_preserves_unresolved_sentinel() -> None:
@@ -324,7 +400,19 @@ def test_mxfp8_dynamic_compile_range_preserves_unresolved_sentinel() -> None:
     scale = graph.placeholder("scale")
     node = graph.call_function(
         torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
-        (x, weight, scale, 512, 65, "exact_table", "layer", "FC1"),
+        (
+            x,
+            weight,
+            scale,
+            512,
+            65,
+            "exact_table",
+            "old-fingerprint",
+            "layer",
+            "FC1",
+            "eager",
+            "eager",
+        ),
     )
     graph.output(node)
 
@@ -332,7 +420,7 @@ def test_mxfp8_dynamic_compile_range_preserves_unresolved_sentinel() -> None:
         _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)(graph)
 
     assert node.target == torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
-    assert node.args[4:6] == (-2, "unresolved_dynamic_compile")
+    assert node.args[4:7] == (-2, "unresolved_dynamic_compile", "")
 
 
 def test_mxfp8_capture_sizes_are_static_compile_entries(

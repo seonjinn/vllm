@@ -16,6 +16,8 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from vllm.compilation.passes.inductor_pass import pass_context
+from vllm.config.utils import Range
 from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
     Mxfp8TacticArtifact,
@@ -25,11 +27,14 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     _load_configured_mxfp8_tactic_artifact,
     _mxfp8_trtllm_linear_fixed_impl,
+    _Mxfp8AdaptiveLayoutSpecializationPass,
     _Mxfp8TacticAudit,
     _Mxfp8TrtllmTacticState,
     _resolve_mxfp8_trtllm_tactic,
     _run_mxfp8_trtllm_pre_resolved,
     finalize_mxfp8_trtllm_tactic_audit,
+    finalize_mxfp8_trtllm_tactic_specialization,
+    prewarm_mxfp8_trtllm_tactic_specializations,
 )
 
 
@@ -610,7 +615,7 @@ def test_capture_rejects_unresolved_key_before_lookup(
         )
 
 
-def test_fixed_impl_capture_rejects_stale_bound_scalar_without_key_or_map_lookup(
+def test_fixed_impl_capture_rejects_unfingerprinted_bound_scalar_without_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner_output = torch.empty((2, 8), dtype=torch.bfloat16)
@@ -664,22 +669,27 @@ def test_fixed_impl_capture_rejects_stale_bound_scalar_without_key_or_map_lookup
             ),
         )
 
-        _mxfp8_trtllm_linear_fixed_impl(
-            x,
-            weight,
-            weight_scale,
-            7,
-            65,
-            "exact_table",
-            "model.layers.0.mlp.fc1",
-            "FC1",
-            "compiled",
-            "pre_capture",
-            use_8x4_sf_layout=True,
-        )
+        with pytest.raises(
+            RuntimeError,
+            match="stale MXFP8 tactic specialization",
+        ):
+            _mxfp8_trtllm_linear_fixed_impl(
+                x,
+                weight,
+                weight_scale,
+                7,
+                65,
+                "exact_table",
+                "",
+                "model.layers.0.mlp.fc1",
+                "FC1",
+                "compiled",
+                "pre_capture",
+                use_8x4_sf_layout=True,
+            )
 
     assert runner_8x4.valid_tactic_inputs == []
-    assert runner_8x4.forward_tactics == [-1]
+    assert runner_8x4.forward_tactics == []
 
 
 def test_fixed_impl_validates_exact_forward_contract_before_registration(
@@ -739,6 +749,7 @@ def test_fixed_impl_validates_exact_forward_contract_before_registration(
         7,
         -2,
         "unresolved_eager",
+        "",
         "model.layers.0.mlp.fc1",
         "FC1",
         "eager",
@@ -755,6 +766,298 @@ def test_fixed_impl_validates_exact_forward_contract_before_registration(
     assert active_inputs[4] is torch.bfloat16
     assert active_inputs[5].shape == (2, 8)
     assert active_inputs[6] is dispatch_state.workspace_8x4
+
+
+def test_static_specialization_lifecycle_binds_worker_validated_tactic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_key = Mxfp8TacticKey(
+        m_logical=2,
+        n_logical=7,
+        k_logical=4,
+        n_physical=8,
+        k_physical=4,
+        activation_scale_layout="8x4",
+        output_dtype="bfloat16",
+    )
+    runner_output = torch.empty((2, 8), dtype=torch.bfloat16)
+
+    class CaptureRunner(FakeRunner):
+        def forward(self, inputs: list[Any], tactic: int) -> torch.Tensor:
+            super().forward(inputs, tactic)
+            return runner_output
+
+    runner_8x4 = CaptureRunner([65])
+    dispatch_state = state(
+        tactics={exact_key: 65},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([]),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX",
+        [],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "prepare_mxfp8_trtllm_tactic_state",
+        lambda _device: dispatch_state,
+    )
+    input_mxfp8 = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
+    input_scale = torch.empty(1, dtype=torch.uint8)
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(
+            SfLayout=SimpleNamespace(layout_8x4="8x4", layout_128x4="128x4"),
+            mxfp8_quantize=lambda *_args, **_kwargs: (
+                input_mxfp8,
+                input_scale,
+            ),
+        ),
+    )
+
+    # Eager pre-capture warmup validates the exact seven inputs later forwarded.
+    _mxfp8_trtllm_linear_fixed_impl(
+        torch.empty((2, 4), dtype=torch.bfloat16),
+        torch.empty((8, 4), dtype=torch.float8_e4m3fn),
+        torch.empty(1, dtype=torch.uint8),
+        7,
+        -2,
+        "unresolved_eager",
+        "",
+        "model.layers.0.mlp.fc1",
+        "FC1",
+        "eager",
+        "pre_capture_warmup",
+        use_8x4_sf_layout=True,
+    )
+    finalize_mxfp8_trtllm_tactic_specialization()
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    scale = graph.placeholder("scale")
+    x.meta["val"] = SimpleNamespace(
+        shape=(2, 4),
+        device=torch.device("cuda", 0),
+    )
+    weight.meta["val"] = SimpleNamespace(
+        shape=(8, 4),
+        device=torch.device("cuda", 0),
+    )
+    node = graph.call_function(
+        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        (
+            x,
+            weight,
+            scale,
+            7,
+            -2,
+            "unresolved_eager",
+            "",
+            "model.layers.0.mlp.fc1",
+            "FC1",
+            "eager",
+            "eager",
+        ),
+    )
+    graph.output(node)
+    specialization_pass = _Mxfp8AdaptiveLayoutSpecializationPass(
+        "adaptive",
+        256,
+        frozenset({2}),
+    )
+    cache_identity = specialization_pass.uuid()
+    with pass_context(Range(2, 2)):
+        specialization_pass(graph)
+
+    assert node.args[4] == 65
+    assert node.args[5] == "exact_table"
+    assert node.args[6]
+    assert node.args[9:11] == ("compiled", "pre_capture")
+    assert cache_identity == specialization_pass.uuid()
+
+    class CaptureLookupBomb(dict[Mxfp8TacticKey, int]):
+        def __contains__(self, _key: object) -> bool:
+            pytest.fail("capture must not inspect resolved tactic keys")
+
+        def get(self, *_: object, **__: object) -> int:
+            pytest.fail("capture must not look up resolved tactics")
+
+    dispatch_state = dispatch_state._replace(resolved_tactics=CaptureLookupBomb())
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "Mxfp8TacticKey",
+        lambda **_kwargs: pytest.fail("capture must not construct tactic keys"),
+    )
+
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        _mxfp8_trtllm_linear_fixed_impl(
+            torch.empty((2, 4), device="cuda", dtype=torch.bfloat16),
+            torch.empty((8, 4), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(1, device="cuda", dtype=torch.uint8),
+            7,
+            cast(int, node.args[4]),
+            cast(str, node.args[5]),
+            cast(str, node.args[6]),
+            "model.layers.0.mlp.fc1",
+            "FC1",
+            "compiled",
+            "pre_capture",
+            use_8x4_sf_layout=True,
+        )
+
+    assert runner_8x4.valid_tactic_inputs == runner_8x4.forward_inputs[:1]
+    assert runner_8x4.forward_tactics == [65, 65]
+
+
+def test_prewarm_runs_all_static_sizes_eager_before_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatch_state = state(
+        tactics={},
+        runner_8x4=FakeRunner([]),
+        runner_128x4=FakeRunner([]),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    events: list[object] = []
+
+    class ModelRunner:
+        compilation_config = SimpleNamespace(compile_sizes=[1024, 32, 32])
+
+        def _dummy_run(self, size: int, **kwargs: object) -> None:
+            events.append((size, kwargs))
+
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "finalize_mxfp8_trtllm_tactic_specialization",
+        lambda: events.append("finalize"),
+    )
+
+    prewarm_mxfp8_trtllm_tactic_specializations(cast(Any, ModelRunner()))
+
+    assert events == [
+        (
+            1024,
+            {
+                "skip_attn": True,
+                "skip_eplb": True,
+                "is_profile": True,
+                "skip_compiled_for_mxfp8_prewarm": True,
+            },
+        ),
+        (
+            32,
+            {
+                "skip_attn": True,
+                "skip_eplb": True,
+                "is_profile": True,
+                "skip_compiled_for_mxfp8_prewarm": True,
+            },
+        ),
+        "finalize",
+    ]
+
+
+def test_capture_rejects_stale_specialization_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_key = Mxfp8TacticKey(
+        m_logical=2,
+        n_logical=7,
+        k_logical=4,
+        n_physical=8,
+        k_physical=4,
+        activation_scale_layout="8x4",
+        output_dtype="bfloat16",
+    )
+    old_state = state(
+        tactics={exact_key: 65},
+        runner_8x4=FakeRunner([65]),
+        runner_128x4=FakeRunner([]),
+    )
+    old_state.resolved_tactics[exact_key] = 65
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [old_state],
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX",
+        [],
+    )
+    monkeypatch.setitem(
+        mxfp8_utils._MXFP8_TACTIC_SOURCES,
+        (id(old_state), exact_key),
+        ("exact_table", 65, True),
+    )
+    finalize_mxfp8_trtllm_tactic_specialization()
+    old_specialization = mxfp8_utils._MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX[0]
+    assert old_specialization is not None
+    old_fingerprint = old_specialization.fingerprint
+    specialization_pass = _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)
+    old_cache_identity = specialization_pass.uuid()
+
+    new_state = state(
+        tactics={exact_key: 66},
+        runner_8x4=FakeRunner([66]),
+        runner_128x4=FakeRunner([]),
+    )
+    new_state.resolved_tactics[exact_key] = 66
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [new_state],
+    )
+    monkeypatch.setitem(
+        mxfp8_utils._MXFP8_TACTIC_SOURCES,
+        (id(new_state), exact_key),
+        ("exact_table", 66, True),
+    )
+    finalize_mxfp8_trtllm_tactic_specialization()
+    assert specialization_pass.uuid() != old_cache_identity
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with (
+        FakeTensorMode(allow_non_fake_inputs=True),
+        pytest.raises(
+            RuntimeError,
+            match="stale MXFP8 tactic specialization",
+        ),
+    ):
+        _mxfp8_trtllm_linear_fixed_impl(
+            torch.empty((2, 4), device="cuda", dtype=torch.bfloat16),
+            torch.empty((8, 4), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(1, device="cuda", dtype=torch.uint8),
+            7,
+            65,
+            "exact_table",
+            old_fingerprint,
+            "",
+            "FC1",
+            "compiled",
+            "pre_capture",
+            use_8x4_sf_layout=True,
+        )
 
 
 def test_fixed_impl_rejects_capture_without_concrete_key_registration(
@@ -798,6 +1101,7 @@ def test_fixed_impl_rejects_capture_without_concrete_key_registration(
                 7,
                 -2,
                 "unresolved_static_compile",
+                "",
                 "model.layers.0.mlp.fc1",
                 "FC1",
                 "compiled",
