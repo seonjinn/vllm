@@ -3,6 +3,9 @@
 import hashlib
 import json
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -23,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     _mxfp8_trtllm_linear_fixed_impl,
     _Mxfp8TacticAudit,
     _Mxfp8TrtllmTacticState,
+    _resolve_mxfp8_compile_tactic,
     _resolve_mxfp8_trtllm_tactic,
     _run_mxfp8_trtllm_pre_resolved,
 )
@@ -368,6 +372,91 @@ def test_runtime_illegal_tactic_is_downgraded_to_default(
     assert dispatch_state.resolved_tactics[key(layout="8x4")] == -1
 
 
+def test_static_compile_binds_runtime_validated_tactic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_key = Mxfp8TacticKey(
+        m_logical=2,
+        n_logical=7,
+        k_logical=4,
+        n_physical=8,
+        k_physical=4,
+        activation_scale_layout="8x4",
+        output_dtype="bfloat16",
+    )
+    runner_8x4 = FakeRunner([61])
+    dispatch_state = state(
+        tactics={exact_key: 65},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([]),
+    )
+    inputs = runner_inputs()
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_materialize_mxfp8_compile_runner_inputs",
+        lambda *_args, **_kwargs: inputs,
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    weight_scale = graph.placeholder("weight_scale")
+    with FakeTensorMode():
+        x.meta["val"] = torch.empty(
+            (2, 4),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        weight.meta["val"] = torch.empty(
+            (8, 4),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        weight_scale.meta["val"] = torch.empty(
+            1,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+    node = graph.call_function(
+        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        (
+            x,
+            weight,
+            weight_scale,
+            7,
+            -2,
+            "unresolved_eager",
+            "layer",
+            "FC1",
+            "eager",
+            "eager",
+        ),
+    )
+
+    replaced = mxfp8_utils._specialize_mxfp8_adaptive_layout_graph(
+        graph,
+        marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        fixed_op=torch.ops.vllm.mxfp8_trtllm_linear_8x4.default,
+        tactic_resolver=lambda current: _resolve_mxfp8_compile_tactic(
+            current,
+            m=2,
+            use_8x4_sf_layout=True,
+        ),
+    )
+
+    assert replaced == 1
+    assert node.args[4:6] == (-1, "runtime_illegal_tactic")
+    assert runner_8x4.valid_tactic_inputs == [inputs]
+    assert dispatch_state.resolved_tactics[exact_key] == -1
+
+
 @pytest.mark.parametrize("layout", ["8x4", "128x4"])
 def test_safely_disabled_artifact_uses_matching_direct_runner_default(
     monkeypatch: pytest.MonkeyPatch,
@@ -457,6 +546,78 @@ def test_capture_rejects_unresolved_key_before_lookup(
         )
 
 
+def test_fixed_impl_capture_uses_bound_scalar_without_key_or_map_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_output = torch.empty((2, 8), dtype=torch.bfloat16)
+
+    class CaptureRunner(FakeRunner):
+        def forward(self, inputs: list[Any], tactic: int) -> torch.Tensor:
+            super().forward(inputs, tactic)
+            return runner_output
+
+    runner_8x4 = CaptureRunner([65])
+
+    class CaptureLookupBomb(dict[Mxfp8TacticKey, int]):
+        def __contains__(self, _key: object) -> bool:
+            pytest.fail("capture must not inspect resolved tactic keys")
+
+        def get(self, *_: object, **__: object) -> int:
+            pytest.fail("capture must not look up resolved tactics")
+
+    dispatch_state = state(
+        tactics={},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([]),
+    )._replace(resolved_tactics=CaptureLookupBomb())
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "Mxfp8TacticKey",
+        lambda **_kwargs: pytest.fail("capture must not construct tactic keys"),
+    )
+
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        x = torch.empty((2, 4), device="cuda", dtype=torch.bfloat16)
+        weight = torch.empty((8, 4), device="cuda", dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(1, device="cuda", dtype=torch.uint8)
+        input_mxfp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        input_scale = torch.empty(1, device="cuda", dtype=torch.uint8)
+        monkeypatch.setitem(
+            sys.modules,
+            "flashinfer",
+            SimpleNamespace(
+                SfLayout=SimpleNamespace(layout_8x4="8x4", layout_128x4="128x4"),
+                mxfp8_quantize=lambda *_args, **_kwargs: (
+                    input_mxfp8,
+                    input_scale,
+                ),
+            ),
+        )
+
+        _mxfp8_trtllm_linear_fixed_impl(
+            x,
+            weight,
+            weight_scale,
+            7,
+            65,
+            "exact_table",
+            "model.layers.0.mlp.fc1",
+            "FC1",
+            "compiled",
+            "pre_capture",
+            use_8x4_sf_layout=True,
+        )
+
+    assert runner_8x4.valid_tactic_inputs == []
+    assert runner_8x4.forward_tactics == [65]
+
+
 def test_fixed_impl_validates_exact_forward_contract_before_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -512,12 +673,12 @@ def test_fixed_impl_validates_exact_forward_contract_before_registration(
         weight,
         weight_scale,
         7,
-        65,
-        "exact_table",
+        -2,
+        "unresolved_eager",
         "model.layers.0.mlp.fc1",
         "FC1",
-        "compiled",
-        "pre_capture",
+        "eager",
+        "eager",
         use_8x4_sf_layout=True,
     )
 
@@ -571,8 +732,8 @@ def test_fixed_impl_rejects_capture_without_concrete_key_registration(
                 weight,
                 weight_scale,
                 7,
-                65,
-                "exact_table",
+                -2,
+                "unresolved_static_compile",
                 "model.layers.0.mlp.fc1",
                 "FC1",
                 "compiled",
@@ -630,3 +791,61 @@ def test_audit_rejection_and_normal_shutdown_are_durable(tmp_path: Path) -> None
     assert payload["rejected_artifact_reasons"] == [
         "MXFP8 tactic artifact SHA256 does not match"
     ]
+
+
+def test_audit_serializes_concurrent_registration_and_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit = _Mxfp8TacticAudit(
+        output_dir=tmp_path,
+        expected_rank_count=1,
+        rank=0,
+        host="gb200-0",
+        pid=5678,
+        registered_keys={},
+        rejected_artifact_reasons=[],
+    )
+    worker_count = 16
+    registration_count = 128
+    start = threading.Barrier(worker_count)
+    replace_lock = threading.Lock()
+    active_replaces = 0
+    max_active_replaces = 0
+    original_replace = mxfp8_utils.os.replace
+
+    def slow_replace(source: Path, destination: Path) -> None:
+        nonlocal active_replaces, max_active_replaces
+        with replace_lock:
+            active_replaces += 1
+            max_active_replaces = max(max_active_replaces, active_replaces)
+        try:
+            time.sleep(0.01)
+            original_replace(source, destination)
+        finally:
+            with replace_lock:
+                active_replaces -= 1
+
+    monkeypatch.setattr(mxfp8_utils.os, "replace", slow_replace)
+
+    def register(index: int) -> None:
+        if index < worker_count:
+            start.wait()
+        audit.register(
+            key(layout="8x4", m=index + 1),
+            selected_tactic=65,
+            tactic_source="exact_table",
+            requested_tactic=65,
+        )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(register, index) for index in range(registration_count)
+        ]
+        for future in futures:
+            future.result()
+
+    payload = json.loads((tmp_path / "rank-0-pid-5678.json").read_text())
+    assert max_active_replaces == 1
+    assert payload["hits"] == registration_count
+    assert len(payload["registered_keys"]) == registration_count
