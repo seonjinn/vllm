@@ -70,6 +70,8 @@ def _trace_mxfp8_dense_shape(
     output_dtype: str,
     tactic_source: str,
     selected_tactic: int,
+    compilation_state: str,
+    cuda_graph_state: str,
     runtime_provenance: dict[str, object],
 ) -> None:
     enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "")
@@ -126,6 +128,8 @@ def _trace_mxfp8_dense_shape(
         output_dtype,
         tactic_source,
         selected_tactic,
+        compilation_state,
+        cuda_graph_state,
         workload,
         batch_size,
         serving_phase,
@@ -143,8 +147,8 @@ def _trace_mxfp8_dense_shape(
     record = {
         "activation_scale_layout": layout,
         "batch_size": batch_size,
-        "compilation_state": "eager",
-        "cuda_graph_state": "eager",
+        "compilation_state": compilation_state,
+        "cuda_graph_state": cuda_graph_state,
         "event": "mxfp8_dense_shape",
         "family": family,
         "host": host,

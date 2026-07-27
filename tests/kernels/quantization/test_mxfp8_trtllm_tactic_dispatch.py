@@ -2,13 +2,15 @@
 
 import hashlib
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
@@ -18,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     _load_configured_mxfp8_tactic_artifact,
+    _mxfp8_trtllm_linear_fixed_impl,
     _Mxfp8TacticAudit,
     _Mxfp8TrtllmTacticState,
     _resolve_mxfp8_trtllm_tactic,
@@ -30,6 +33,7 @@ class FakeRunner:
         self.valid_tactics = valid_tactics
         self.valid_tactic_inputs: list[list[Any]] = []
         self.valid_tactic_shapes: list[object] = []
+        self.forward_inputs: list[list[Any]] = []
         self.forward_tactics: list[int] = []
 
     def get_valid_tactics(self, inputs: list[Any], profile: Any) -> list[int]:
@@ -37,7 +41,8 @@ class FakeRunner:
         self.valid_tactic_shapes.append(profile.get_opt_shapes())
         return self.valid_tactics
 
-    def forward(self, inputs: list[Any], tactic: int) -> object:
+    def forward(self, inputs: list[Any], tactic: int) -> torch.Tensor:
+        self.forward_inputs.append(inputs)
         self.forward_tactics.append(tactic)
         return inputs[-2]
 
@@ -91,8 +96,8 @@ def state(
         ),
         runner_8x4=runner_8x4,
         runner_128x4=runner_128x4,
-        workspace_8x4=object(),
-        workspace_128x4=object(),
+        workspace_8x4=torch.Tensor(),
+        workspace_128x4=torch.Tensor(),
         resolved_tactics={},
     )
 
@@ -450,6 +455,130 @@ def test_capture_rejects_unresolved_key_before_lookup(
             unresolved_key,
             inputs,
         )
+
+
+def test_fixed_impl_validates_exact_forward_contract_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_key = Mxfp8TacticKey(
+        m_logical=2,
+        n_logical=7,
+        k_logical=4,
+        n_physical=8,
+        k_physical=4,
+        activation_scale_layout="8x4",
+        output_dtype="bfloat16",
+    )
+    runner_8x4 = FakeRunner([65])
+    dispatch_state = state(
+        tactics={exact_key: 65},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([]),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TACTIC_AUDIT", None)
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TRTLLM_TRACE_CALLBACK", None)
+
+    x = torch.empty((2, 4), dtype=torch.bfloat16)
+    weight = torch.empty((8, 4), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty(1, dtype=torch.uint8)
+    input_mxfp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    input_scale = torch.empty(1, dtype=torch.uint8)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "prepare_mxfp8_trtllm_tactic_state",
+        lambda _device: dispatch_state,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(
+            SfLayout=SimpleNamespace(layout_8x4="8x4", layout_128x4="128x4"),
+            mxfp8_quantize=lambda *_args, **_kwargs: (
+                input_mxfp8,
+                input_scale,
+            ),
+        ),
+    )
+
+    _mxfp8_trtllm_linear_fixed_impl(
+        x,
+        weight,
+        weight_scale,
+        7,
+        65,
+        "exact_table",
+        "model.layers.0.mlp.fc1",
+        "FC1",
+        "compiled",
+        "pre_capture",
+        use_8x4_sf_layout=True,
+    )
+
+    assert runner_8x4.valid_tactic_inputs == runner_8x4.forward_inputs
+    active_inputs = runner_8x4.forward_inputs[0]
+    assert active_inputs[0] is input_mxfp8
+    assert active_inputs[1].data_ptr() == weight.data_ptr()
+    assert active_inputs[2] is input_scale
+    assert active_inputs[3] is weight_scale
+    assert active_inputs[4] is torch.bfloat16
+    assert active_inputs[5].shape == (2, 8)
+    assert active_inputs[6] is dispatch_state.workspace_8x4
+
+
+def test_fixed_impl_rejects_capture_without_concrete_key_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatch_state = state(
+        tactics={},
+        runner_8x4=FakeRunner([65]),
+        runner_128x4=FakeRunner([]),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with FakeTensorMode():
+        x = torch.empty((2, 4), device="cuda", dtype=torch.bfloat16)
+        weight = torch.empty((8, 4), device="cuda", dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(1, device="cuda", dtype=torch.uint8)
+        monkeypatch.setitem(
+            sys.modules,
+            "flashinfer",
+            SimpleNamespace(
+                SfLayout=SimpleNamespace(layout_8x4="8x4", layout_128x4="128x4"),
+                mxfp8_quantize=lambda *_args, **_kwargs: pytest.fail(
+                    "capture-only key must fail before activation quantization"
+                ),
+            ),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="unresolved MXFP8 tactic before CUDA Graph capture",
+        ):
+            _mxfp8_trtllm_linear_fixed_impl(
+                x,
+                weight,
+                weight_scale,
+                7,
+                65,
+                "exact_table",
+                "model.layers.0.mlp.fc1",
+                "FC1",
+                "compiled",
+                "pre_capture",
+                use_8x4_sf_layout=True,
+            )
 
 
 def test_audit_atomically_records_runtime_illegal_default(

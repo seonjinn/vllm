@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Generator
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.kernels.linear.mxfp8.flashinfer as flashinfer_module
+import vllm.model_executor.layers.quantization.utils.mxfp8_utils as mxfp8_utils
+from vllm.compilation.passes.inductor_pass import pass_context
+from vllm.config.utils import Range
 from vllm.model_executor.kernels.linear.mxfp8 import Mxfp8LinearLayerConfig
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferTrtllmMxfp8LinearKernel,
@@ -18,9 +24,11 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_TRTLLM_SWITCH_M_ENV,
     _mxfp8_layout_for_compile_range,
     _mxfp8_trtllm_layout_config,
+    _Mxfp8AdaptiveLayoutSpecializationPass,
     _parse_mxfp8_tactic_hints,
     _resolve_mxfp8_high_m_tactic,
     _specialize_mxfp8_adaptive_layout_graph,
+    configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_trtllm_high_m_static_tactics_enabled,
     mxfp8_trtllm_scale_numel,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -28,7 +36,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 
 
 @pytest.fixture(autouse=True)
-def reset_mxfp8_layout_config() -> None:
+def reset_mxfp8_layout_config() -> Generator[None, None, None]:
     _mxfp8_trtllm_layout_config.cache_clear()
     yield
     _mxfp8_trtllm_layout_config.cache_clear()
@@ -244,7 +252,38 @@ def test_mxfp8_adaptive_marker_is_specialized(
     assert node.target == expected_op
 
 
-def test_mxfp8_dynamic_compile_range_downgrades_bound_tactic() -> None:
+@pytest.mark.parametrize(
+    ("m", "expected_tactic"),
+    [(32, 65), (1024, 17)],
+)
+def test_mxfp8_static_compile_ranges_bind_each_concrete_m_independently(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+    expected_tactic: int,
+) -> None:
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    scale = graph.placeholder("scale")
+    node = graph.call_function(
+        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        (x, weight, scale, 512, 99, "trace_m_tactic", "layer", "FC1"),
+    )
+    graph.output(node)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_resolve_mxfp8_compile_tactic",
+        lambda *_args, **_kwargs: (expected_tactic, "exact_table"),
+        raising=False,
+    )
+
+    with pass_context(Range(m, m)):
+        _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)(graph)
+
+    assert node.args[4:6] == (expected_tactic, "exact_table")
+
+
+def test_mxfp8_dynamic_compile_range_preserves_unresolved_sentinel() -> None:
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     weight = graph.placeholder("weight")
@@ -255,16 +294,34 @@ def test_mxfp8_dynamic_compile_range_downgrades_bound_tactic() -> None:
     )
     graph.output(node)
 
-    replaced = _specialize_mxfp8_adaptive_layout_graph(
-        graph,
-        marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
-        fixed_op=torch.ops.vllm.mxfp8_trtllm_linear_8x4.default,
-        tactic_override=(-1, "dynamic_compile_default"),
+    with pass_context(Range(1, 256)):
+        _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)(graph)
+
+    assert node.target == torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
+    assert node.args[4:6] == (-2, "unresolved_dynamic_compile")
+
+
+def test_mxfp8_capture_sizes_are_static_compile_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compilation_config = SimpleNamespace(
+        compile_ranges_endpoints=[],
+        compile_sizes=[99],
+        cudagraph_capture_sizes=[32, 1024],
+        inductor_compile_config={},
+    )
+    vllm_config = SimpleNamespace(
+        compilation_config=compilation_config,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+    )
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config",
+        lambda: vllm_config,
     )
 
-    assert replaced == 1
-    assert node.target == torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
-    assert node.args[4:6] == (-1, "dynamic_compile_default")
+    configure_mxfp8_trtllm_adaptive_compilation()
+
+    assert compilation_config.compile_sizes == [32, 99, 1024]
 
 
 def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:

@@ -33,6 +33,8 @@ def trace_once() -> None:
         output_dtype="bfloat16",
         tactic_source="exact_table",
         selected_tactic=17,
+        compilation_state="compiled",
+        cuda_graph_state="pre_capture",
         runtime_provenance={
             "vllm_version": "0.26.0",
             "flashinfer_version": "0.6.14",
@@ -77,8 +79,8 @@ def test_shape_trace_writes_exact_high_m_record_once(
         {
             "activation_scale_layout": "128x4",
             "batch_size": 32,
-            "compilation_state": "eager",
-            "cuda_graph_state": "eager",
+            "compilation_state": "compiled",
+            "cuda_graph_state": "pre_capture",
             "event": "mxfp8_dense_shape",
             "family": "FC1",
             "host": records[0]["host"],
@@ -140,6 +142,8 @@ def test_shape_trace_honors_record_limit(
         output_dtype="bfloat16",
         tactic_source="exact_miss",
         selected_tactic=-1,
+        compilation_state="compiled",
+        cuda_graph_state="not_captured",
         runtime_provenance={"topology": "tp4"},
     )
 
