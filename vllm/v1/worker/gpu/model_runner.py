@@ -677,7 +677,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prewarm_mxfp8_trtllm_tactic_specializations,
         )
 
-        prewarm_mxfp8_trtllm_tactic_specializations(self)
+        prewarm_mxfp8_trtllm_tactic_specializations(self, skip_attn=True)
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )

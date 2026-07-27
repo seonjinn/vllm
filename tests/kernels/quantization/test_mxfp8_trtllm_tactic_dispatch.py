@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import importlib
+import inspect
 import json
 import sys
 import threading
@@ -17,6 +19,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm.compilation.passes.inductor_pass import pass_context
+from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
@@ -925,8 +928,14 @@ def test_static_specialization_lifecycle_binds_worker_validated_tactic(
     assert runner_8x4.forward_tactics == [65, 65]
 
 
+@pytest.mark.parametrize(
+    "runner_options",
+    [{}, {"skip_attn": True}],
+    ids=["v1", "v2"],
+)
 def test_prewarm_runs_all_static_sizes_eager_before_finalization(
     monkeypatch: pytest.MonkeyPatch,
+    runner_options: dict[str, object],
 ) -> None:
     dispatch_state = state(
         tactics={},
@@ -952,29 +961,104 @@ def test_prewarm_runs_all_static_sizes_eager_before_finalization(
         lambda: events.append("finalize"),
     )
 
-    prewarm_mxfp8_trtllm_tactic_specializations(cast(Any, ModelRunner()))
+    prewarm_mxfp8_trtllm_tactic_specializations(
+        cast(Any, ModelRunner()),
+        **runner_options,
+    )
 
     assert events == [
         (
             1024,
             {
-                "skip_attn": True,
                 "skip_eplb": True,
                 "is_profile": True,
                 "skip_compiled_for_mxfp8_prewarm": True,
+                **runner_options,
             },
         ),
         (
             32,
             {
-                "skip_attn": True,
                 "skip_eplb": True,
                 "is_profile": True,
                 "skip_compiled_for_mxfp8_prewarm": True,
+                **runner_options,
             },
         ),
         "finalize",
     ]
+
+
+@pytest.mark.parametrize(
+    ("runner_module_name", "expected_options"),
+    [
+        ("vllm.v1.worker.gpu_model_runner", {}),
+        ("vllm.v1.worker.gpu.model_runner", {"skip_attn": True}),
+    ],
+)
+def test_v1_and_v2_profile_invoke_prewarm_before_compile(
+    monkeypatch: pytest.MonkeyPatch,
+    runner_module_name: str,
+    expected_options: dict[str, object],
+) -> None:
+    einops = ModuleType("einops")
+    cast(Any, einops).rearrange = lambda *_args, **_kwargs: None
+    cast(Any, einops).reduce = lambda *_args, **_kwargs: None
+    cast(Any, einops).repeat = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "einops", einops)
+    runner_module = importlib.import_module(runner_module_name)
+    runner = object.__new__(runner_module.GPUModelRunner)
+    events: list[tuple[object, dict[str, object]]] = []
+
+    class PrewarmReached(Exception):
+        pass
+
+    def prewarm(actual_runner: object, **options: object) -> None:
+        events.append((actual_runner, options))
+        raise PrewarmReached
+
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "prewarm_mxfp8_trtllm_tactic_specializations",
+        prewarm,
+    )
+
+    with pytest.raises(PrewarmReached):
+        runner.profile_run()
+
+    assert events == [(runner, expected_options)]
+    if runner_module_name.endswith("gpu_model_runner"):
+        dummy_source = inspect.getsource(runner_module.GPUModelRunner._dummy_run)
+        assert "skip_compiled=skip_compiled_for_mxfp8_prewarm" in dummy_source
+    else:
+        execute_source = inspect.getsource(runner_module.GPUModelRunner.execute_model)
+        assert "skip_compiled = skip_compiled_for_mxfp8_prewarm" in execute_source
+
+
+def test_hybrid_model_defaults_to_v1_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HybridVllmConfig:
+        speculative_config = None
+        model_config = SimpleNamespace(
+            runner_type="generate",
+            is_hybrid=True,
+            is_diffusion=False,
+            is_attention_free=False,
+            architectures=["NemotronHForCausalLM"],
+            is_moe=True,
+        )
+
+        def _dflash_needs_multi_kv_group(self) -> bool:
+            return False
+
+        def _is_default_v2_model_runner_model(self) -> bool:
+            return VllmConfig._is_default_v2_model_runner_model(cast(Any, self))
+
+    monkeypatch.setattr(mxfp8_utils.envs, "VLLM_USE_V2_MODEL_RUNNER", None)
+    use_v2_model_runner = VllmConfig.use_v2_model_runner.fget
+    assert use_v2_model_runner is not None
+    assert not use_v2_model_runner(cast(Any, HybridVllmConfig()))
 
 
 def test_capture_rejects_stale_specialization_fingerprint(

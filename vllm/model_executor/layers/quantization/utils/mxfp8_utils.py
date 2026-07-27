@@ -538,7 +538,10 @@ def finalize_mxfp8_trtllm_tactic_specialization() -> None:
         _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX = specializations
 
 
-def prewarm_mxfp8_trtllm_tactic_specializations(model_runner: Any) -> None:
+def prewarm_mxfp8_trtllm_tactic_specializations(
+    model_runner: Any,
+    **dummy_run_kwargs: Any,
+) -> None:
     """Resolve exact static contracts eagerly before the first compilation."""
     with _MXFP8_TRTLLM_STATE_LOCK:
         has_prepared_state = any(
@@ -551,7 +554,7 @@ def prewarm_mxfp8_trtllm_tactic_specializations(model_runner: Any) -> None:
     for size in sorted(set(compile_sizes), reverse=True):
         model_runner._dummy_run(
             size,
-            skip_attn=True,
+            **dummy_run_kwargs,
             skip_eplb=True,
             is_profile=True,
             skip_compiled_for_mxfp8_prewarm=True,

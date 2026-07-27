@@ -5778,6 +5778,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        skip_compiled_for_mxfp8_prewarm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -6079,6 +6080,7 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    skip_compiled=skip_compiled_for_mxfp8_prewarm,
                 ),
             ):
                 outputs = self.model(
@@ -6362,6 +6364,12 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            prewarm_mxfp8_trtllm_tactic_specializations,
+        )
+
+        prewarm_mxfp8_trtllm_tactic_specializations(self)
+
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
