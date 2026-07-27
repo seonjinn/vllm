@@ -360,12 +360,11 @@ def _load_configured_mxfp8_tactic_artifact() -> tuple[
     table_sha256 = envs.VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256
     provenance_path = envs.VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_PATH
     provenance_sha256 = envs.VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256
-    configured = (table_path, table_sha256, provenance_path, provenance_sha256)
+    table_configured = bool(table_path or table_sha256)
+    provenance_configured = bool(provenance_path or provenance_sha256)
     global _MXFP8_ARTIFACT_CONFIGURATION_PRESENT
-    _MXFP8_ARTIFACT_CONFIGURATION_PRESENT = any(
-        value is not None for value in configured
-    )
-    if not _MXFP8_ARTIFACT_CONFIGURATION_PRESENT:
+    _MXFP8_ARTIFACT_CONFIGURATION_PRESENT = table_configured
+    if not table_configured and not provenance_configured:
         return None, None, None
 
     expected: RuntimeProvenance | None = None
@@ -384,6 +383,8 @@ def _load_configured_mxfp8_tactic_artifact() -> tuple[
             "incomplete runtime provenance configuration",
         )
 
+    if not table_configured:
+        return None, expected, None
     if not table_path or not table_sha256 or expected is None:
         return (
             None,

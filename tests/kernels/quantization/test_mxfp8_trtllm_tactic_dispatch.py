@@ -167,6 +167,44 @@ def configure_artifact(
     )
 
 
+def test_provenance_only_configuration_supports_shape_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provenance_contents = (
+        json.dumps(asdict(provenance()), sort_keys=True).encode("utf-8") + b"\n"
+    )
+    provenance_path = tmp_path / "runtime-provenance.json"
+    provenance_path.write_bytes(provenance_contents)
+    monkeypatch.setattr(
+        mxfp8_utils.envs,
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_PATH",
+        None,
+    )
+    monkeypatch.setattr(
+        mxfp8_utils.envs,
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256",
+        None,
+    )
+    monkeypatch.setattr(
+        mxfp8_utils.envs,
+        "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_PATH",
+        str(provenance_path),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils.envs,
+        "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256",
+        hashlib.sha256(provenance_contents).hexdigest(),
+    )
+
+    artifact, runtime_provenance, rejection = _load_configured_mxfp8_tactic_artifact()
+
+    assert artifact is None
+    assert runtime_provenance == provenance()
+    assert rejection is None
+    assert not mxfp8_utils._MXFP8_ARTIFACT_CONFIGURATION_PRESENT
+
+
 def test_missing_artifact_is_safely_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
