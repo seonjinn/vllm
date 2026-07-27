@@ -9,13 +9,14 @@ from pathlib import Path
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_e4m3_quantize,
     mxfp8_trtllm_adaptive_linear,
-    mxfp8_trtllm_use_8x4_sf_layout,
-    prepare_mxfp8_trtllm_high_m_tactic_state,
+    prepare_mxfp8_trtllm_tactic_state,
+    register_mxfp8_trtllm_trace_callback,
     swizzle_mxfp8_scale,
 )
 from vllm.platforms import current_platform
@@ -24,8 +25,11 @@ from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
-_MXFP8_DENSE_TRACE_SEEN: set[tuple[str, str, int, int, int, int, str]] = set()
+logger = init_logger(__name__)
+
+_MXFP8_DENSE_TRACE_SEEN: set[tuple[object, ...]] = set()
 _MXFP8_DENSE_TRACE_WRITTEN = 0
+_MXFP8_DENSE_TRACE_WARNED = False
 
 
 def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
@@ -56,11 +60,17 @@ def _trace_mxfp8_dense_shape(
     *,
     prefix: str,
     family: str,
-    m: int,
+    m_logical: int,
+    m_physical: int,
     n_logical: int,
     n_physical: int,
-    k: int,
+    k_logical: int,
+    k_physical: int,
     layout: str,
+    output_dtype: str,
+    tactic_source: str,
+    selected_tactic: int,
+    runtime_provenance: dict[str, object],
 ) -> None:
     enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "")
     if enabled.strip().lower() in ("", "0", "false", "no", "off"):
@@ -71,7 +81,55 @@ def _trace_mxfp8_dense_shape(
     if not trace_dir:
         return
 
-    key = (prefix, family, m, n_logical, n_physical, k, layout)
+    workload = os.environ.get("VLLM_MXFP8_DENSE_TRACE_WORKLOAD", "").strip()
+    raw_batch_size = os.environ.get("VLLM_MXFP8_DENSE_TRACE_BATCH_SIZE", "")
+    serving_phase = os.environ.get("VLLM_MXFP8_DENSE_TRACE_SERVING_PHASE", "").strip()
+    topology = runtime_provenance.get("topology")
+    global _MXFP8_DENSE_TRACE_WARNED
+    if (
+        not workload
+        or not raw_batch_size
+        or not serving_phase
+        or not isinstance(topology, str)
+        or not topology
+        or not runtime_provenance
+    ):
+        if not _MXFP8_DENSE_TRACE_WARNED:
+            _MXFP8_DENSE_TRACE_WARNED = True
+            logger.warning(
+                "MXFP8 dense shape tracing requires workload, batch size, "
+                "serving phase, and runtime provenance; skipping incomplete rows."
+            )
+        return
+    try:
+        batch_size = int(raw_batch_size)
+    except ValueError:
+        batch_size = 0
+    if batch_size <= 0:
+        if not _MXFP8_DENSE_TRACE_WARNED:
+            _MXFP8_DENSE_TRACE_WARNED = True
+            logger.warning(
+                "MXFP8 dense shape trace batch size must be a positive integer."
+            )
+        return
+
+    key = (
+        prefix,
+        family,
+        m_logical,
+        m_physical,
+        n_logical,
+        n_physical,
+        k_logical,
+        k_physical,
+        layout,
+        output_dtype,
+        tactic_source,
+        selected_tactic,
+        workload,
+        batch_size,
+        serving_phase,
+    )
     max_records = int(os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"))
     global _MXFP8_DENSE_TRACE_WRITTEN
     if key in _MXFP8_DENSE_TRACE_SEEN or max_records <= _MXFP8_DENSE_TRACE_WRITTEN:
@@ -81,21 +139,44 @@ def _trace_mxfp8_dense_shape(
 
     output_dir = Path(trace_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    host = socket.gethostname()
     record = {
+        "activation_scale_layout": layout,
+        "batch_size": batch_size,
+        "compilation_state": "eager",
+        "cuda_graph_state": "eager",
         "event": "mxfp8_dense_shape",
         "family": family,
-        "hostname": socket.gethostname(),
-        "k": int(k),
+        "host": host,
+        "hostname": host,
+        "k": int(k_logical),
+        "k_logical": int(k_logical),
+        "k_physical": int(k_physical),
+        "layer_prefix": prefix,
         "layout": layout,
-        "m": int(m),
+        "m": int(m_logical),
+        "m_logical": int(m_logical),
+        "m_physical": int(m_physical),
         "n_logical": int(n_logical),
         "n_physical": int(n_physical),
+        "normalized_family": family,
+        "output_dtype": output_dtype,
         "pid": os.getpid(),
         "prefix": prefix,
+        "rank": int(os.environ.get("RANK", "0")),
+        "runtime_provenance": runtime_provenance,
+        "selected_tactic": int(selected_tactic),
+        "serving_phase": serving_phase,
+        "tactic_source": tactic_source,
+        "topology": topology,
+        "workload": workload,
     }
-    output = output_dir / f"dense_shapes_{record['hostname']}_{record['pid']}.jsonl"
+    output = output_dir / f"dense_shapes_{record['host']}_{record['pid']}.jsonl"
     with output.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+register_mxfp8_trtllm_trace_callback(_trace_mxfp8_dense_shape)
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -320,7 +401,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         layer.weight = Parameter(shuffled_weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(shuffled_scale.contiguous(), requires_grad=False)
         layer._mxfp8_trtllm_output_features = n
-        prepare_mxfp8_trtllm_high_m_tactic_state(layer.weight.device)
+        prepare_mxfp8_trtllm_tactic_state(layer.weight.device)
 
     def apply_weights(
         self,
@@ -335,30 +416,18 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
             )
         weight = layer.weight  # shuffled [N_padded, K]
         weight_scale = layer.weight_scale
-        n_padded, k = weight.shape
+        _, k = weight.shape
         output_features = layer._mxfp8_trtllm_output_features
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
-        if (
-            not torch.compiler.is_compiling()
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            use_8x4 = mxfp8_trtllm_use_8x4_sf_layout(int(input_2d.shape[0]))
-            _trace_mxfp8_dense_shape(
-                prefix=str(getattr(layer, "prefix", "unknown")),
-                family=_mxfp8_dense_family(layer),
-                m=int(input_2d.shape[0]),
-                n_logical=int(output_features),
-                n_physical=int(n_padded),
-                k=int(k),
-                layout="8x4" if use_8x4 else "128x4",
-            )
         output = mxfp8_trtllm_adaptive_linear(
             input_2d,
             weight,
             weight_scale,
             output_features,
+            str(getattr(layer, "prefix", "unknown")),
+            _mxfp8_dense_family(layer),
         )
         if bias is not None:
             output = output + bias

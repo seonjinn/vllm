@@ -1,15 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import atexit
+import hashlib
+import json
 import os
-from contextlib import nullcontext
+import socket
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, fields
 from functools import cache
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
 
+from vllm import envs
 from vllm.compilation.passes.inductor_pass import InductorPass, get_pass_context
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.mxfp8_tactic_table import (
+    Mxfp8TacticArtifact,
+    Mxfp8TacticKey,
+    RuntimeProvenance,
+    load_mxfp8_tactic_artifact,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 # MXFP8 constants
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
@@ -138,15 +154,118 @@ def mxfp8_trtllm_high_m_static_tactics_enabled() -> bool:
     )
 
 
-class _Mxfp8HighMTrtllmState(NamedTuple):
-    workspace: torch.Tensor
-    runner: Any
-    fallback_tactic: int
-    tactic_hints: dict[tuple[int, int, int], int]
-    use_global_fallback: bool
+class _Mxfp8TrtllmTacticState(NamedTuple):
+    artifact: Mxfp8TacticArtifact | None
+    runner_8x4: Any
+    runner_128x4: Any
+    workspace_8x4: torch.Tensor
+    workspace_128x4: torch.Tensor
+    resolved_tactics: dict[Mxfp8TacticKey, int]
 
 
-_MXFP8_HIGH_M_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8HighMTrtllmState] = {}
+class _Mxfp8RunnerProfile:
+    def __init__(self, key: Mxfp8TacticKey) -> None:
+        self._shapes = (
+            (key.m_logical, key.k_physical),
+            (key.k_physical, key.n_physical),
+        )
+
+    def get_opt_shapes(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        return self._shapes
+
+
+@dataclass
+class _Mxfp8TacticAudit:
+    output_dir: Path | None
+    expected_rank_count: int
+    rank: int
+    host: str
+    pid: int
+    registered_keys: dict[Mxfp8TacticKey, dict[str, Any]]
+    rejected_artifact_reasons: list[str]
+    hits: int = 0
+    misses: int = 0
+    defaults: int = 0
+    complete: bool = False
+
+    def reject_artifact(self, reason: str) -> None:
+        if reason not in self.rejected_artifact_reasons:
+            self.rejected_artifact_reasons.append(reason)
+            self.write()
+
+    def register(
+        self,
+        key: Mxfp8TacticKey,
+        *,
+        selected_tactic: int,
+        tactic_source: str,
+        requested_tactic: int | None,
+    ) -> None:
+        if key in self.registered_keys:
+            return
+        if tactic_source in ("exact_table", "exact_table_default"):
+            self.hits += 1
+        elif tactic_source == "exact_miss":
+            self.misses += 1
+        if selected_tactic == -1:
+            self.defaults += 1
+        self.registered_keys[key] = {
+            **asdict(key),
+            "requested_tactic": requested_tactic,
+            "selected_tactic": selected_tactic,
+            "tactic_source": tactic_source,
+        }
+        self.write()
+
+    def write(self) -> None:
+        if self.output_dir is None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        worker_name = f"rank-{self.rank}-pid-{self.pid}"
+        temporary = self.output_dir / f"{worker_name}.json.tmp"
+        destination = self.output_dir / f"{worker_name}.json"
+        payload = {
+            "complete": self.complete,
+            "defaults": self.defaults,
+            "expected_rank_count": self.expected_rank_count,
+            "hits": self.hits,
+            "host": self.host,
+            "misses": self.misses,
+            "pid": self.pid,
+            "rank": self.rank,
+            "registered_keys": sorted(
+                self.registered_keys.values(),
+                key=lambda row: (
+                    row["m_logical"],
+                    row["n_logical"],
+                    row["k_logical"],
+                    row["n_physical"],
+                    row["k_physical"],
+                    row["activation_scale_layout"],
+                    row["output_dtype"],
+                ),
+            ),
+            "rejected_artifact_reasons": self.rejected_artifact_reasons,
+        }
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+
+
+_MXFP8_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8TrtllmTacticState] = {}
+_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX: list[_Mxfp8TrtllmTacticState | None] = []
+_MXFP8_TACTIC_SOURCES: dict[tuple[int, Mxfp8TacticKey], tuple[str, int | None]] = {}
+_MXFP8_RUNTIME_PROVENANCE: RuntimeProvenance | None = None
+_MXFP8_ARTIFACT_CONFIGURATION_PRESENT = False
+_MXFP8_ARTIFACT_REJECTION_WARNED = False
+_MXFP8_LEGACY_TACTIC_HINTS: dict[tuple[int, int, int], int] = {}
+_MXFP8_LEGACY_FALLBACK_TACTIC = -1
+_MXFP8_LEGACY_GLOBAL_FALLBACK = False
+_MXFP8_TACTIC_AUDIT: _Mxfp8TacticAudit | None = None
+_MXFP8_TRTLLM_TRACE_CALLBACK: Callable[..., None] | None = None
 
 
 def _mxfp8_cuda_device_key(device: torch.device) -> tuple[str, int]:
@@ -159,28 +278,169 @@ def _mxfp8_cuda_device_key(device: torch.device) -> tuple[str, int]:
     return canonical.type, index
 
 
-def prepare_mxfp8_trtllm_high_m_tactic_state(
-    device: torch.device,
-) -> _Mxfp8HighMTrtllmState | None:
-    if not mxfp8_trtllm_high_m_static_tactics_enabled():
-        return None
+def _runtime_provenance_from_file(
+    path: Path,
+    expected_sha256: str,
+) -> RuntimeProvenance:
+    try:
+        contents = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Unable to read MXFP8 runtime provenance {path}.") from exc
+    if hashlib.sha256(contents).hexdigest() != expected_sha256:
+        raise ValueError(
+            "MXFP8 runtime provenance SHA256 does not match configuration."
+        )
+    try:
+        raw = json.loads(contents)
+    except json.JSONDecodeError as exc:
+        raise ValueError("MXFP8 runtime provenance is not valid JSON.") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("MXFP8 runtime provenance root must be an object.")
 
+    values: dict[str, Any] = {}
+    for field in fields(RuntimeProvenance):
+        value = raw.get(field.name)
+        if field.name == "adaptive_switch_m":
+            if type(value) is not int or value <= 0:
+                raise ValueError(
+                    "MXFP8 runtime provenance adaptive_switch_m must be positive."
+                )
+        elif not isinstance(value, str) or not value:
+            raise ValueError(
+                f"MXFP8 runtime provenance {field.name} must be non-empty."
+            )
+        values[field.name] = value
+    return RuntimeProvenance(**values)
+
+
+def _load_configured_mxfp8_tactic_artifact() -> tuple[
+    Mxfp8TacticArtifact | None, RuntimeProvenance | None, str | None
+]:
+    table_path = envs.VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_PATH
+    table_sha256 = envs.VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256
+    provenance_path = envs.VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_PATH
+    provenance_sha256 = envs.VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256
+    configured = (table_path, table_sha256, provenance_path, provenance_sha256)
+    global _MXFP8_ARTIFACT_CONFIGURATION_PRESENT
+    _MXFP8_ARTIFACT_CONFIGURATION_PRESENT = any(
+        value is not None for value in configured
+    )
+    if not _MXFP8_ARTIFACT_CONFIGURATION_PRESENT:
+        return None, None, None
+
+    expected: RuntimeProvenance | None = None
+    if provenance_path and provenance_sha256:
+        try:
+            expected = _runtime_provenance_from_file(
+                Path(provenance_path),
+                provenance_sha256,
+            )
+        except ValueError as exc:
+            return None, None, str(exc)
+    elif provenance_path or provenance_sha256:
+        return (
+            None,
+            None,
+            "incomplete runtime provenance configuration",
+        )
+
+    if not table_path or not table_sha256 or expected is None:
+        return (
+            None,
+            expected,
+            "incomplete tactic table or runtime provenance configuration",
+        )
+
+    try:
+        artifact = load_mxfp8_tactic_artifact(
+            Path(table_path),
+            table_sha256,
+            expected,
+        )
+    except ValueError as exc:
+        safe_disable_errors = (
+            "Unable to read MXFP8 tactic artifact ",
+            "MXFP8 tactic artifact SHA256 does not match configuration.",
+            "MXFP8 tactic artifact provenance does not match runtime for ",
+            "MXFP8 tactic artifact provenance does not match worker-local runtime for ",
+            "Unable to query MXFP8 worker-local runtime provenance.",
+        )
+        if not str(exc).startswith(safe_disable_errors):
+            raise
+        return None, expected, str(exc)
+    return artifact, expected, None
+
+
+def _new_mxfp8_tactic_audit() -> _Mxfp8TacticAudit:
+    configured_path = envs.VLLM_MXFP8_DENSE_TACTIC_AUDIT_PATH
+    return _Mxfp8TacticAudit(
+        output_dir=Path(configured_path) if configured_path else None,
+        expected_rank_count=int(os.environ.get("WORLD_SIZE", "1")),
+        rank=int(os.environ.get("RANK", "0")),
+        host=socket.gethostname(),
+        pid=os.getpid(),
+        registered_keys={},
+        rejected_artifact_reasons=[],
+    )
+
+
+def finalize_mxfp8_trtllm_tactic_audit() -> None:
+    if _MXFP8_TACTIC_AUDIT is None:
+        return
+    _MXFP8_TACTIC_AUDIT.complete = True
+    _MXFP8_TACTIC_AUDIT.write()
+
+
+atexit.register(finalize_mxfp8_trtllm_tactic_audit)
+
+
+def register_mxfp8_trtllm_trace_callback(
+    callback: Callable[..., None],
+) -> None:
+    global _MXFP8_TRTLLM_TRACE_CALLBACK
+    _MXFP8_TRTLLM_TRACE_CALLBACK = callback
+
+
+def prepare_mxfp8_trtllm_tactic_state(
+    device: torch.device,
+) -> _Mxfp8TrtllmTacticState:
+    global _MXFP8_ARTIFACT_REJECTION_WARNED
+    global _MXFP8_LEGACY_FALLBACK_TACTIC
+    global _MXFP8_LEGACY_GLOBAL_FALLBACK
+    global _MXFP8_LEGACY_TACTIC_HINTS
+    global _MXFP8_RUNTIME_PROVENANCE
+    global _MXFP8_TACTIC_AUDIT
     device_key = _mxfp8_cuda_device_key(device)
-    existing = _MXFP8_HIGH_M_TRTLLM_STATES.get(device_key)
+    existing = _MXFP8_TRTLLM_STATES.get(device_key)
     if existing is not None:
         return existing
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "MXFP8 high-M TRTLLM tactic state must be prepared before "
-            "CUDA Graph capture."
+            "MXFP8 TRTLLM tactic state must be prepared before CUDA Graph capture."
         )
+
+    artifact, runtime_provenance, rejection = _load_configured_mxfp8_tactic_artifact()
+    _MXFP8_RUNTIME_PROVENANCE = runtime_provenance
+    if _MXFP8_TACTIC_AUDIT is None:
+        _MXFP8_TACTIC_AUDIT = _new_mxfp8_tactic_audit()
+    if rejection is not None:
+        _MXFP8_TACTIC_AUDIT.reject_artifact(rejection)
+        if not _MXFP8_ARTIFACT_REJECTION_WARNED:
+            _MXFP8_ARTIFACT_REJECTION_WARNED = True
+            logger.warning(
+                "Disabling explicit MXFP8 tactics and using direct TRTLLM "
+                "tactic=-1: %s",
+                rejection,
+            )
 
     fallback_tactic = int(os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, "-1"))
     if fallback_tactic < -1:
         raise ValueError(f"{MXFP8_TRTLLM_HIGH_M_TACTIC_ENV} must be -1 or greater.")
-    tactic_hints = _parse_mxfp8_tactic_hints(
+    _MXFP8_LEGACY_FALLBACK_TACTIC = fallback_tactic
+    _MXFP8_LEGACY_TACTIC_HINTS = _parse_mxfp8_tactic_hints(
         os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "")
     )
+    _MXFP8_LEGACY_GLOBAL_FALLBACK = MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ
 
     from flashinfer.gemm.gemm_base import (
         DEFAULT_WORKSPACE_SIZE,
@@ -190,42 +450,187 @@ def prepare_mxfp8_trtllm_high_m_tactic_state(
 
     canonical = torch.device(device_key[0], device_key[1])
     with torch.cuda.device(canonical):
-        workspace = _get_cache_buf(
-            "vllm_mxfp8_trtllm_high_m_static_tactic_workspace",
+        workspace_8x4 = _get_cache_buf(
+            "vllm_mxfp8_trtllm_tactic_workspace_8x4",
             DEFAULT_WORKSPACE_SIZE,
             canonical,
         )
-        runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
-            use_8x4_sf_layout=False
+        workspace_128x4 = _get_cache_buf(
+            "vllm_mxfp8_trtllm_tactic_workspace_128x4",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical,
         )
+        module = get_trtllm_gemm_module()
+        runner_8x4 = module.trtllm_mxfp8_gemm_runner(use_8x4_sf_layout=True)
+        runner_128x4 = module.trtllm_mxfp8_gemm_runner(use_8x4_sf_layout=False)
 
-    state = _Mxfp8HighMTrtllmState(
-        workspace=workspace,
-        runner=runner,
-        fallback_tactic=fallback_tactic,
-        tactic_hints=tactic_hints,
-        use_global_fallback=MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ,
+    state = _Mxfp8TrtllmTacticState(
+        artifact=artifact,
+        runner_8x4=runner_8x4,
+        runner_128x4=runner_128x4,
+        workspace_8x4=workspace_8x4,
+        workspace_128x4=workspace_128x4,
+        resolved_tactics={},
     )
-    _MXFP8_HIGH_M_TRTLLM_STATES[device_key] = state
+    _MXFP8_TRTLLM_STATES[device_key] = state
+    device_index = device_key[1]
+    if device_index >= len(_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX):
+        _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX.extend(
+            [None] * (device_index + 1 - len(_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX))
+        )
+    _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX[device_index] = state
     return state
 
 
-def _require_mxfp8_trtllm_high_m_tactic_state(
+def prepare_mxfp8_trtllm_high_m_tactic_state(
     device: torch.device,
-) -> _Mxfp8HighMTrtllmState:
+) -> _Mxfp8TrtllmTacticState | None:
+    if not mxfp8_trtllm_high_m_static_tactics_enabled():
+        return None
+    return prepare_mxfp8_trtllm_tactic_state(device)
+
+
+def _require_mxfp8_trtllm_tactic_state(
+    device: torch.device,
+) -> _Mxfp8TrtllmTacticState:
     device_key = _mxfp8_cuda_device_key(device)
-    state = _MXFP8_HIGH_M_TRTLLM_STATES.get(device_key)
+    state = _MXFP8_TRTLLM_STATES.get(device_key)
     if state is not None:
         return state
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "MXFP8 high-M TRTLLM tactic state was not prepared before "
-            "CUDA Graph capture."
+        raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
+    return prepare_mxfp8_trtllm_tactic_state(device)
+
+
+def _runner_and_workspace(
+    state: _Mxfp8TrtllmTacticState,
+    use_8x4_sf_layout: bool,
+) -> tuple[Any, torch.Tensor]:
+    if use_8x4_sf_layout:
+        return state.runner_8x4, state.workspace_8x4
+    return state.runner_128x4, state.workspace_128x4
+
+
+def _record_mxfp8_tactic_resolution(
+    key: Mxfp8TacticKey,
+    *,
+    selected_tactic: int,
+    tactic_source: str,
+    requested_tactic: int | None,
+) -> None:
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return
+    if _MXFP8_TACTIC_AUDIT is not None:
+        _MXFP8_TACTIC_AUDIT.register(
+            key,
+            selected_tactic=selected_tactic,
+            tactic_source=tactic_source,
+            requested_tactic=requested_tactic,
         )
-    prepared = prepare_mxfp8_trtllm_high_m_tactic_state(device)
-    if prepared is None:
-        raise RuntimeError("MXFP8 high-M static tactic path is not enabled.")
-    return prepared
+
+
+def _resolve_mxfp8_trtllm_tactic(
+    state: _Mxfp8TrtllmTacticState,
+    key: Mxfp8TacticKey,
+    runner_inputs: list[Any],
+) -> tuple[int, str]:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
+
+    existing = state.resolved_tactics.get(key)
+    if existing is not None:
+        tactic_source, requested_tactic = _MXFP8_TACTIC_SOURCES.get(
+            (id(state), key),
+            ("pre_resolved", existing),
+        )
+        _record_mxfp8_tactic_resolution(
+            key,
+            selected_tactic=existing,
+            tactic_source=tactic_source,
+            requested_tactic=requested_tactic,
+        )
+        return existing, tactic_source
+
+    requested_tactic: int | None = None
+    if state.artifact is not None:
+        requested_tactic = state.artifact.lookup(key)
+        if requested_tactic is None:
+            selected_tactic = -1
+            tactic_source = "exact_miss"
+        elif requested_tactic == -1:
+            selected_tactic = -1
+            tactic_source = "exact_table_default"
+        else:
+            selected_tactic = requested_tactic
+            tactic_source = "exact_table"
+    elif (
+        not _MXFP8_ARTIFACT_CONFIGURATION_PRESENT
+        and key.activation_scale_layout == "128x4"
+    ):
+        legacy_tactic = _resolve_mxfp8_high_m_tactic(
+            key.m_logical,
+            key.n_logical,
+            key.k_logical,
+            _MXFP8_LEGACY_TACTIC_HINTS,
+            _MXFP8_LEGACY_FALLBACK_TACTIC,
+            use_global_fallback=_MXFP8_LEGACY_GLOBAL_FALLBACK,
+        )
+        if legacy_tactic is None:
+            selected_tactic = -1
+            tactic_source = "artifact_disabled"
+        else:
+            requested_tactic = legacy_tactic
+            selected_tactic = legacy_tactic
+            tactic_source = "legacy_high_m"
+    else:
+        selected_tactic = -1
+        tactic_source = "artifact_disabled"
+
+    if selected_tactic >= 0:
+        runner, _ = _runner_and_workspace(
+            state,
+            key.activation_scale_layout == "8x4",
+        )
+        try:
+            valid_tactics = runner.get_valid_tactics(
+                runner_inputs,
+                _Mxfp8RunnerProfile(key),
+            )
+        except Exception:
+            logger.warning(
+                "MXFP8 tactic %d could not be validated at runtime; using "
+                "direct TRTLLM tactic=-1.",
+                selected_tactic,
+                exc_info=True,
+            )
+            valid_tactics = []
+        if selected_tactic not in valid_tactics:
+            selected_tactic = -1
+            tactic_source = "runtime_illegal_tactic"
+
+    state.resolved_tactics[key] = selected_tactic
+    _MXFP8_TACTIC_SOURCES[(id(state), key)] = (
+        tactic_source,
+        requested_tactic,
+    )
+    _record_mxfp8_tactic_resolution(
+        key,
+        selected_tactic=selected_tactic,
+        tactic_source=tactic_source,
+        requested_tactic=requested_tactic,
+    )
+    return selected_tactic, tactic_source
+
+
+def _run_mxfp8_trtllm_pre_resolved(
+    state: _Mxfp8TrtllmTacticState,
+    *,
+    use_8x4_sf_layout: bool,
+    runner_inputs: list[Any],
+    tactic: int,
+) -> torch.Tensor:
+    runner, _ = _runner_and_workspace(state, use_8x4_sf_layout)
+    return runner.forward(runner_inputs, tactic=tactic)
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
@@ -497,13 +902,28 @@ def _mxfp8_trtllm_linear_fixed_impl(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    tactic: int,
+    tactic_source: str,
+    layer_prefix: str,
+    normalized_family: str,
     *,
     use_8x4_sf_layout: bool,
 ) -> torch.Tensor:
     from flashinfer import SfLayout
-    from flashinfer import autotune as flashinfer_autotune
-    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+
+    device_index = x.get_device()
+    state = (
+        _MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX[device_index]
+        if 0 <= device_index < len(_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX)
+        else None
+    )
+    if state is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
+        state = prepare_mxfp8_trtllm_tactic_state(x.device)
+    if tactic < -1:
+        raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
 
     sf_layout = SfLayout.layout_8x4 if use_8x4_sf_layout else SfLayout.layout_128x4
     input_mxfp8, input_scale = flashinfer_mxfp8_quantize(
@@ -512,50 +932,67 @@ def _mxfp8_trtllm_linear_fixed_impl(
         backend="cuda",
         sf_swizzle_layout=sf_layout,
     )
-    if not use_8x4_sf_layout and mxfp8_trtllm_high_m_static_tactics_enabled():
-        state = _require_mxfp8_trtllm_high_m_tactic_state(x.device)
-        logical_shape = (int(x.shape[0]), int(output_features), int(x.shape[1]))
-        tactic = _resolve_mxfp8_high_m_tactic(
-            *logical_shape,
-            state.tactic_hints,
-            state.fallback_tactic,
-            use_global_fallback=state.use_global_fallback,
-        )
-        if tactic is not None:
-            physical_n = int(weight.shape[0])
-            output = torch.empty(
-                (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
-            )
-            output = state.runner.forward(
-                [
-                    input_mxfp8,
-                    weight.t(),
-                    input_scale,
-                    weight_scale,
-                    torch.bfloat16,
-                    output,
-                    state.workspace,
-                ],
-                tactic=tactic,
-            )
-            return output[:, :output_features].contiguous()
-
-    # Exact-hint misses keep the serving-stable FlashInfer wrapper path.
-    autotune_context = (
-        nullcontext()
-        if use_8x4_sf_layout
-        else flashinfer_autotune(skip_ops={"mxfp8_gemm"})
+    physical_n = int(weight.shape[0])
+    output = torch.empty(
+        (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
     )
-    with autotune_context:
-        output = flashinfer_mm_mxfp8(
+    _, workspace = _runner_and_workspace(state, use_8x4_sf_layout)
+    output = _run_mxfp8_trtllm_pre_resolved(
+        state,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        runner_inputs=[
             input_mxfp8,
             weight.t(),
             input_scale,
             weight_scale,
-            out_dtype=torch.bfloat16,
-            use_8x4_sf_layout=use_8x4_sf_layout,
-            backend="trtllm",
+            torch.bfloat16,
+            output,
+            workspace,
+        ],
+        tactic=tactic,
+    )
+    if not torch.compiler.is_compiling() and (
+        not torch.cuda.is_current_stream_capturing()
+    ):
+        key = Mxfp8TacticKey(
+            m_logical=int(x.shape[0]),
+            n_logical=int(output_features),
+            k_logical=int(x.shape[1]),
+            n_physical=physical_n,
+            k_physical=int(weight.shape[1]),
+            activation_scale_layout="8x4" if use_8x4_sf_layout else "128x4",
+            output_dtype="bfloat16",
         )
+        _, requested_tactic = _MXFP8_TACTIC_SOURCES.get(
+            (id(state), key),
+            (tactic_source, tactic),
+        )
+        _record_mxfp8_tactic_resolution(
+            key,
+            selected_tactic=tactic,
+            tactic_source=tactic_source,
+            requested_tactic=requested_tactic,
+        )
+        if _MXFP8_TRTLLM_TRACE_CALLBACK is not None:
+            _MXFP8_TRTLLM_TRACE_CALLBACK(
+                prefix=layer_prefix,
+                family=normalized_family,
+                m_logical=key.m_logical,
+                m_physical=key.m_logical,
+                n_logical=key.n_logical,
+                n_physical=key.n_physical,
+                k_logical=key.k_logical,
+                k_physical=key.k_physical,
+                layout=key.activation_scale_layout,
+                output_dtype=key.output_dtype,
+                tactic_source=tactic_source,
+                selected_tactic=tactic,
+                runtime_provenance=(
+                    asdict(_MXFP8_RUNTIME_PROVENANCE)
+                    if _MXFP8_RUNTIME_PROVENANCE is not None
+                    else {}
+                ),
+            )
     return output[:, :output_features].contiguous()
 
 
@@ -564,12 +1001,20 @@ def _mxfp8_trtllm_adaptive_linear_impl(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    tactic: int,
+    tactic_source: str,
+    layer_prefix: str,
+    normalized_family: str,
 ) -> torch.Tensor:
     return _mxfp8_trtllm_linear_fixed_impl(
         x,
         weight,
         weight_scale,
         output_features,
+        tactic,
+        tactic_source,
+        layer_prefix,
+        normalized_family,
         use_8x4_sf_layout=mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0])),
     )
 
@@ -579,9 +1024,21 @@ def _mxfp8_trtllm_linear_8x4_impl(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    tactic: int,
+    tactic_source: str,
+    layer_prefix: str,
+    normalized_family: str,
 ) -> torch.Tensor:
     return _mxfp8_trtllm_linear_fixed_impl(
-        x, weight, weight_scale, output_features, use_8x4_sf_layout=True
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        tactic,
+        tactic_source,
+        layer_prefix,
+        normalized_family,
+        use_8x4_sf_layout=True,
     )
 
 
@@ -590,9 +1047,57 @@ def _mxfp8_trtllm_linear_128x4_impl(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    tactic: int,
+    tactic_source: str,
+    layer_prefix: str,
+    normalized_family: str,
 ) -> torch.Tensor:
     return _mxfp8_trtllm_linear_fixed_impl(
-        x, weight, weight_scale, output_features, use_8x4_sf_layout=False
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        tactic,
+        tactic_source,
+        layer_prefix,
+        normalized_family,
+        use_8x4_sf_layout=False,
+    )
+
+
+@torch.compiler.assume_constant_result
+def _resolve_mxfp8_trtllm_call(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> tuple[int, str]:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("unresolved MXFP8 tactic before CUDA Graph capture")
+    use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
+    state = _require_mxfp8_trtllm_tactic_state(x.device)
+    key = Mxfp8TacticKey(
+        m_logical=int(x.shape[0]),
+        n_logical=int(output_features),
+        k_logical=int(x.shape[1]),
+        n_physical=int(weight.shape[0]),
+        k_physical=int(weight.shape[1]),
+        activation_scale_layout="8x4" if use_8x4_sf_layout else "128x4",
+        output_dtype="bfloat16",
+    )
+    _, workspace = _runner_and_workspace(state, use_8x4_sf_layout)
+    return _resolve_mxfp8_trtllm_tactic(
+        state,
+        key,
+        [
+            x,
+            weight.t(),
+            weight_scale,
+            weight_scale,
+            torch.bfloat16,
+            x,
+            workspace,
+        ],
     )
 
 
@@ -601,9 +1106,24 @@ def mxfp8_trtllm_adaptive_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    layer_prefix: str = "unknown",
+    normalized_family: str = "OtherDense",
 ) -> torch.Tensor:
+    tactic, tactic_source = _resolve_mxfp8_trtllm_call(
+        x,
+        weight,
+        weight_scale,
+        output_features,
+    )
     return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
-        x, weight, weight_scale, output_features
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        tactic,
+        tactic_source,
+        layer_prefix,
+        normalized_family,
     )
 
 
@@ -612,6 +1132,10 @@ def mxfp8_trtllm_adaptive_linear_fake(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
+    tactic: int,
+    tactic_source: str,
+    layer_prefix: str,
+    normalized_family: str,
 ) -> torch.Tensor:
     if x.ndim != 2:
         raise ValueError(f"TRTLLM MXFP8 linear requires 2D input, got {x.ndim}D.")
@@ -653,12 +1177,26 @@ def _mxfp8_layout_for_compile_range(
 
 
 def _specialize_mxfp8_adaptive_layout_graph(
-    graph: Any, *, marker_op: Any, fixed_op: Any
+    graph: Any,
+    *,
+    marker_op: Any,
+    fixed_op: Any,
+    tactic_override: tuple[int, str] | None = None,
 ) -> int:
     replaced = 0
     for node in graph.nodes:
         if node.op == "call_function" and node.target == marker_op:
             node.target = fixed_op
+            if tactic_override is not None:
+                if len(node.args) < 6:
+                    raise RuntimeError(
+                        "MXFP8 adaptive marker is missing bound tactic arguments."
+                    )
+                node.args = (
+                    *node.args[:4],
+                    *tactic_override,
+                    *node.args[6:],
+                )
             replaced += 1
     return replaced
 
@@ -686,6 +1224,11 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
                 torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
                 if use_8x4_sf_layout
                 else torch.ops.vllm.mxfp8_trtllm_linear_128x4.default
+            ),
+            tactic_override=(
+                None
+                if compile_range.is_single_size()
+                else (-1, "dynamic_compile_default")
             ),
         )
         if replaced == 0:

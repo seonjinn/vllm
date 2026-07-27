@@ -39,7 +39,12 @@ def provenance() -> RuntimeProvenance:
 
 
 @pytest.fixture(autouse=True)
-def matching_local_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def matching_local_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    if request.node.name.startswith("test_wraps_worker_local_evidence_failures"):
+        return
     monkeypatch.setattr(
         mxfp8_tactic_table,
         "_local_runtime_values",

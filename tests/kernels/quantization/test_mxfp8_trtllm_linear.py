@@ -244,6 +244,29 @@ def test_mxfp8_adaptive_marker_is_specialized(
     assert node.target == expected_op
 
 
+def test_mxfp8_dynamic_compile_range_downgrades_bound_tactic() -> None:
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    scale = graph.placeholder("scale")
+    node = graph.call_function(
+        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        (x, weight, scale, 512, 65, "exact_table", "layer", "FC1"),
+    )
+    graph.output(node)
+
+    replaced = _specialize_mxfp8_adaptive_layout_graph(
+        graph,
+        marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        fixed_op=torch.ops.vllm.mxfp8_trtllm_linear_8x4.default,
+        tactic_override=(-1, "dynamic_compile_default"),
+    )
+
+    assert replaced == 1
+    assert node.target == torch.ops.vllm.mxfp8_trtllm_linear_8x4.default
+    assert node.args[4:6] == (-1, "dynamic_compile_default")
+
+
 def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:
     kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
     with pytest.raises(ValueError, match="requires BF16 activations"):
@@ -266,8 +289,8 @@ def test_mxfp8_shape_trace_policy_is_not_evaluated_during_compile(
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(
         flashinfer_module,
-        "mxfp8_trtllm_use_8x4_sf_layout",
-        lambda _: pytest.fail("compile must not evaluate the shape-trace layout"),
+        "_trace_mxfp8_dense_shape",
+        lambda **_: pytest.fail("compile must not emit shape trace rows"),
     )
     monkeypatch.setattr(
         flashinfer_module,
