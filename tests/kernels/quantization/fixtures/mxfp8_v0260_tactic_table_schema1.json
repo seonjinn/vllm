@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "vllm_version": "0.26.0",
+    "flashinfer_version": "0.6.14",
+    "torch_version": "2.11.0+cu130",
+    "cuda_version": "13.0",
+    "driver_version": "580.65.06",
+    "gpu": "NVIDIA GB200",
+    "topology": "tp4",
+    "adaptive_switch_m": 256,
+    "weight_contract": "trtllm_shuffled_b_sf_a_n128_v1",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "container_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "checkpoint_id": "nvidia/Nemotron3-Ultra-30B-A3B-MXFP8",
+    "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "trace_sha256": {
+      "/trace/rank0.jsonl": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "repeat_sources": [
+      {
+        "path": "/shmoo/repeat-0.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+        "job_id": "9000"
+      },
+      {
+        "path": "/shmoo/repeat-1.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+        "job_id": "9001"
+      },
+      {
+        "path": "/shmoo/repeat-2.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000003",
+        "job_id": "9002"
+      }
+    ],
+    "job_ids": ["9000", "9001", "9002"],
+    "selection_policy": {
+      "min_repeats": 3,
+      "min_speedup": 1.02,
+      "max_cv": 0.02,
+      "min_bf16_cosine": 0.98,
+      "min_quant_plus_gemm_speedup": 0.98
+    },
+    "generated_at": "2026-07-26T00:00:00Z"
+  },
+  "entries": [
+    {
+      "key": {
+        "m_logical": 32,
+        "n_logical": 4384,
+        "k_logical": 8192,
+        "n_physical": 4480,
+        "k_physical": 8192,
+        "activation_scale_layout": "8x4",
+        "output_dtype": "bfloat16"
+      },
+      "selected_tactic": 65,
+      "selection": "qualified",
+      "legal_tactics": [61, 65, 66],
+      "default_runner_median_ms": 1.0,
+      "selected_runner_median_ms": 0.9,
+      "runner_speedup_vs_default": 1.111111,
+      "quant_plus_gemm_speedup_vs_default": 1.03,
+      "coefficient_of_variation": 0.01,
+      "repeat_count": 3,
+      "numerical": {
+        "finite": true,
+        "default_allclose": true,
+        "bf16_cosine_min": 0.99,
+        "bf16_max_abs_error": 0.1,
+        "bf16_mean_abs_error": 0.01
+      },
+      "cuda_graph": {
+        "capture_ok": true,
+        "replay_ok": true,
+        "changed_input_ok": true,
+        "output_pointer_stable": true
+      }
+    }
+  ]
+}

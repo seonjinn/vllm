@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import uuid
@@ -125,6 +126,11 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
+    VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_PATH: str | None = None
+    VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256: str | None = None
+    VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_PATH: str | None = None
+    VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256: str | None = None
+    VLLM_MXFP8_DENSE_TACTIC_AUDIT_PATH: str | None = None
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -524,6 +530,17 @@ def get_env_or_set_default(
         return default_value
 
     return _get_or_set_default
+
+
+def _get_optional_sha256(env_name: str) -> str | None:
+    value = os.getenv(env_name)
+    if value is None:
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(
+            f"{env_name} must be a lowercase 64-character hexadecimal string."
+        )
+    return value
 
 
 # The start-* and end* here are used by the documentation generator
@@ -1182,6 +1199,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": lambda: (
         os.getenv("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower()
         in ("true", "1")
+    ),
+    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_PATH": lambda: os.getenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_PATH"
+    ),
+    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256": lambda: _get_optional_sha256(
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256"
+    ),
+    "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_PATH": lambda: os.getenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_PATH"
+    ),
+    "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256": lambda: _get_optional_sha256(
+        "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256"
+    ),
+    "VLLM_MXFP8_DENSE_TACTIC_AUDIT_PATH": lambda: os.getenv(
+        "VLLM_MXFP8_DENSE_TACTIC_AUDIT_PATH"
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
