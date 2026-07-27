@@ -538,6 +538,50 @@ def finalize_mxfp8_trtllm_tactic_specialization() -> None:
         _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX = specializations
 
 
+def mxfp8_trtllm_specialization_fingerprint(device: torch.device) -> str:
+    device_index = _mxfp8_cuda_device_key(device)[1]
+    specialization = (
+        _MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX[device_index]
+        if 0 <= device_index < len(_MXFP8_TRTLLM_SPECIALIZATIONS_BY_DEVICE_INDEX)
+        else None
+    )
+    if specialization is None:
+        raise RuntimeError(
+            "MXFP8 tactic specialization must be finalized before CUDA Graph capture."
+        )
+    return specialization.fingerprint
+
+
+def mxfp8_trtllm_resolved_binding(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output_features: int,
+    *,
+    use_8x4_sf_layout: bool,
+) -> tuple[int, str] | None:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("MXFP8 tactic binding lookup is not allowed during capture.")
+    state = _require_mxfp8_trtllm_tactic_state(x.device)
+    key = Mxfp8TacticKey(
+        m_logical=int(x.shape[0]),
+        n_logical=int(output_features),
+        k_logical=int(x.shape[1]),
+        n_physical=int(weight.shape[0]),
+        k_physical=int(weight.shape[1]),
+        activation_scale_layout=("8x4" if use_8x4_sf_layout else "128x4"),
+        output_dtype="bfloat16",
+    )
+    with state.resolution_lock:
+        selected_tactic = state.resolved_tactics.get(key)
+        if selected_tactic is None:
+            return None
+        tactic_source = _MXFP8_TACTIC_SOURCES.get(
+            (id(state), key),
+            ("pre_resolved", selected_tactic, None),
+        )[0]
+    return selected_tactic, tactic_source
+
+
 def prewarm_mxfp8_trtllm_tactic_specializations(
     model_runner: Any,
     **dummy_run_kwargs: Any,
@@ -1342,15 +1386,18 @@ def mxfp8_trtllm_adaptive_linear(
     output_features: int,
     layer_prefix: str = "unknown",
     normalized_family: str = "OtherDense",
+    tactic: int = _MXFP8_TRTLLM_UNRESOLVED_TACTIC,
+    tactic_source: str = "unresolved_eager",
+    tactic_specialization_fingerprint: str = "",
 ) -> torch.Tensor:
     return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
         x,
         weight,
         weight_scale,
         output_features,
-        _MXFP8_TRTLLM_UNRESOLVED_TACTIC,
-        "unresolved_eager",
-        "",
+        tactic,
+        tactic_source,
+        tactic_specialization_fingerprint,
         layer_prefix,
         normalized_family,
         "eager",

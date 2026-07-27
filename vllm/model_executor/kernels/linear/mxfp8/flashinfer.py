@@ -15,6 +15,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_e4m3_quantize,
     mxfp8_trtllm_adaptive_linear,
+    mxfp8_trtllm_resolved_binding,
+    mxfp8_trtllm_specialization_fingerprint,
+    mxfp8_trtllm_use_8x4_sf_layout,
     prepare_mxfp8_trtllm_tactic_state,
     register_mxfp8_trtllm_trace_callback,
     swizzle_mxfp8_scale,
@@ -30,6 +33,7 @@ logger = init_logger(__name__)
 _MXFP8_DENSE_TRACE_SEEN: set[tuple[object, ...]] = set()
 _MXFP8_DENSE_TRACE_WRITTEN = 0
 _MXFP8_DENSE_TRACE_WARNED = False
+_MXFP8_CAPTURE_DEFAULT_BINDING = (-1, "capture_exact_miss")
 
 
 def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
@@ -425,6 +429,23 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
+        m = int(input_2d.shape[0])
+        use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(m)
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            bindings = getattr(layer, "_mxfp8_trtllm_capture_bindings", None)
+            tactic, tactic_source = (
+                bindings.get(m, _MXFP8_CAPTURE_DEFAULT_BINDING)
+                if bindings is not None
+                else _MXFP8_CAPTURE_DEFAULT_BINDING
+            )
+            tactic_specialization_fingerprint = (
+                mxfp8_trtllm_specialization_fingerprint(input_2d.device)
+            )
+        else:
+            tactic = -2
+            tactic_source = "unresolved_eager"
+            tactic_specialization_fingerprint = ""
         output = mxfp8_trtllm_adaptive_linear(
             input_2d,
             weight,
@@ -432,7 +453,23 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
             output_features,
             str(getattr(layer, "prefix", "unknown")),
             _mxfp8_dense_family(layer),
+            tactic,
+            tactic_source,
+            tactic_specialization_fingerprint,
         )
+        if not is_capturing and not torch.compiler.is_compiling():
+            binding = mxfp8_trtllm_resolved_binding(
+                input_2d,
+                weight,
+                output_features,
+                use_8x4_sf_layout=use_8x4_sf_layout,
+            )
+            if binding is not None:
+                bindings = getattr(layer, "_mxfp8_trtllm_capture_bindings", None)
+                if bindings is None:
+                    bindings = {}
+                    layer._mxfp8_trtllm_capture_bindings = bindings
+                bindings[m] = binding
         if bias is not None:
             output = output + bias
 
