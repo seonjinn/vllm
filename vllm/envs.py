@@ -534,7 +534,7 @@ def get_env_or_set_default(
 
 def _get_optional_sha256(env_name: str) -> str | None:
     value = os.getenv(env_name)
-    if value is None:
+    if not value:
         return None
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise ValueError(

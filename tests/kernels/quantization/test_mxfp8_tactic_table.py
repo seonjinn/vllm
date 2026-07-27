@@ -392,6 +392,13 @@ def test_environment_registry_validates_paths_and_digests(
         monkeypatch.setenv(name, value)
         assert getattr(envs, name) == value
 
+    for name in (
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256",
+        "VLLM_MXFP8_DENSE_TRTLLM_RUNTIME_PROVENANCE_SHA256",
+    ):
+        monkeypatch.setenv(name, "")
+        assert getattr(envs, name) is None
+
     monkeypatch.setenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256", "A" * 64)
     with pytest.raises(ValueError):
         _ = envs.VLLM_MXFP8_DENSE_TRTLLM_TACTIC_TABLE_SHA256
