@@ -253,13 +253,12 @@ def test_mxfp8_adaptive_marker_is_specialized(
 
 
 @pytest.mark.parametrize(
-    ("m", "expected_tactic"),
-    [(32, 65), (1024, 17)],
+    "m",
+    [32, 1024],
 )
-def test_mxfp8_static_compile_ranges_bind_each_concrete_m_independently(
+def test_mxfp8_static_compile_ranges_bind_only_direct_default(
     monkeypatch: pytest.MonkeyPatch,
     m: int,
-    expected_tactic: int,
 ) -> None:
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -272,15 +271,50 @@ def test_mxfp8_static_compile_ranges_bind_each_concrete_m_independently(
     graph.output(node)
     monkeypatch.setattr(
         mxfp8_utils,
-        "_resolve_mxfp8_compile_tactic",
-        lambda *_args, **_kwargs: (expected_tactic, "exact_table"),
-        raising=False,
+        "_select_mxfp8_trtllm_tactic_candidate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "static compilation must not bind worker-derived tactics"
+        ),
     )
 
     with pass_context(Range(m, m)):
         _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)(graph)
 
-    assert node.args[4:6] == (expected_tactic, "exact_table")
+    assert node.args[4:6] == (-1, "compiled_direct_default")
+
+
+def test_mxfp8_static_compile_cache_reuse_cannot_retain_worker_tactic() -> None:
+    specialization_pass = _Mxfp8AdaptiveLayoutSpecializationPass("adaptive", 256)
+    bound_tactics: list[tuple[object, ...]] = []
+
+    for traced_tactic in (65, -2):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        weight = graph.placeholder("weight")
+        scale = graph.placeholder("scale")
+        node = graph.call_function(
+            torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+            (
+                x,
+                weight,
+                scale,
+                512,
+                traced_tactic,
+                "exact_table" if traced_tactic == 65 else "artifact_disabled",
+                "layer",
+                "FC1",
+            ),
+        )
+        graph.output(node)
+
+        with pass_context(Range(32, 32)):
+            specialization_pass(graph)
+        bound_tactics.append(node.args[4:6])
+
+    assert bound_tactics == [
+        (-1, "compiled_direct_default"),
+        (-1, "compiled_direct_default"),
+    ]
 
 
 def test_mxfp8_dynamic_compile_range_preserves_unresolved_sentinel() -> None:

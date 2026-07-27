@@ -6,10 +6,11 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
-from types import MappingProxyType, SimpleNamespace
-from typing import Any
+from types import MappingProxyType, ModuleType, SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -26,9 +27,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     _mxfp8_trtllm_linear_fixed_impl,
     _Mxfp8TacticAudit,
     _Mxfp8TrtllmTacticState,
-    _resolve_mxfp8_compile_tactic,
     _resolve_mxfp8_trtllm_tactic,
     _run_mxfp8_trtllm_pre_resolved,
+    finalize_mxfp8_trtllm_tactic_audit,
 )
 
 
@@ -103,6 +104,7 @@ def state(
         workspace_8x4=torch.Tensor(),
         workspace_128x4=torch.Tensor(),
         resolved_tactics={},
+        resolution_lock=threading.RLock(),
     )
 
 
@@ -359,6 +361,16 @@ def test_runtime_illegal_tactic_is_downgraded_to_default(
         runner_128x4=runner_128x4,
     )
     inputs = runner_inputs()
+    audit = _Mxfp8TacticAudit(
+        output_dir=None,
+        expected_rank_count=1,
+        rank=0,
+        host="worker",
+        pid=1,
+        registered_keys={},
+        rejected_artifact_reasons=[],
+    )
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TACTIC_AUDIT", audit)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     tactic, source = _resolve_mxfp8_trtllm_tactic(
@@ -370,91 +382,143 @@ def test_runtime_illegal_tactic_is_downgraded_to_default(
     assert tactic == -1
     assert source == "runtime_illegal_tactic"
     assert dispatch_state.resolved_tactics[key(layout="8x4")] == -1
+    assert audit.hits == 1
+    assert audit.misses == 0
 
 
-def test_static_compile_binds_runtime_validated_tactic(
+def test_per_key_resolution_is_serialized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    exact_key = Mxfp8TacticKey(
-        m_logical=2,
-        n_logical=7,
-        k_logical=4,
-        n_physical=8,
-        k_physical=4,
-        activation_scale_layout="8x4",
-        output_dtype="bfloat16",
-    )
-    runner_8x4 = FakeRunner([61])
+    entered_validation = threading.Event()
+    release_validation = threading.Event()
+    second_started = threading.Event()
+
+    class BlockingRunner(FakeRunner):
+        def get_valid_tactics(self, inputs: list[Any], profile: Any) -> list[int]:
+            self.valid_tactic_inputs.append(inputs)
+            self.valid_tactic_shapes.append(profile.get_opt_shapes())
+            entered_validation.set()
+            assert release_validation.wait(timeout=5)
+            return self.valid_tactics
+
+    runner_8x4 = BlockingRunner([65])
     dispatch_state = state(
-        tactics={exact_key: 65},
+        tactics={key(layout="8x4"): 65},
         runner_8x4=runner_8x4,
         runner_128x4=FakeRunner([]),
     )
     inputs = runner_inputs()
-    monkeypatch.setattr(
-        mxfp8_utils,
-        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
-        [dispatch_state],
-    )
-    monkeypatch.setattr(
-        mxfp8_utils,
-        "_materialize_mxfp8_compile_runner_inputs",
-        lambda *_args, **_kwargs: inputs,
-        raising=False,
-    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
-    graph = torch.fx.Graph()
-    x = graph.placeholder("x")
-    weight = graph.placeholder("weight")
-    weight_scale = graph.placeholder("weight_scale")
-    with FakeTensorMode():
-        x.meta["val"] = torch.empty(
-            (2, 4),
-            device="cuda",
-            dtype=torch.bfloat16,
+    def resolve() -> tuple[int, str]:
+        return _resolve_mxfp8_trtllm_tactic(
+            dispatch_state,
+            key(layout="8x4"),
+            inputs,
         )
-        weight.meta["val"] = torch.empty(
-            (8, 4),
-            device="cuda",
-            dtype=torch.float8_e4m3fn,
-        )
-        weight_scale.meta["val"] = torch.empty(
-            1,
-            device="cuda",
-            dtype=torch.uint8,
-        )
-    node = graph.call_function(
-        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
-        (
-            x,
-            weight,
-            weight_scale,
-            7,
-            -2,
-            "unresolved_eager",
-            "layer",
-            "FC1",
-            "eager",
-            "eager",
-        ),
-    )
 
-    replaced = mxfp8_utils._specialize_mxfp8_adaptive_layout_graph(
-        graph,
-        marker_op=torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
-        fixed_op=torch.ops.vllm.mxfp8_trtllm_linear_8x4.default,
-        tactic_resolver=lambda current: _resolve_mxfp8_compile_tactic(
-            current,
-            m=2,
-            use_8x4_sf_layout=True,
-        ),
-    )
+    def resolve_second() -> tuple[int, str]:
+        second_started.set()
+        return resolve()
 
-    assert replaced == 1
-    assert node.args[4:6] == (-1, "runtime_illegal_tactic")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(resolve)
+        assert entered_validation.wait(timeout=5)
+        second = executor.submit(resolve_second)
+        assert second_started.wait(timeout=5)
+        time.sleep(0.05)
+        release_validation.set()
+        assert first.result() == (65, "exact_table")
+        assert second.result() == (65, "exact_table")
+
     assert runner_8x4.valid_tactic_inputs == [inputs]
-    assert dispatch_state.resolved_tactics[exact_key] == -1
+
+
+def test_worker_state_and_audit_initialization_are_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_load_entered = threading.Event()
+    release_first_load = threading.Event()
+    load_count = 0
+    audit_count = 0
+    runner_count = 0
+    counter_lock = threading.Lock()
+
+    def load_artifact() -> tuple[None, None, None]:
+        nonlocal load_count
+        with counter_lock:
+            load_count += 1
+            current_load = load_count
+        if current_load == 1:
+            first_load_entered.set()
+            assert release_first_load.wait(timeout=5)
+        return None, None, None
+
+    def new_audit() -> _Mxfp8TacticAudit:
+        nonlocal audit_count
+        with counter_lock:
+            audit_count += 1
+        return _Mxfp8TacticAudit(
+            output_dir=None,
+            expected_rank_count=1,
+            rank=0,
+            host="worker",
+            pid=1,
+            registered_keys={},
+            rejected_artifact_reasons=[],
+        )
+
+    class FakeModule:
+        def trtllm_mxfp8_gemm_runner(self, **_kwargs: object) -> FakeRunner:
+            nonlocal runner_count
+            with counter_lock:
+                runner_count += 1
+            return FakeRunner([])
+
+    gemm_base = ModuleType("flashinfer.gemm.gemm_base")
+    fake_gemm_base = cast(Any, gemm_base)
+    fake_gemm_base.DEFAULT_WORKSPACE_SIZE = 1
+    fake_gemm_base._get_cache_buf = lambda *_args, **_kwargs: torch.Tensor()
+    fake_gemm_base.get_trtllm_gemm_module = FakeModule
+    monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm", ModuleType("flashinfer.gemm"))
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm.gemm_base", gemm_base)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_mxfp8_cuda_device_key",
+        lambda _device: ("cuda", 0),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_load_configured_mxfp8_tactic_artifact",
+        load_artifact,
+    )
+    monkeypatch.setattr(mxfp8_utils, "_new_mxfp8_tactic_audit", new_audit)
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TRTLLM_STATES", {})
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX", [])
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TACTIC_AUDIT", None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            mxfp8_utils.prepare_mxfp8_trtllm_tactic_state,
+            torch.device("cuda", 0),
+        )
+        assert first_load_entered.wait(timeout=5)
+        second = executor.submit(
+            mxfp8_utils.prepare_mxfp8_trtllm_tactic_state,
+            torch.device("cuda", 0),
+        )
+        time.sleep(0.05)
+        release_first_load.set()
+        first_state = first.result()
+        second_state = second.result()
+
+    assert first_state is second_state
+    assert load_count == 1
+    assert audit_count == 1
+    assert runner_count == 2
 
 
 @pytest.mark.parametrize("layout", ["8x4", "128x4"])
@@ -546,7 +610,7 @@ def test_capture_rejects_unresolved_key_before_lookup(
         )
 
 
-def test_fixed_impl_capture_uses_bound_scalar_without_key_or_map_lookup(
+def test_fixed_impl_capture_rejects_stale_bound_scalar_without_key_or_map_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner_output = torch.empty((2, 8), dtype=torch.bfloat16)
@@ -615,7 +679,7 @@ def test_fixed_impl_capture_uses_bound_scalar_without_key_or_map_lookup(
         )
 
     assert runner_8x4.valid_tactic_inputs == []
-    assert runner_8x4.forward_tactics == [65]
+    assert runner_8x4.forward_tactics == [-1]
 
 
 def test_fixed_impl_validates_exact_forward_contract_before_registration(
@@ -760,6 +824,7 @@ def test_audit_atomically_records_runtime_illegal_default(
         selected_tactic=-1,
         tactic_source="runtime_illegal_tactic",
         requested_tactic=65,
+        artifact_lookup_hit=True,
     )
 
     assert not list(tmp_path.glob("*.tmp"))
@@ -767,11 +832,16 @@ def test_audit_atomically_records_runtime_illegal_default(
     assert payload["complete"] is False
     assert payload["defaults"] == 1
     assert payload["expected_rank_count"] == 4
+    assert payload["hits"] == 1
+    assert payload["registered_keys"][0]["artifact_lookup"] == "hit"
     assert payload["registered_keys"][0]["requested_tactic"] == 65
     assert payload["registered_keys"][0]["tactic_source"] == "runtime_illegal_tactic"
 
 
-def test_audit_rejection_and_normal_shutdown_are_durable(tmp_path: Path) -> None:
+def test_audit_rejection_and_normal_shutdown_are_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     audit = _Mxfp8TacticAudit(
         output_dir=tmp_path,
         expected_rank_count=1,
@@ -783,8 +853,8 @@ def test_audit_rejection_and_normal_shutdown_are_durable(tmp_path: Path) -> None
     )
 
     audit.reject_artifact("MXFP8 tactic artifact SHA256 does not match")
-    audit.complete = True
-    audit.write()
+    monkeypatch.setattr(mxfp8_utils, "_MXFP8_TACTIC_AUDIT", audit)
+    finalize_mxfp8_trtllm_tactic_audit()
 
     payload = json.loads((tmp_path / "rank-0-pid-4321.json").read_text())
     assert payload["complete"] is True
@@ -836,6 +906,7 @@ def test_audit_serializes_concurrent_registration_and_publication(
             selected_tactic=65,
             tactic_source="exact_table",
             requested_tactic=65,
+            artifact_lookup_hit=True,
         )
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:

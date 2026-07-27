@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    finalize_mxfp8_trtllm_tactic_audit,
+)
 
 logger = init_logger(__name__)
 
@@ -18,3 +21,4 @@ def free_before_shutdown(vllm_config: VllmConfig) -> None:
 
     _ROPE_DICT.clear()
     reset_workspace_manager()
+    finalize_mxfp8_trtllm_tactic_audit()
