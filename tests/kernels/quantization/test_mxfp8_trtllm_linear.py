@@ -467,6 +467,11 @@ def test_mxfp8_shape_trace_policy_is_not_evaluated_during_compile(
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: pytest.fail("compile must not query CUDA capture state"),
+    )
+    monkeypatch.setattr(
         flashinfer_module,
         "_trace_mxfp8_dense_shape",
         lambda **_: pytest.fail("compile must not emit shape trace rows"),
