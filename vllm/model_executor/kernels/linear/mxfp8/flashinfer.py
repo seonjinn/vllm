@@ -429,23 +429,30 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
 
         input_shape = x.shape
         input_2d = x.view(-1, k)
-        m = int(input_2d.shape[0])
-        use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(m)
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if is_capturing:
-            bindings = getattr(layer, "_mxfp8_trtllm_capture_bindings", None)
-            tactic, tactic_source = (
-                bindings.get(m, _MXFP8_CAPTURE_DEFAULT_BINDING)
-                if bindings is not None
-                else _MXFP8_CAPTURE_DEFAULT_BINDING
-            )
-            tactic_specialization_fingerprint = (
-                mxfp8_trtllm_specialization_fingerprint(input_2d.device)
-            )
-        else:
+        is_compiling = torch.compiler.is_compiling()
+        if is_compiling:
+            is_capturing = False
             tactic = -2
             tactic_source = "unresolved_eager"
             tactic_specialization_fingerprint = ""
+        else:
+            m = int(input_2d.shape[0])
+            use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(m)
+            is_capturing = torch.cuda.is_current_stream_capturing()
+            if is_capturing:
+                bindings = getattr(layer, "_mxfp8_trtllm_capture_bindings", None)
+                tactic, tactic_source = (
+                    bindings.get(m, _MXFP8_CAPTURE_DEFAULT_BINDING)
+                    if bindings is not None
+                    else _MXFP8_CAPTURE_DEFAULT_BINDING
+                )
+                tactic_specialization_fingerprint = (
+                    mxfp8_trtllm_specialization_fingerprint(input_2d.device)
+                )
+            else:
+                tactic = -2
+                tactic_source = "unresolved_eager"
+                tactic_specialization_fingerprint = ""
         output = mxfp8_trtllm_adaptive_linear(
             input_2d,
             weight,
@@ -457,7 +464,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
             tactic_source,
             tactic_specialization_fingerprint,
         )
-        if not is_capturing and not torch.compiler.is_compiling():
+        if not is_compiling and not is_capturing:
             binding = mxfp8_trtllm_resolved_binding(
                 input_2d,
                 weight,
