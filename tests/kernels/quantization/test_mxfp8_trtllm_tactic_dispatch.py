@@ -1264,6 +1264,24 @@ def test_audit_atomically_records_runtime_illegal_default(
     assert payload["registered_keys"][0]["tactic_source"] == "runtime_illegal_tactic"
 
 
+def test_new_audit_uses_initialized_distributed_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TACTIC_AUDIT_PATH", str(tmp_path))
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 5)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+
+    audit = mxfp8_utils._new_mxfp8_tactic_audit()
+
+    assert audit.rank == 5
+    assert audit.expected_rank_count == 8
+
+
 def test_audit_rejection_and_normal_shutdown_are_durable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -414,10 +414,16 @@ def _load_configured_mxfp8_tactic_artifact() -> tuple[
 
 def _new_mxfp8_tactic_audit() -> _Mxfp8TacticAudit:
     configured_path = envs.VLLM_MXFP8_DENSE_TACTIC_AUDIT_PATH
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        expected_rank_count = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+    else:
+        expected_rank_count = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
     return _Mxfp8TacticAudit(
         output_dir=Path(configured_path) if configured_path else None,
-        expected_rank_count=int(os.environ.get("WORLD_SIZE", "1")),
-        rank=int(os.environ.get("RANK", "0")),
+        expected_rank_count=expected_rank_count,
+        rank=rank,
         host=socket.gethostname(),
         pid=os.getpid(),
         registered_keys={},
