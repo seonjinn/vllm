@@ -21,7 +21,7 @@ Use these source coordinates:
 ```text
 fork:                          https://github.com/seonjinn/vllm.git
 branch:                        sna/mxfp8-adaptive-v0.20.2-nemorl
-published final build pin:     bc5881924556fcf830f8158815d5a62cef0fbcba
+approved runtime build pin:    bc5881924556fcf830f8158815d5a62cef0fbcba
 functional implementation:    e32ce4fdd30ef313e10bf3a328352ead2a4c0054
 upstream vLLM base:            5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1
 vLLM public version:           0.20.2
@@ -30,13 +30,12 @@ FlashInfer public version:     0.6.8.post1
 
 The functional implementation commit is a historical lower bound, not the
 final build pin. It does not include later offline-bootstrap, NeMo-RL handoff,
-or review fixes. Fetch the published branch, verify its head and ancestry, and
-build the same immutable final commit on every node:
+or review fixes. Fetch the published branch to make the approved object
+available, then verify its ancestry and build that immutable runtime commit on
+every node. Later documentation-only branch commits do not change this pin:
 
 ```bash
 git fetch origin sna/mxfp8-adaptive-v0.20.2-nemorl
-test "$(git rev-parse origin/sna/mxfp8-adaptive-v0.20.2-nemorl)" = \
-  bc5881924556fcf830f8158815d5a62cef0fbcba
 git checkout --detach bc5881924556fcf830f8158815d5a62cef0fbcba
 VLLM_BUILD_COMMIT=$(git rev-parse HEAD)
 git merge-base --is-ancestor \
