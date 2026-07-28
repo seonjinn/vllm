@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import json
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -12,15 +16,21 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferTrtllmMxfp8LinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV,
+    MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV,
     MXFP8_TRTLLM_HIGH_M_TACTIC_ENV,
     MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV,
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
+    _load_mxfp8_exact_tactic_table,
     _mxfp8_layout_for_compile_range,
     _mxfp8_trtllm_layout_config,
     _parse_mxfp8_tactic_hints,
+    _resolve_mxfp8_exact_tactic,
     _resolve_mxfp8_high_m_tactic,
     _specialize_mxfp8_adaptive_layout_graph,
+    _validate_mxfp8_runtime_fingerprint,
+    mxfp8_trtllm_exact_tactics_enabled,
     mxfp8_trtllm_high_m_static_tactics_enabled,
     mxfp8_trtllm_scale_numel,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -206,6 +216,169 @@ def test_mxfp8_high_m_static_tactics_are_opt_in(
 
     monkeypatch.setenv(MXFP8_TRTLLM_HIGH_M_TACTIC_ENV, "92")
     assert mxfp8_trtllm_high_m_static_tactics_enabled()
+
+
+def test_mxfp8_exact_tactic_table_uses_full_execution_signature(
+    tmp_path: Path,
+) -> None:
+    table_path = tmp_path / "exact-tactics.json"
+    payload = {
+        "schema_version": 1,
+        "metadata": {
+            "runtime_fingerprint": {
+                "vllm_version": "0.25.1",
+                "flashinfer_version": "0.6.13",
+                "cuda_version": "12.9",
+                "device_name": "NVIDIA GB200",
+                "compute_capability": [10, 0],
+            }
+        },
+        "entries": [
+            {
+                "m": 8,
+                "n_logical": 8768,
+                "n_physical": 8832,
+                "k": 8192,
+                "layout": "8x4",
+                "tactic": 65,
+            },
+            {
+                "m": 1000,
+                "n_logical": 8768,
+                "n_physical": 8832,
+                "k": 8192,
+                "layout": "128x4",
+                "tactic": 92,
+            },
+        ],
+    }
+    table_path.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(table_path.read_bytes()).hexdigest()
+
+    table = _load_mxfp8_exact_tactic_table(str(table_path), digest)
+
+    assert table.tactics[(8, 8768, 8832, 8192, "8x4")] == 65
+    assert table.tactics[(1000, 8768, 8832, 8192, "128x4")] == 92
+    assert (
+        _resolve_mxfp8_exact_tactic(
+            8,
+            8768,
+            8832,
+            8192,
+            "8x4",
+            table.tactics,
+        )
+        == 65
+    )
+    assert (
+        _resolve_mxfp8_exact_tactic(
+            16,
+            8768,
+            8832,
+            8192,
+            "8x4",
+            table.tactics,
+        )
+        == -1
+    )
+
+
+def test_mxfp8_exact_tactic_table_rejects_sha_mismatch(tmp_path: Path) -> None:
+    table_path = tmp_path / "exact-tactics.json"
+    table_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "metadata": {
+                    "runtime_fingerprint": {
+                        "vllm_version": "0.25.1",
+                        "flashinfer_version": "0.6.13",
+                        "cuda_version": "12.9",
+                        "device_name": "NVIDIA GB200",
+                        "compute_capability": [10, 0],
+                    }
+                },
+                "entries": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV):
+        _load_mxfp8_exact_tactic_table(str(table_path), "0" * 64)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("m", True),
+        ("n_logical", 8768.5),
+        ("n_physical", "8832"),
+        ("k", None),
+        ("tactic", 65.0),
+    ],
+)
+def test_mxfp8_exact_tactic_table_rejects_non_integer_fields(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    table_path = tmp_path / f"invalid-{field}.json"
+    entry = {
+        "m": 8,
+        "n_logical": 8768,
+        "n_physical": 8832,
+        "k": 8192,
+        "layout": "8x4",
+        "tactic": 65,
+    }
+    entry[field] = invalid_value
+    payload = {
+        "schema_version": 1,
+        "metadata": {
+            "runtime_fingerprint": {
+                "vllm_version": "0.25.1",
+                "flashinfer_version": "0.6.13",
+                "cuda_version": "12.9",
+                "device_name": "NVIDIA GB200",
+                "compute_capability": [10, 0],
+            }
+        },
+        "entries": [entry],
+    }
+    table_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be a JSON integer"):
+        _load_mxfp8_exact_tactic_table(
+            str(table_path),
+            hashlib.sha256(table_path.read_bytes()).hexdigest(),
+        )
+
+
+def test_mxfp8_exact_tactic_table_rejects_runtime_fingerprint_mismatch() -> None:
+    expected = {
+        "vllm_version": "0.25.1",
+        "flashinfer_version": "0.6.13",
+        "cuda_version": "12.9",
+        "device_name": "NVIDIA GB200",
+        "compute_capability": [10, 0],
+    }
+    current = dict(expected)
+    current["flashinfer_version"] = "0.6.14"
+
+    with pytest.raises(ValueError, match="flashinfer_version"):
+        _validate_mxfp8_runtime_fingerprint(expected, current)
+
+
+def test_mxfp8_exact_tactic_table_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV, raising=False)
+    monkeypatch.delenv(MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV, raising=False)
+    assert not mxfp8_trtllm_exact_tactics_enabled()
+
+    monkeypatch.setenv(MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV, "/tmp/tactics.json")
+    assert mxfp8_trtllm_exact_tactics_enabled()
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import importlib.metadata
+import json
 import os
 from contextlib import nullcontext
 from functools import cache
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
@@ -20,6 +24,15 @@ MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYOUT"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_DENSE_TRTLLM_SWITCH_M"
 MXFP8_TRTLLM_HIGH_M_TACTIC_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC"
 MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV = "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
+MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV = "VLLM_MXFP8_DENSE_TRTLLM_EXACT_TACTIC_FILE"
+MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV = "VLLM_MXFP8_DENSE_TRTLLM_EXACT_TACTIC_SHA256"
+
+Mxfp8ExactTacticKey = tuple[int, int, int, int, str]
+
+
+class _Mxfp8ExactTacticTable(NamedTuple):
+    tactics: dict[Mxfp8ExactTacticKey, int]
+    runtime_fingerprint: dict[str, object]
 
 
 class _Mxfp8TrtllmLayoutConfig(NamedTuple):
@@ -136,6 +149,281 @@ def mxfp8_trtllm_high_m_static_tactics_enabled() -> bool:
     return MXFP8_TRTLLM_HIGH_M_TACTIC_ENV in os.environ or bool(
         os.environ.get(MXFP8_TRTLLM_HIGH_M_TACTIC_HINTS_ENV, "").strip()
     )
+
+
+@cache
+def _load_mxfp8_exact_tactic_table(
+    path: str,
+    expected_sha256: str,
+) -> _Mxfp8ExactTacticTable:
+    table_path = Path(path)
+    try:
+        payload_bytes = table_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"Unable to read {MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV}={path!r}: {exc}"
+        ) from exc
+
+    actual_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    normalized_expected = expected_sha256.strip().lower()
+    if normalized_expected and actual_sha256 != normalized_expected:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV} mismatch for {path!r}: "
+            f"expected {normalized_expected}, got {actual_sha256}."
+        )
+
+    try:
+        payload = json.loads(
+            payload_bytes,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON value {value}")
+            ),
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid MXFP8 exact tactic JSON in {path!r}: {exc}") from exc
+    except ValueError as exc:
+        raise ValueError(f"Invalid MXFP8 exact tactic JSON in {path!r}: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+    ):
+        raise ValueError(
+            "MXFP8 exact tactic table must be an object with schema_version=1."
+        )
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("MXFP8 exact tactic table metadata must be an object.")
+    runtime_fingerprint = metadata.get("runtime_fingerprint")
+    if not isinstance(runtime_fingerprint, dict):
+        raise ValueError(
+            "MXFP8 exact tactic table metadata.runtime_fingerprint must be an object."
+        )
+    _validate_mxfp8_runtime_fingerprint_schema(runtime_fingerprint)
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("MXFP8 exact tactic table entries must be a list.")
+
+    tactics: dict[Mxfp8ExactTacticKey, int] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"MXFP8 exact tactic entry {index} must be an object.")
+        try:
+            m = entry["m"]
+            n_logical = entry["n_logical"]
+            n_physical = entry["n_physical"]
+            k = entry["k"]
+            layout = entry["layout"]
+            tactic = entry["tactic"]
+        except KeyError as exc:
+            raise ValueError(
+                f"Invalid MXFP8 exact tactic entry {index}: {exc}"
+            ) from exc
+        integer_fields = {
+            "m": m,
+            "n_logical": n_logical,
+            "n_physical": n_physical,
+            "k": k,
+            "tactic": tactic,
+        }
+        for field, value in integer_fields.items():
+            if type(value) is not int:
+                raise ValueError(
+                    f"MXFP8 exact tactic entry {index} field {field} "
+                    "must be a JSON integer."
+                )
+        if min(m, n_logical, n_physical, k) <= 0:
+            raise ValueError(f"MXFP8 exact tactic entry {index} has nonpositive shape.")
+        if type(layout) is not str or layout not in ("8x4", "128x4"):
+            raise ValueError(
+                f"MXFP8 exact tactic entry {index} has invalid layout {layout!r}."
+            )
+        if n_physical < n_logical or n_physical % 128:
+            raise ValueError(
+                f"MXFP8 exact tactic entry {index} has invalid physical N "
+                f"{n_physical} for logical N {n_logical}."
+            )
+        if tactic < -1:
+            raise ValueError(
+                f"MXFP8 exact tactic entry {index} has invalid tactic {tactic}."
+            )
+        key = (m, n_logical, n_physical, k, layout)
+        if key in tactics:
+            raise ValueError(f"Duplicate MXFP8 exact tactic signature {key}.")
+        tactics[key] = tactic
+    return _Mxfp8ExactTacticTable(
+        tactics=tactics,
+        runtime_fingerprint=runtime_fingerprint,
+    )
+
+
+def _validate_mxfp8_runtime_fingerprint_schema(
+    runtime_fingerprint: dict[str, object],
+) -> None:
+    for field in (
+        "vllm_version",
+        "flashinfer_version",
+        "cuda_version",
+        "device_name",
+    ):
+        value = runtime_fingerprint.get(field)
+        if type(value) is not str or not value:
+            raise ValueError(
+                "MXFP8 exact tactic runtime fingerprint field "
+                f"{field} must be a non-empty string."
+            )
+    capability = runtime_fingerprint.get("compute_capability")
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(type(value) is not int or value < 0 for value in capability)
+    ):
+        raise ValueError(
+            "MXFP8 exact tactic runtime fingerprint compute_capability "
+            "must be a two-integer list."
+        )
+
+
+def _current_mxfp8_runtime_fingerprint(
+    device: torch.device,
+) -> dict[str, object]:
+    import flashinfer
+
+    canonical = torch.device(device)
+    return {
+        "vllm_version": importlib.metadata.version("vllm"),
+        "flashinfer_version": str(flashinfer.__version__),
+        "cuda_version": str(torch.version.cuda),
+        "device_name": torch.cuda.get_device_name(canonical),
+        "compute_capability": list(torch.cuda.get_device_capability(canonical)),
+    }
+
+
+def _validate_mxfp8_runtime_fingerprint(
+    expected: dict[str, object],
+    current: dict[str, object],
+) -> None:
+    _validate_mxfp8_runtime_fingerprint_schema(expected)
+    _validate_mxfp8_runtime_fingerprint_schema(current)
+    mismatches = {
+        field: (expected[field], current[field])
+        for field in expected
+        if expected[field] != current.get(field)
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{field}: table={table_value!r}, runtime={runtime_value!r}"
+            for field, (table_value, runtime_value) in sorted(mismatches.items())
+        )
+        raise ValueError(
+            "MXFP8 exact tactic table runtime fingerprint mismatch: " + details
+        )
+
+
+def _resolve_mxfp8_exact_tactic(
+    m: int,
+    n_logical: int,
+    n_physical: int,
+    k: int,
+    layout: str,
+    tactics: dict[Mxfp8ExactTacticKey, int],
+) -> int:
+    return tactics.get((m, n_logical, n_physical, k, layout), -1)
+
+
+def mxfp8_trtllm_exact_tactics_enabled() -> bool:
+    return bool(os.environ.get(MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV, "").strip())
+
+
+class _Mxfp8ExactTrtllmState(NamedTuple):
+    workspace_8x4: torch.Tensor
+    workspace_128x4: torch.Tensor
+    runner_8x4: Any
+    runner_128x4: Any
+    tactics: dict[Mxfp8ExactTacticKey, int]
+
+
+_MXFP8_EXACT_TRTLLM_STATES: dict[tuple[str, int], _Mxfp8ExactTrtllmState] = {}
+
+
+def prepare_mxfp8_trtllm_exact_tactic_state(
+    device: torch.device,
+) -> _Mxfp8ExactTrtllmState | None:
+    if not mxfp8_trtllm_exact_tactics_enabled():
+        return None
+
+    device_key = _mxfp8_cuda_device_key(device)
+    existing = _MXFP8_EXACT_TRTLLM_STATES.get(device_key)
+    if existing is not None:
+        return existing
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 exact TRTLLM tactic state must be prepared before "
+            "CUDA Graph capture."
+        )
+
+    table_path = os.environ[MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV].strip()
+    expected_sha256 = os.environ.get(MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV, "").strip()
+    if not expected_sha256:
+        raise ValueError(
+            f"{MXFP8_TRTLLM_EXACT_TACTIC_SHA256_ENV} is required when "
+            f"{MXFP8_TRTLLM_EXACT_TACTIC_FILE_ENV} is set."
+        )
+    table = _load_mxfp8_exact_tactic_table(table_path, expected_sha256)
+    _validate_mxfp8_runtime_fingerprint(
+        table.runtime_fingerprint,
+        _current_mxfp8_runtime_fingerprint(device),
+    )
+
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        _get_cache_buf,
+        get_trtllm_gemm_module,
+    )
+
+    canonical = torch.device(device_key[0], device_key[1])
+    with torch.cuda.device(canonical):
+        workspace_8x4 = _get_cache_buf(
+            "vllm_mxfp8_trtllm_exact_tactic_workspace_8x4",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical,
+        )
+        workspace_128x4 = _get_cache_buf(
+            "vllm_mxfp8_trtllm_exact_tactic_workspace_128x4",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical,
+        )
+        module = get_trtllm_gemm_module()
+        runner_8x4 = module.trtllm_mxfp8_gemm_runner(use_8x4_sf_layout=True)
+        runner_128x4 = module.trtllm_mxfp8_gemm_runner(use_8x4_sf_layout=False)
+
+    state = _Mxfp8ExactTrtllmState(
+        workspace_8x4=workspace_8x4,
+        workspace_128x4=workspace_128x4,
+        runner_8x4=runner_8x4,
+        runner_128x4=runner_128x4,
+        tactics=table.tactics,
+    )
+    _MXFP8_EXACT_TRTLLM_STATES[device_key] = state
+    return state
+
+
+def _require_mxfp8_trtllm_exact_tactic_state(
+    device: torch.device,
+) -> _Mxfp8ExactTrtllmState:
+    device_key = _mxfp8_cuda_device_key(device)
+    state = _MXFP8_EXACT_TRTLLM_STATES.get(device_key)
+    if state is not None:
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 exact TRTLLM tactic state was not prepared before "
+            "CUDA Graph capture."
+        )
+    prepared = prepare_mxfp8_trtllm_exact_tactic_state(device)
+    if prepared is None:
+        raise RuntimeError("MXFP8 exact TRTLLM tactic path is not enabled.")
+    return prepared
 
 
 class _Mxfp8HighMTrtllmState(NamedTuple):
@@ -512,6 +800,37 @@ def _mxfp8_trtllm_linear_fixed_impl(
         backend="cuda",
         sf_swizzle_layout=sf_layout,
     )
+    if mxfp8_trtllm_exact_tactics_enabled():
+        state = _require_mxfp8_trtllm_exact_tactic_state(x.device)
+        layout = "8x4" if use_8x4_sf_layout else "128x4"
+        physical_n = int(weight.shape[0])
+        tactic = _resolve_mxfp8_exact_tactic(
+            int(x.shape[0]),
+            int(output_features),
+            physical_n,
+            int(x.shape[1]),
+            layout,
+            state.tactics,
+        )
+        output = torch.empty(
+            (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
+        )
+        runner = state.runner_8x4 if use_8x4_sf_layout else state.runner_128x4
+        workspace = state.workspace_8x4 if use_8x4_sf_layout else state.workspace_128x4
+        output = runner.forward(
+            [
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                torch.bfloat16,
+                output,
+                workspace,
+            ],
+            tactic=tactic,
+        )
+        return output[:, :output_features].contiguous()
+
     if not use_8x4_sf_layout and mxfp8_trtllm_high_m_static_tactics_enabled():
         state = _require_mxfp8_trtllm_high_m_tactic_state(x.device)
         logical_shape = (int(x.shape[0]), int(output_features), int(x.shape[1]))
