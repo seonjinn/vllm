@@ -9,19 +9,556 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import json
 import os
 import shutil
+import socket
+import time
 from collections.abc import Callable
-from typing import Any, NoReturn
+from pathlib import Path
+from typing import Any, NamedTuple, NoReturn
 
 import requests
 import torch
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 import vllm.envs as envs
+from vllm.compilation.passes.inductor_pass import InductorPass, get_pass_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+_MXFP8_ADAPTIVE_DISPATCH_TRACE_SEEN: set[
+    tuple[tuple[int, int, int], bool, int, bool]
+] = set()
+
+
+def _trace_mxfp8_adaptive_dispatch(
+    *,
+    shape_key: tuple[int, int, int],
+    use_8x4_sf_layout: bool,
+    tactic: int,
+    tactic_hit: bool,
+) -> None:
+    raw_enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "")
+    if raw_enabled.strip().lower() in ("", "0", "false", "no", "off"):
+        return
+    trace_dir = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", "").strip()
+    if not trace_dir:
+        return
+
+    key = (shape_key, use_8x4_sf_layout, tactic, tactic_hit)
+    if key in _MXFP8_ADAPTIVE_DISPATCH_TRACE_SEEN:
+        return
+    _MXFP8_ADAPTIVE_DISPATCH_TRACE_SEEN.add(key)
+
+    path = Path(trace_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    output = path / f"adaptive_dispatch_{socket.gethostname()}_{os.getpid()}.jsonl"
+    record = {
+        "event": "mxfp8_adaptive_dispatch",
+        "time": time.time(),
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "layout": "8x4" if use_8x4_sf_layout else "128x4",
+        "m": shape_key[0],
+        "n": shape_key[1],
+        "k": shape_key[2],
+        "tactic": tactic,
+        "tactic_source": "static_hint" if tactic_hit else "runner_default",
+    }
+    with output.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _mxfp8_env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+@functools.cache
+def _parse_mxfp8_tactic_hints(
+    raw_hints: str,
+) -> dict[tuple[int, int, int], int]:
+    tactic_table: dict[tuple[int, int, int], int] = {}
+    for item in raw_hints.split(";"):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        shape_raw, tactic_raw = item.split(":", 1)
+        try:
+            shape = tuple(int(part.strip()) for part in shape_raw.split(","))
+            if len(shape) != 3:
+                continue
+            tactic_table[(shape[0], shape[1], shape[2])] = int(tactic_raw.strip())
+        except ValueError:
+            continue
+    return tactic_table
+
+
+class _Mxfp8TrtllmConfigurationFingerprint(NamedTuple):
+    layout_mode: str
+    switch_m: int
+    gemm_backend: str
+    direct_trtllm: bool
+    require_direct_trtllm: bool
+    default_tactic: int
+    low_tactic_hints_raw: str
+    low_tactic_map: tuple[tuple[tuple[int, int, int], int], ...]
+    high_tactic_hints_raw: str
+    high_tactic_map: tuple[tuple[tuple[int, int, int], int], ...]
+    quant_backend: str
+    require_8x4_quant: bool
+    pad_to_128: bool
+
+
+def _mxfp8_trtllm_configuration_fingerprint() -> _Mxfp8TrtllmConfigurationFingerprint:
+    def env_flag(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+    layout_mode = (
+        os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4").strip().lower()
+    )
+    if layout_mode not in ("adaptive", "shape-aware", "shape_aware"):
+        raise RuntimeError(
+            "MXFP8 TRTLLM adaptive execution state requires adaptive layout mode; "
+            f"got {layout_mode!r}"
+        )
+
+    switch_m = int(os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M", "256"))
+    if switch_m <= 0:
+        raise ValueError("VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M must be positive")
+    if switch_m % 128:
+        raise ValueError(
+            "VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M must be a multiple of 128 "
+            "because adaptive serving pads the physical M dimension to 128 rows"
+        )
+
+    gemm_backend = (
+        os.environ.get("VLLM_MXFP8_DENSE_GEMM_BACKEND", "cutlass").strip().lower()
+    )
+    if gemm_backend != "trtllm":
+        raise RuntimeError(
+            f"MXFP8 adaptive layout requires backend='trtllm'; got {gemm_backend!r}"
+        )
+
+    low_tactic_hints_raw = os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS", "")
+    high_tactic_hints_raw = os.environ.get(
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4", ""
+    )
+    return _Mxfp8TrtllmConfigurationFingerprint(
+        layout_mode="adaptive",
+        switch_m=switch_m,
+        gemm_backend=gemm_backend,
+        direct_trtllm=env_flag("VLLM_MXFP8_DENSE_DIRECT_TRTLLM"),
+        require_direct_trtllm=env_flag("VLLM_MXFP8_DENSE_REQUIRE_DIRECT_TRTLLM"),
+        default_tactic=int(os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1")),
+        low_tactic_hints_raw=low_tactic_hints_raw,
+        low_tactic_map=tuple(
+            sorted(_parse_mxfp8_tactic_hints(low_tactic_hints_raw).items())
+        ),
+        high_tactic_hints_raw=high_tactic_hints_raw,
+        high_tactic_map=tuple(
+            sorted(_parse_mxfp8_tactic_hints(high_tactic_hints_raw).items())
+        ),
+        quant_backend=os.environ.get("VLLM_MXFP8_DENSE_QUANT_BACKEND", "cuda"),
+        require_8x4_quant=env_flag("VLLM_MXFP8_DENSE_REQUIRE_8X4_QUANT"),
+        pad_to_128=env_flag("VLLM_MXFP8_DENSE_PAD_TO_128", True),
+    )
+
+
+def _validate_mxfp8_trtllm_configuration(
+    prepared: _Mxfp8TrtllmConfigurationFingerprint,
+    active: _Mxfp8TrtllmConfigurationFingerprint,
+) -> None:
+    if prepared != active:
+        raise RuntimeError(
+            "MXFP8 TRTLLM configuration changed after preparation; "
+            "restart the worker before using the new layout or tactic configuration"
+        )
+
+
+_MXFP8_TRTLLM_CONFIGURATION: _Mxfp8TrtllmConfigurationFingerprint | None = None
+
+
+def _freeze_mxfp8_trtllm_configuration(
+    active: _Mxfp8TrtllmConfigurationFingerprint,
+) -> _Mxfp8TrtllmConfigurationFingerprint:
+    global _MXFP8_TRTLLM_CONFIGURATION
+    if _MXFP8_TRTLLM_CONFIGURATION is None:
+        _MXFP8_TRTLLM_CONFIGURATION = active
+    else:
+        _validate_mxfp8_trtllm_configuration(_MXFP8_TRTLLM_CONFIGURATION, active)
+    return _MXFP8_TRTLLM_CONFIGURATION
+
+
+def validate_mxfp8_trtllm_configuration(
+    prepared: _Mxfp8TrtllmConfigurationFingerprint,
+) -> None:
+    active = _mxfp8_trtllm_configuration_fingerprint()
+    _validate_mxfp8_trtllm_configuration(prepared, active)
+    if _MXFP8_TRTLLM_CONFIGURATION is not None:
+        _validate_mxfp8_trtllm_configuration(_MXFP8_TRTLLM_CONFIGURATION, active)
+
+
+class _Mxfp8TrtllmDirectState(NamedTuple):
+    workspace_8x4: torch.Tensor
+    workspace_128x4: torch.Tensor
+    runner_8x4: Any
+    runner_128x4: Any
+    configuration: _Mxfp8TrtllmConfigurationFingerprint | None
+    tactic_map_8x4: dict[tuple[int, int, int], int]
+    tactic_map_128x4: dict[tuple[int, int, int], int]
+
+
+_MXFP8_TRTLLM_DIRECT_STATES: dict[tuple[str, int], _Mxfp8TrtllmDirectState] = {}
+
+
+def _mxfp8_trtllm_device_key(device: torch.device) -> tuple[str, int]:
+    canonical_device = torch.device(device)
+    if canonical_device.type != "cuda":
+        raise RuntimeError(
+            f"MXFP8 TRTLLM direct state requires a CUDA device; got {canonical_device}"
+        )
+    device_index = canonical_device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return canonical_device.type, device_index
+
+
+def prepare_mxfp8_trtllm_direct_state(
+    device: torch.device,
+) -> _Mxfp8TrtllmDirectState:
+    device_key = _mxfp8_trtllm_device_key(device)
+    canonical_device = torch.device(device_key[0], device_key[1])
+    with torch.cuda.device(canonical_device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MXFP8 TRTLLM direct state must be prepared before CUDA Graph capture"
+            )
+
+        layout_mode = (
+            os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4").strip().lower()
+        )
+        is_adaptive_layout = layout_mode in (
+            "adaptive",
+            "shape-aware",
+            "shape_aware",
+        )
+        configuration = None
+        tactic_map_8x4: dict[tuple[int, int, int], int] = {}
+        tactic_map_128x4: dict[tuple[int, int, int], int] = {}
+        if is_adaptive_layout:
+            configuration = _freeze_mxfp8_trtllm_configuration(
+                _mxfp8_trtllm_configuration_fingerprint()
+            )
+
+        prepared_state = _MXFP8_TRTLLM_DIRECT_STATES.get(device_key)
+        if prepared_state is not None:
+            if configuration is not None and prepared_state.configuration is None:
+                raise RuntimeError(
+                    "MXFP8 TRTLLM state was prepared without adaptive configuration; "
+                    "restart the worker before enabling adaptive layout"
+                )
+            if prepared_state.configuration is not None:
+                validate_mxfp8_trtllm_configuration(prepared_state.configuration)
+            return prepared_state
+
+        if configuration is not None:
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                prepare_mxfp8_dense_quant_backend,
+            )
+
+            prepare_mxfp8_dense_quant_backend(configuration.quant_backend)
+            tactic_map_8x4 = dict(configuration.low_tactic_map)
+            tactic_map_128x4 = dict(configuration.high_tactic_map)
+
+        from flashinfer.gemm.gemm_base import (  # type: ignore
+            DEFAULT_WORKSPACE_SIZE,
+            _get_cache_buf,
+            get_trtllm_gemm_module,
+        )
+
+        workspace_8x4 = _get_cache_buf(
+            "vllm_direct_trtllm_mxfp8_workspace_8x4",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical_device,
+        )
+        workspace_128x4 = _get_cache_buf(
+            "vllm_direct_trtllm_mxfp8_workspace_128x4",
+            DEFAULT_WORKSPACE_SIZE,
+            canonical_device,
+        )
+        gemm_module = get_trtllm_gemm_module()
+        prepared_state = _Mxfp8TrtllmDirectState(
+            workspace_8x4=workspace_8x4,
+            workspace_128x4=workspace_128x4,
+            runner_8x4=gemm_module.trtllm_mxfp8_gemm_runner(use_8x4_sf_layout=True),
+            runner_128x4=gemm_module.trtllm_mxfp8_gemm_runner(use_8x4_sf_layout=False),
+            configuration=configuration,
+            tactic_map_8x4=tactic_map_8x4,
+            tactic_map_128x4=tactic_map_128x4,
+        )
+        _MXFP8_TRTLLM_DIRECT_STATES[device_key] = prepared_state
+        return prepared_state
+
+
+def _require_mxfp8_trtllm_direct_state(
+    device: torch.device,
+) -> _Mxfp8TrtllmDirectState:
+    device_key = _mxfp8_trtllm_device_key(device)
+    prepared_state = _MXFP8_TRTLLM_DIRECT_STATES.get(device_key)
+    if prepared_state is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MXFP8 TRTLLM direct state was not prepared before CUDA Graph capture; "
+                f"device={device_key}"
+            )
+        return prepare_mxfp8_trtllm_direct_state(device)
+    layout_mode = (
+        os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4").strip().lower()
+    )
+    is_adaptive_layout = layout_mode in (
+        "adaptive",
+        "shape-aware",
+        "shape_aware",
+    )
+    if is_adaptive_layout and prepared_state.configuration is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MXFP8 TRTLLM adaptive state was not prepared before CUDA Graph capture; "
+                f"device={device_key}"
+            )
+        return prepare_mxfp8_trtllm_direct_state(device)
+    if prepared_state.configuration is not None:
+        validate_mxfp8_trtllm_configuration(prepared_state.configuration)
+    return prepared_state
+
+
+def _mxfp8_trtllm_run_prepared(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    workspace: torch.Tensor,
+    use_8x4_sf_layout: bool,
+    tactic: int,
+) -> torch.Tensor:
+    state = _require_mxfp8_trtllm_direct_state(A.device)
+    m = int(A.shape[0])
+    n = int(B.shape[1])
+    out = torch.empty((m, n), dtype=out_dtype, device=A.device)
+    runner = state.runner_8x4 if use_8x4_sf_layout else state.runner_128x4
+    return runner.forward(
+        [A, B, A_scale, B_scale, out_dtype, out, workspace],
+        tactic=tactic,
+    )
+
+
+def get_mxfp8_trtllm_prepared_workspaces(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state = _require_mxfp8_trtllm_direct_state(device)
+    return state.workspace_8x4, state.workspace_128x4
+
+
+def _mxfp8_quantize_mm_fixed_layout_impl(
+    A_bf16: torch.Tensor,
+    B: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    backend: str,
+    workspace_8x4: torch.Tensor,
+    workspace_128x4: torch.Tensor,
+    *,
+    use_8x4_sf_layout: bool,
+) -> torch.Tensor:
+    if backend != "trtllm":
+        raise RuntimeError(
+            f"MXFP8 adaptive layout requires backend='trtllm'; got {backend!r}"
+        )
+    state = _require_mxfp8_trtllm_direct_state(A_bf16.device)
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize_128x4_impl,
+        mxfp8_e4m3_quantize_8x4_impl,
+    )
+
+    quantize = (
+        mxfp8_e4m3_quantize_8x4_impl
+        if use_8x4_sf_layout
+        else mxfp8_e4m3_quantize_128x4_impl
+    )
+    A, A_scale = quantize(A_bf16)
+    configuration = state.configuration
+    if configuration is None:
+        raise RuntimeError("MXFP8 adaptive layout requires a pre-capture configuration")
+
+    tactic_table = state.tactic_map_8x4 if use_8x4_sf_layout else state.tactic_map_128x4
+    shape_key = (int(A.shape[0]), int(B.shape[1]), int(A.shape[1]))
+    tactic_hit = shape_key in tactic_table
+    tactic = tactic_table.get(shape_key, -1)
+    _trace_mxfp8_adaptive_dispatch(
+        shape_key=shape_key,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        tactic=tactic,
+        tactic_hit=tactic_hit,
+    )
+    workspace = workspace_8x4 if use_8x4_sf_layout else workspace_128x4
+    return _mxfp8_trtllm_run_prepared(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out_dtype,
+        workspace,
+        use_8x4_sf_layout,
+        tactic,
+    )
+
+
+def _mxfp8_layout_for_compile_range(
+    range_start: int,
+    range_end: int,
+    switch_m: int,
+) -> bool:
+    if range_end <= switch_m:
+        return True
+    if range_start > switch_m:
+        return False
+    raise RuntimeError(
+        "MXFP8 compile range "
+        f"[{range_start}, {range_end}] straddles adaptive layout switch M={switch_m}"
+    )
+
+
+def _specialize_mxfp8_adaptive_layout_graph(
+    graph: Any,
+    *,
+    marker_op: Any,
+    fixed_op: Any,
+    auto_functionalized_op: Any = None,
+) -> int:
+    replaced = 0
+    for node in list(graph.nodes):
+        if node.op != "call_function":
+            continue
+        if node.target == marker_op:
+            node.target = fixed_op
+            replaced += 1
+        elif (
+            node.target == auto_functionalized_op
+            and node.args
+            and node.args[0] == marker_op
+        ):
+            node.args = (fixed_op, *node.args[1:])
+            replaced += 1
+    return replaced
+
+
+def _validate_mxfp8_adaptive_op_schemas() -> None:
+    schema_pairs = (
+        (
+            torch.ops.vllm.mxfp8_adaptive_quantize_mm_marker.default._schema,
+            torch.ops.vllm.mxfp8_quantize_mm_8x4.default._schema,
+        ),
+        (
+            torch.ops.vllm.mxfp8_adaptive_quantize_mm_marker.default._schema,
+            torch.ops.vllm.mxfp8_quantize_mm_128x4.default._schema,
+        ),
+    )
+    for marker_schema, fixed_schema in schema_pairs:
+        marker_signature = str(marker_schema)[str(marker_schema).index("(") :]
+        fixed_signature = str(fixed_schema)[str(fixed_schema).index("(") :]
+        if fixed_signature != marker_signature:
+            raise RuntimeError(
+                "MXFP8 adaptive fixed-op schema must match its marker schema: "
+                f"marker={marker_schema}, fixed={fixed_schema}"
+            )
+
+
+class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
+    def __init__(
+        self,
+        configuration: _Mxfp8TrtllmConfigurationFingerprint,
+    ) -> None:
+        self.configuration = configuration
+        self.switch_m = configuration.switch_m
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        compile_range = get_pass_context().compile_range
+        use_8x4_sf_layout = _mxfp8_layout_for_compile_range(
+            compile_range.start,
+            compile_range.end,
+            self.switch_m,
+        )
+        # Functionalization may wrap the workspace-mutating fused marker.
+        _specialize_mxfp8_adaptive_layout_graph(
+            graph,
+            marker_op=torch.ops.vllm.mxfp8_adaptive_quantize_mm_marker.default,
+            fixed_op=(
+                torch.ops.vllm.mxfp8_quantize_mm_8x4.default
+                if use_8x4_sf_layout
+                else torch.ops.vllm.mxfp8_quantize_mm_128x4.default
+            ),
+            auto_functionalized_op=auto_functionalized,
+        )
+
+    def uuid(self) -> str:
+        return self.hash_dict(
+            {
+                "source": self.hash_source(self),
+                "configuration": self.configuration._asdict(),
+                "phase": "joint_custom_pre_pass",
+                "schema_version": 7,
+            }
+        )
+
+
+def configure_mxfp8_adaptive_layout_compilation() -> None:
+    from vllm.config import get_current_vllm_config
+
+    active_configuration = _freeze_mxfp8_trtllm_configuration(
+        _mxfp8_trtllm_configuration_fingerprint()
+    )
+    _validate_mxfp8_adaptive_op_schemas()
+    vllm_config = get_current_vllm_config()
+    compilation_config = vllm_config.compilation_config
+
+    max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    if max_num_batched_tokens is None:
+        raise RuntimeError(
+            "MXFP8 adaptive layout requires a finite max_num_batched_tokens"
+        )
+    endpoints = list(compilation_config.compile_ranges_endpoints or [])
+    if active_configuration.switch_m < max_num_batched_tokens:
+        endpoints.append(active_configuration.switch_m)
+    compilation_config.compile_ranges_endpoints = sorted(set(endpoints))
+
+    # Retarget existing traced markers before AOT partitioning and lifetime
+    # analysis. No tuple-return node is injected after fake propagation.
+    pass_key = "joint_custom_pre_pass"
+    existing_pass = compilation_config.inductor_compile_config.get(pass_key)
+    if existing_pass is None:
+        compilation_config.inductor_compile_config[pass_key] = (
+            _Mxfp8AdaptiveLayoutSpecializationPass(active_configuration)
+        )
+    elif not isinstance(existing_pass, _Mxfp8AdaptiveLayoutSpecializationPass):
+        raise RuntimeError(
+            "MXFP8 adaptive layout cannot replace an existing Inductor joint pre-pass"
+        )
+    else:
+        _validate_mxfp8_trtllm_configuration(
+            existing_pass.configuration,
+            active_configuration,
+        )
+
 
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
@@ -603,9 +1140,77 @@ if has_flashinfer():
         B_scale: torch.Tensor,
         out_dtype: torch.dtype,
         backend: str = "cutlass",
+        use_8x4_sf_layout: bool = False,
     ) -> torch.Tensor:
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
+        layout_mode = (
+            os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4").strip().lower()
+        )
+        is_adaptive_layout = layout_mode in (
+            "adaptive",
+            "shape-aware",
+            "shape_aware",
+        )
+        if is_adaptive_layout and backend != "trtllm":
+            raise RuntimeError(
+                f"MXFP8 adaptive layout requires backend='trtllm'; got {backend!r}"
+            )
+        use_direct_trtllm = is_adaptive_layout or (
+            backend == "trtllm" and _mxfp8_env_flag("VLLM_MXFP8_DENSE_DIRECT_TRTLLM")
+        )
+        if use_direct_trtllm:
+            require_direct = is_adaptive_layout or _mxfp8_env_flag(
+                "VLLM_MXFP8_DENSE_REQUIRE_DIRECT_TRTLLM"
+            )
+            try:
+                state = _require_mxfp8_trtllm_direct_state(A.device)
+                configuration = state.configuration
+                tactic = (
+                    configuration.default_tactic
+                    if configuration is not None
+                    else int(os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1"))
+                )
+                tactic_hints_name = (
+                    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS"
+                    if use_8x4_sf_layout
+                    else "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS_128X4"
+                )
+                if configuration is None:
+                    tactic_table = _parse_mxfp8_tactic_hints(
+                        os.environ.get(tactic_hints_name, "")
+                    )
+                else:
+                    tactic_table = dict(
+                        configuration.low_tactic_map
+                        if use_8x4_sf_layout
+                        else configuration.high_tactic_map
+                    )
+                m = int(A.shape[0])
+                k = int(A.shape[1])
+                n = int(B.shape[1])
+                tactic = tactic_table.get((m, n, k), tactic)
+                workspace = (
+                    state.workspace_8x4 if use_8x4_sf_layout else state.workspace_128x4
+                )
+                return _mxfp8_trtllm_run_prepared(
+                    A,
+                    B,
+                    A_scale,
+                    B_scale,
+                    out_dtype,
+                    workspace,
+                    use_8x4_sf_layout,
+                    tactic,
+                )
+            except Exception:
+                if require_direct:
+                    raise
+
+        if is_adaptive_layout:
+            raise RuntimeError(
+                "MXFP8 adaptive layout cannot fall back from direct TRTLLM"
+            )
         return mm_mxfp8_(
             A,
             B,
@@ -626,9 +1231,122 @@ if has_flashinfer():
         B_scale: torch.Tensor,
         out_dtype: torch.dtype,
         backend: str = "cutlass",
+        use_8x4_sf_layout: bool = False,
     ) -> torch.Tensor:
         # A is [m, k], B is [k, n] -> output [m, n]
         return torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
+
+    @torch.library.custom_op(
+        "vllm::mxfp8_adaptive_quantize_mm_marker",
+        mutates_args=["workspace_8x4", "workspace_128x4"],
+        device_types="cuda",
+    )
+    def mxfp8_adaptive_quantize_mm_marker(
+        A_bf16: torch.Tensor,
+        B: torch.Tensor,
+        B_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str,
+        workspace_8x4: torch.Tensor,
+        workspace_128x4: torch.Tensor,
+    ) -> torch.Tensor:
+        raise RuntimeError(
+            "MXFP8 adaptive quantize-MM marker must be specialized before execution"
+        )
+
+    @torch.library.register_fake(
+        "vllm::mxfp8_adaptive_quantize_mm_marker",
+    )
+    def mxfp8_adaptive_quantize_mm_marker_fake(
+        A_bf16: torch.Tensor,
+        B: torch.Tensor,
+        B_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str,
+        workspace_8x4: torch.Tensor,
+        workspace_128x4: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            A_bf16.shape[0], B.shape[1], dtype=out_dtype, device=A_bf16.device
+        )
+
+    @torch.library.custom_op(
+        "vllm::mxfp8_quantize_mm_8x4",
+        mutates_args=["workspace_8x4", "workspace_128x4"],
+        device_types="cuda",
+    )
+    def mxfp8_quantize_mm_8x4(
+        A_bf16: torch.Tensor,
+        B: torch.Tensor,
+        B_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str,
+        workspace_8x4: torch.Tensor,
+        workspace_128x4: torch.Tensor,
+    ) -> torch.Tensor:
+        return _mxfp8_quantize_mm_fixed_layout_impl(
+            A_bf16,
+            B,
+            B_scale,
+            out_dtype,
+            backend,
+            workspace_8x4,
+            workspace_128x4,
+            use_8x4_sf_layout=True,
+        )
+
+    @torch.library.register_fake("vllm::mxfp8_quantize_mm_8x4")
+    def mxfp8_quantize_mm_8x4_fake(
+        A_bf16: torch.Tensor,
+        B: torch.Tensor,
+        B_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str,
+        workspace_8x4: torch.Tensor,
+        workspace_128x4: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            A_bf16.shape[0], B.shape[1], dtype=out_dtype, device=A_bf16.device
+        )
+
+    @torch.library.custom_op(
+        "vllm::mxfp8_quantize_mm_128x4",
+        mutates_args=["workspace_8x4", "workspace_128x4"],
+        device_types="cuda",
+    )
+    def mxfp8_quantize_mm_128x4(
+        A_bf16: torch.Tensor,
+        B: torch.Tensor,
+        B_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str,
+        workspace_8x4: torch.Tensor,
+        workspace_128x4: torch.Tensor,
+    ) -> torch.Tensor:
+        return _mxfp8_quantize_mm_fixed_layout_impl(
+            A_bf16,
+            B,
+            B_scale,
+            out_dtype,
+            backend,
+            workspace_8x4,
+            workspace_128x4,
+            use_8x4_sf_layout=False,
+        )
+
+    @torch.library.register_fake("vllm::mxfp8_quantize_mm_128x4")
+    def mxfp8_quantize_mm_128x4_fake(
+        A_bf16: torch.Tensor,
+        B: torch.Tensor,
+        B_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        backend: str,
+        workspace_8x4: torch.Tensor,
+        workspace_128x4: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            A_bf16.shape[0], B.shape[1], dtype=out_dtype, device=A_bf16.device
+        )
 
 
 def flashinfer_mm_mxfp8(

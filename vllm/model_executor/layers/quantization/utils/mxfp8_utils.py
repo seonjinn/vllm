@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -9,6 +11,60 @@ from vllm.utils.torch_utils import direct_register_custom_op
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+
+_MXFP8_DENSE_QUANT_BACKEND: str | None = None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def prepare_mxfp8_dense_quant_backend(backend: str | None = None) -> str:
+    global _MXFP8_DENSE_QUANT_BACKEND
+    active_backend = (
+        (
+            backend
+            if backend is not None
+            else os.environ.get("VLLM_MXFP8_DENSE_QUANT_BACKEND", "cuda")
+        )
+        .strip()
+        .lower()
+    )
+    if _MXFP8_DENSE_QUANT_BACKEND is None:
+        _MXFP8_DENSE_QUANT_BACKEND = active_backend
+    elif _MXFP8_DENSE_QUANT_BACKEND != active_backend:
+        raise RuntimeError(
+            "MXFP8 dense quantization backend changed after preparation; "
+            "restart the worker before changing it"
+        )
+    return _MXFP8_DENSE_QUANT_BACKEND
+
+
+def _mxfp8_dense_quant_backend() -> str:
+    return prepare_mxfp8_dense_quant_backend()
+
+
+def _mxfp8_dense_a_sf_layout() -> str:
+    return os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4").strip().lower()
+
+
+def mxfp8_dense_use_8x4_sf_layout(m: int) -> bool:
+    layout = _mxfp8_dense_a_sf_layout()
+    if layout in ("8x4", "layout_8x4", "true", "1"):
+        return True
+    if layout in ("128x4", "layout_128x4", "false", "0"):
+        return False
+    if layout in ("adaptive", "shape-aware", "shape_aware"):
+        threshold = int(os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M", "256"))
+        if threshold <= 0:
+            raise ValueError("VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M must be positive")
+        return int(m) <= threshold
+    raise ValueError(
+        f"VLLM_MXFP8_DENSE_A_SF_LAYOUT must be 8x4, 128x4, or adaptive; got {layout!r}"
+    )
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
@@ -84,24 +140,61 @@ def _mxfp8_e4m3_quantize_torch(
     return x_fp8, scales_uint8
 
 
-def _mxfp8_e4m3_quantize_impl(
+def _flashinfer_mxfp8_quantize_impl(
     x: torch.Tensor,
-    is_sf_swizzled_layout: bool = False,
-    alignment: int = 0,
+    is_sf_swizzled_layout: bool,
+    alignment: int,
+    use_8x4_sf_layout: bool,
+    *,
+    require_exact_8x4_layout: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from vllm.platforms import current_platform
+    from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 
-    if current_platform.has_device_capability(100):
-        from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+    quant_kwargs = {
+        "input": x,
+        "is_sf_swizzled_layout": is_sf_swizzled_layout,
+        "alignment": alignment if alignment > 0 else 32,
+    }
+    use_8x4 = is_sf_swizzled_layout and use_8x4_sf_layout
+    if use_8x4:
+        from flashinfer import SfLayout
 
+        quant_kwargs["sf_swizzle_layout"] = SfLayout.layout_8x4
+        quant_kwargs["backend"] = _mxfp8_dense_quant_backend()
+
+    try:
+        x_q, x_scales = flashinfer_mxfp8_quantize(**quant_kwargs)
+    except TypeError:
+        if use_8x4 and (
+            require_exact_8x4_layout or _env_flag("VLLM_MXFP8_DENSE_REQUIRE_8X4_QUANT")
+        ):
+            raise
         x_q, x_scales = flashinfer_mxfp8_quantize(
             x,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment if alignment > 0 else 32,
         )
-        if x_scales.ndim == 1 and x.ndim == 2 and not is_sf_swizzled_layout:
-            x_scales = x_scales.view(x.size(0), -1)
-        return x_q, x_scales
+    if x_scales.ndim == 1 and x.ndim == 2 and not is_sf_swizzled_layout:
+        x_scales = x_scales.view(x.size(0), -1)
+    return x_q, x_scales
+
+
+def _mxfp8_e4m3_quantize_impl(
+    x: torch.Tensor,
+    is_sf_swizzled_layout: bool = False,
+    alignment: int = 0,
+    use_8x4_sf_layout: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.platforms import current_platform
+
+    if current_platform.has_device_capability(100):
+        return _flashinfer_mxfp8_quantize_impl(
+            x,
+            is_sf_swizzled_layout,
+            alignment,
+            use_8x4_sf_layout,
+            require_exact_8x4_layout=False,
+        )
 
     return _mxfp8_e4m3_quantize_torch(x, is_sf_swizzled_layout)
 
@@ -110,8 +203,43 @@ def mxfp8_e4m3_quantize(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
     alignment: int = 0,
+    use_8x4_sf_layout: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.mxfp8_quantize(x, is_sf_swizzled_layout, alignment)
+    if use_8x4_sf_layout is None:
+        use_8x4_sf_layout = mxfp8_dense_use_8x4_sf_layout(int(x.shape[-2]))
+    return torch.ops.vllm.mxfp8_quantize(
+        x, is_sf_swizzled_layout, alignment, use_8x4_sf_layout
+    )
+
+
+def _mxfp8_e4m3_quantize_fixed_layout_impl(
+    x: torch.Tensor,
+    *,
+    use_8x4_sf_layout: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.platforms import current_platform
+
+    if not current_platform.has_device_capability(100):
+        raise RuntimeError("Fixed-layout MXFP8 quantization requires >=sm_100")
+    return _flashinfer_mxfp8_quantize_impl(
+        x,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        require_exact_8x4_layout=use_8x4_sf_layout,
+    )
+
+
+def mxfp8_e4m3_quantize_8x4_impl(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _mxfp8_e4m3_quantize_fixed_layout_impl(x, use_8x4_sf_layout=True)
+
+
+def mxfp8_e4m3_quantize_128x4_impl(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _mxfp8_e4m3_quantize_fixed_layout_impl(x, use_8x4_sf_layout=False)
 
 
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -134,6 +262,7 @@ def mxfp8_e4m3_quantize_fake(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,
     alignment: int = 0,
+    use_8x4_sf_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
     fp_data = torch.empty_like(x, dtype=MXFP8_VALUE_DTYPE)
@@ -144,7 +273,8 @@ def mxfp8_e4m3_quantize_fake(
         M, N = x.shape
         K = (N + block_size - 1) // block_size
         if is_sf_swizzled_layout:
-            M_padded = ((M + 127) // 128) * 128
+            m_tile = 8 if use_8x4_sf_layout else 128
+            M_padded = ((M + m_tile - 1) // m_tile) * m_tile
             K_padded = ((K + 3) // 4) * 4
             scales = torch.empty(
                 M_padded * K_padded, dtype=MXFP8_SCALE_DTYPE, device=x.device
@@ -155,7 +285,8 @@ def mxfp8_e4m3_quantize_fake(
         B, M, N = x.shape
         K = (N + block_size - 1) // block_size
         if is_sf_swizzled_layout:
-            M_padded = ((M + 127) // 128) * 128
+            m_tile = 8 if use_8x4_sf_layout else 128
+            M_padded = ((M + m_tile - 1) // m_tile) * m_tile
             K_padded = ((K + 3) // 4) * 4
             scales = torch.empty(
                 B * M_padded * K_padded, dtype=MXFP8_SCALE_DTYPE, device=x.device
@@ -170,12 +301,45 @@ def mxfp8_e4m3_quantize_fake(
     return fp_data, scales
 
 
+def mxfp8_e4m3_quantize_8x4_fake(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return mxfp8_e4m3_quantize_fake(
+        x,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+        use_8x4_sf_layout=True,
+    )
+
+
+def mxfp8_e4m3_quantize_128x4_fake(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return mxfp8_e4m3_quantize_fake(
+        x,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+        use_8x4_sf_layout=False,
+    )
+
+
 direct_register_custom_op(
     op_name="mxfp8_quantize",
     op_func=_mxfp8_e4m3_quantize_impl,
     fake_impl=mxfp8_e4m3_quantize_fake,
 )
 
+direct_register_custom_op(
+    op_name="mxfp8_quantize_8x4",
+    op_func=mxfp8_e4m3_quantize_8x4_impl,
+    fake_impl=mxfp8_e4m3_quantize_8x4_fake,
+)
+
+direct_register_custom_op(
+    op_name="mxfp8_quantize_128x4",
+    op_func=mxfp8_e4m3_quantize_128x4_impl,
+    fake_impl=mxfp8_e4m3_quantize_128x4_fake,
+)
 
 def xpu_mxfp8_quantize(
     x: torch.Tensor, dtype: torch.dtype | None = None
