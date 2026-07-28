@@ -7,7 +7,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, Unpack
 
 import pytest
 
@@ -54,6 +54,74 @@ _PROVENANCE: dict[str, object] = {
 }
 
 
+class _ObservationOverrides(TypedDict, total=False):
+    layout: str
+    m: int
+    n: int
+    k: int
+    config_sha256: str
+    cosine_similarity: float | None
+    all_finite: bool
+    status: str
+    device_name: str
+    vllm_version: str
+    seed: int
+
+
+def _bootstrap_manifest() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "mode": "adaptive",
+        "compatibility": dict(_COMPATIBILITY),
+        "policy": {
+            "gemm_backend": "trtllm",
+            "layout": "adaptive",
+            "switch_m": 256,
+            "direct_trtllm": True,
+            "require_direct_trtllm": True,
+            "quant_backend": "cuda",
+            "require_8x4_quant": True,
+            "pad_to_128": False,
+            "default_tactic": -1,
+        },
+        "tactics": {"8x4": [], "128x4": []},
+        "provenance": dict(_PROVENANCE),
+    }
+
+
+def _write_bootstrap_manifest(path: Path) -> str:
+    path.write_bytes(canonical_json_bytes(_bootstrap_manifest()))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_inventory_artifact(
+    path: Path,
+    *,
+    bootstrap_sha256: str = _CONFIG_SHA256,
+    source_manifest_sha256: str = "a" * 64,
+) -> None:
+    path.write_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "source_manifest_sha256": source_manifest_sha256,
+                "bootstrap_manifest_sha256": bootstrap_sha256,
+                "compatibility": dict(_COMPATIBILITY),
+                "shapes": [
+                    {
+                        "layout": "8x4",
+                        "m": 8,
+                        "n": 2048,
+                        "k": 8192,
+                        "config_sha256": bootstrap_sha256,
+                        "frequency": 1,
+                    }
+                ],
+            }
+        )
+    )
+
+
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     path.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
@@ -85,6 +153,7 @@ def _observation(
     m: int = 8,
     n: int = 2048,
     k: int = 8192,
+    config_sha256: str = _CONFIG_SHA256,
     tactic: int = -1,
     repeat: int = 0,
     median_ms: float | None = 10.0,
@@ -93,20 +162,21 @@ def _observation(
     status: str = "success",
     device_name: str = "NVIDIA GB200",
     vllm_version: str = "0.20.2",
+    seed: int | None = None,
 ) -> Any:
     return BenchmarkObservation(
         layout=layout,
         m=m,
         n=n,
         k=k,
-        config_sha256=_CONFIG_SHA256,
+        config_sha256=config_sha256,
         tactic=tactic,
         repeat=repeat,
         median_ms=median_ms,
         all_finite=all_finite,
         cosine_similarity=cosine_similarity,
         status=status,
-        seed=1000 + repeat,
+        seed=1000 + repeat if seed is None else seed,
         warmup=10,
         iterations=80,
         device_name=device_name,
@@ -120,7 +190,7 @@ def _observation(
 def _observations_for_tactic(
     tactic: int,
     medians: tuple[float, float, float],
-    **overrides: object,
+    **overrides: Unpack[_ObservationOverrides],
 ) -> list[Any]:
     return [
         _observation(
@@ -301,6 +371,44 @@ def test_inventory_requires_explicit_layout_for_dense_trace(tmp_path: Path) -> N
         load_shape_inventory([path])
 
 
+def test_inventory_cli_rejects_trace_config_not_bound_to_bootstrap_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Trace rows cannot be relabeled with an unrelated bootstrap manifest."""
+    bootstrap = tmp_path / "bootstrap.json"
+    _write_bootstrap_manifest(bootstrap)
+    trace = tmp_path / "trace.jsonl"
+    _write_jsonl(
+        trace,
+        [
+            {
+                "event": "mxfp8_adaptive_dispatch",
+                "layout": "8x4",
+                "m": 8,
+                "n": 2048,
+                "k": 8192,
+                "config_sha256": _CONFIG_SHA256,
+            }
+        ],
+    )
+
+    assert (
+        main(
+            [
+                "inventory",
+                "--trace",
+                str(trace),
+                "--bootstrap-manifest",
+                str(bootstrap),
+                "--output",
+                str(tmp_path / "inventory.json"),
+            ]
+        )
+        == 2
+    )
+    assert "bootstrap manifest SHA256" in capsys.readouterr().err
+
+
 def test_observation_loader_rejects_duplicate_exact_identity(tmp_path: Path) -> None:
     """Resume collisions cannot silently replace one repeat's measurement."""
     path = tmp_path / "duplicate.jsonl"
@@ -462,6 +570,42 @@ def test_qualification_requires_passing_default_for_every_repeat() -> None:
         )
 
 
+def test_qualification_requires_shared_seed_per_repeat_and_distinct_repeats() -> None:
+    """Externally supplied observations must preserve independent repeat identity."""
+    observations = [
+        *_observations_for_tactic(-1, (10.0, 10.0, 10.0)),
+        *_observations_for_tactic(7, (8.0, 8.0, 8.0)),
+    ]
+    observations[3] = _observation(
+        tactic=7,
+        repeat=0,
+        median_ms=8.0,
+        seed=9999,
+    )
+
+    with pytest.raises(ValueError, match="one seed"):
+        qualify_observations(
+            [_shape()],
+            observations,
+            minimum_repeat_count=3,
+            minimum_cosine_similarity=0.999,
+            minimum_speedup_vs_default=1.02,
+        )
+
+    repeated_seed = [
+        _observation(tactic=-1, repeat=repeat, seed=1000)
+        for repeat in range(3)
+    ]
+    with pytest.raises(ValueError, match="distinct seeds"):
+        qualify_observations(
+            [_shape()],
+            repeated_seed,
+            minimum_repeat_count=3,
+            minimum_cosine_similarity=0.999,
+            minimum_speedup_vs_default=1.02,
+        )
+
+
 def test_qualification_rejects_observation_shape_absent_from_inventory() -> None:
     """Benchmark results cannot introduce an untraced physical shape."""
     observations = _observations_for_tactic(-1, (10.0, 10.0, 10.0), m=16)
@@ -558,6 +702,49 @@ def test_benchmark_plan_keeps_exact_unpadded_layout_and_deterministic_seeds() ->
     ]
 
 
+def test_resume_rejects_changed_base_seed_and_mixed_repeat_seeds() -> None:
+    """Resume identity must bind every existing tactic to the deterministic seed."""
+    plans = build_benchmark_plan([_shape()], repeat_count=3, base_seed=1234)
+    observations = [
+        *[
+            _observation(
+                tactic=-1,
+                repeat=repeat,
+                median_ms=10.0,
+                seed=plans[repeat].seed,
+            )
+            for repeat in range(3)
+        ],
+        *[
+            _observation(
+                tactic=7,
+                repeat=repeat,
+                median_ms=8.0,
+                seed=plans[repeat].seed,
+            )
+            for repeat in range(3)
+        ],
+    ]
+
+    _MODULE.validate_resume_observations(plans, observations)
+
+    changed = list(observations)
+    changed[3] = _observation(
+        tactic=7,
+        repeat=0,
+        median_ms=8.0,
+        seed=changed[3].seed + 100,
+    )
+    with pytest.raises(ValueError, match="deterministic seed"):
+        _MODULE.validate_resume_observations(plans, changed)
+
+    changed_plan = build_benchmark_plan(
+        [_shape()], repeat_count=3, base_seed=9999
+    )
+    with pytest.raises(ValueError, match="deterministic seed"):
+        _MODULE.validate_resume_observations(changed_plan, observations)
+
+
 def test_tactic_plan_includes_default_all_valid_and_exact_identity_resume() -> None:
     """The GPU stage must benchmark -1 plus every valid tactic exactly once."""
     plan = build_benchmark_plan(
@@ -584,6 +771,89 @@ def test_tactic_plan_includes_default_all_valid_and_exact_identity_resume() -> N
     assert tactics == (-1, 9, 11)
 
 
+def test_valid_tactic_enumeration_error_aborts_with_underlying_diagnostic() -> None:
+    """A private-runner ABI error cannot masquerade as zero valid tactics."""
+
+    class BrokenRunner:
+        def get_valid_tactics(
+            self, _inputs: list[object], _profile: object
+        ) -> list[int]:
+            raise RuntimeError("enumeration ABI mismatch")
+
+    with pytest.raises(RuntimeError, match="enumeration ABI mismatch"):
+        _MODULE.enumerate_valid_tactics(BrokenRunner(), [], object())
+
+    class EmptyRunner:
+        def get_valid_tactics(
+            self, _inputs: list[object], _profile: object
+        ) -> list[int]:
+            return []
+
+    assert _MODULE.enumerate_valid_tactics(EmptyRunner(), [], object()) == ()
+
+
+def test_gpu_error_observation_retains_actionable_diagnostic() -> None:
+    """Append-only failures must explain the failing private runner operation."""
+    plan = build_benchmark_plan(
+        [_shape()], repeat_count=3, base_seed=1234
+    )[0]
+    runtime = _MODULE._GpuRuntimeIdentity(
+        device_name="NVIDIA GB200",
+        compute_capability="10.0",
+        vllm_version="0.20.2",
+        flashinfer_version="0.6.8.post1",
+        container_sha256=_CONTAINER_SHA256,
+    )
+
+    observation = _MODULE._error_observation(
+        plan,
+        7,
+        runtime,
+        warmup=10,
+        iterations=80,
+        num_valid_tactics=12,
+        error=RuntimeError("runner forward ABI mismatch"),
+    )
+
+    assert observation.status == "error"
+    assert observation.num_valid_tactics == 12
+    assert observation.error == "runner forward ABI mismatch"
+
+
+def test_active_runtime_identity_rejects_declared_version_or_gpu_mismatch() -> None:
+    """The GPU stage must bind CLI declarations to installed/runtime identity."""
+    _MODULE.validate_active_runtime_identity(
+        active_vllm_version="0.20.2",
+        active_flashinfer_version="0.6.8.post1",
+        active_compute_capability="10.0",
+        active_device_name="NVIDIA GB200",
+        declared_vllm_version="0.20.2",
+        declared_flashinfer_version="0.6.8.post1",
+        inventory_compatibility=_COMPATIBILITY,
+    )
+
+    with pytest.raises(RuntimeError, match="active vLLM"):
+        _MODULE.validate_active_runtime_identity(
+            active_vllm_version="0.20.1",
+            active_flashinfer_version="0.6.8.post1",
+            active_compute_capability="10.0",
+            active_device_name="NVIDIA GB200",
+            declared_vllm_version="0.20.2",
+            declared_flashinfer_version="0.6.8.post1",
+            inventory_compatibility=_COMPATIBILITY,
+        )
+    with pytest.raises(RuntimeError, match="GPU family"):
+        _MODULE.validate_active_runtime_identity(
+            active_vllm_version="0.20.2",
+            active_flashinfer_version="0.6.8.post1",
+            active_compute_capability="10.0",
+            active_device_name="NVIDIA H100",
+            declared_vllm_version="0.20.2",
+            declared_flashinfer_version="0.6.8.post1",
+            inventory_compatibility=_COMPATIBILITY,
+        )
+
+
 def test_aggregate_input_digest_is_path_and_argument_order_independent(
     tmp_path: Path,
 ) -> None:
@@ -607,6 +877,8 @@ def test_inventory_cli_writes_canonical_json_and_zero_hit_returns_nonzero(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The explicit inventory stage must be reproducible and fail loudly on no hits."""
+    bootstrap = tmp_path / "bootstrap.json"
+    bootstrap_sha256 = _write_bootstrap_manifest(bootstrap)
     trace = tmp_path / "trace.jsonl"
     _write_jsonl(
         trace,
@@ -617,7 +889,7 @@ def test_inventory_cli_writes_canonical_json_and_zero_hit_returns_nonzero(
                 "m": 8,
                 "n": 2048,
                 "k": 8192,
-                "config_sha256": _CONFIG_SHA256,
+                "config_sha256": bootstrap_sha256,
             }
         ],
     )
@@ -629,6 +901,8 @@ def test_inventory_cli_writes_canonical_json_and_zero_hit_returns_nonzero(
                 "inventory",
                 "--trace",
                 str(trace),
+                "--bootstrap-manifest",
+                str(bootstrap),
                 "--output",
                 str(output),
             ]
@@ -638,9 +912,11 @@ def test_inventory_cli_writes_canonical_json_and_zero_hit_returns_nonzero(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert output.read_bytes() == canonical_json_bytes(payload)
     assert payload["source_manifest_sha256"] == digest_input_paths([trace])
+    assert payload["bootstrap_manifest_sha256"] == bootstrap_sha256
+    assert payload["compatibility"] == _COMPATIBILITY
     assert payload["shapes"] == [
         {
-            "config_sha256": _CONFIG_SHA256,
+            "config_sha256": bootstrap_sha256,
             "frequency": 1,
             "k": 8192,
             "layout": "8x4",
@@ -657,6 +933,8 @@ def test_inventory_cli_writes_canonical_json_and_zero_hit_returns_nonzero(
                 "inventory",
                 "--trace",
                 str(empty),
+                "--bootstrap-manifest",
+                str(bootstrap),
                 "--output",
                 str(tmp_path / "must-not-exist.json"),
             ]
@@ -666,10 +944,12 @@ def test_inventory_cli_writes_canonical_json_and_zero_hit_returns_nonzero(
     assert "zero eligible" in capsys.readouterr().err
 
 
-def test_promote_cli_binds_manifest_compatibility_to_observed_runtime(
+def test_generated_outputs_refuse_aliases_and_existing_files(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A caller cannot relabel shmoo results as another vLLM runtime."""
+    """Generated artifacts cannot overwrite trace evidence or prior artifacts."""
+    bootstrap = tmp_path / "bootstrap.json"
+    bootstrap_sha256 = _write_bootstrap_manifest(bootstrap)
     trace = tmp_path / "trace.jsonl"
     _write_jsonl(
         trace,
@@ -680,7 +960,93 @@ def test_promote_cli_binds_manifest_compatibility_to_observed_runtime(
                 "m": 8,
                 "n": 2048,
                 "k": 8192,
-                "config_sha256": _CONFIG_SHA256,
+                "config_sha256": bootstrap_sha256,
+            }
+        ],
+    )
+    common = [
+        "inventory",
+        "--trace",
+        str(trace),
+        "--bootstrap-manifest",
+        str(bootstrap),
+        "--output",
+    ]
+
+    assert main([*common, str(trace)]) == 2
+    assert "path collision" in capsys.readouterr().err
+    existing = tmp_path / "existing.json"
+    existing.write_text("keep", encoding="utf-8")
+    assert main([*common, str(existing)]) == 2
+    assert existing.read_text(encoding="utf-8") == "keep"
+    assert "already exists" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "invalid_args",
+    [
+        ["--repeat-count", "2"],
+        ["--base-seed", "-1"],
+        ["--warmup", "-1"],
+        ["--iterations", "0"],
+        ["--workspace-mb", "0"],
+        ["--minimum-cosine-similarity", "0"],
+        ["--container-sha256", "bad"],
+    ],
+)
+def test_shmoo_rejects_invalid_contract_arguments_before_gpu_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_args: list[str],
+) -> None:
+    """Invalid settings must not touch CUDA or create unreadable append logs."""
+    inventory = tmp_path / "inventory.json"
+    _write_inventory_artifact(inventory)
+    output = tmp_path / "observations.jsonl"
+    imports = 0
+
+    def forbidden_gpu_import() -> tuple[object, ...]:
+        nonlocal imports
+        imports += 1
+        raise AssertionError("GPU import must occur after argument validation")
+
+    monkeypatch.setattr(_MODULE, "_import_gpu_dependencies", forbidden_gpu_import)
+    base_args = [
+        "shmoo",
+        "--inventory",
+        str(inventory),
+        "--output",
+        str(output),
+        "--vllm-version",
+        "0.20.2",
+        "--flashinfer-version",
+        "0.6.8.post1",
+        "--container-sha256",
+        _CONTAINER_SHA256,
+    ]
+
+    assert main([*base_args, *invalid_args]) == 2
+    assert imports == 0
+    assert not output.exists()
+
+
+def test_promote_cli_binds_manifest_compatibility_to_observed_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A caller cannot relabel shmoo results as another vLLM runtime."""
+    bootstrap = tmp_path / "bootstrap.json"
+    bootstrap_sha256 = _write_bootstrap_manifest(bootstrap)
+    trace = tmp_path / "trace.jsonl"
+    _write_jsonl(
+        trace,
+        [
+            {
+                "event": "mxfp8_adaptive_dispatch",
+                "layout": "8x4",
+                "m": 8,
+                "n": 2048,
+                "k": 8192,
+                "config_sha256": bootstrap_sha256,
             }
         ],
     )
@@ -691,6 +1057,8 @@ def test_promote_cli_binds_manifest_compatibility_to_observed_runtime(
                 "inventory",
                 "--trace",
                 str(trace),
+                "--bootstrap-manifest",
+                str(bootstrap),
                 "--output",
                 str(inventory),
             ]
@@ -704,13 +1072,17 @@ def test_promote_cli_binds_manifest_compatibility_to_observed_runtime(
             *(
                 observation.__dict__
                 for observation in _observations_for_tactic(
-                    -1, (10.0, 10.0, 10.0)
+                    -1,
+                    (10.0, 10.0, 10.0),
+                    config_sha256=bootstrap_sha256,
                 )
             ),
             *(
                 observation.__dict__
                 for observation in _observations_for_tactic(
-                    7, (8.0, 8.0, 8.0)
+                    7,
+                    (8.0, 8.0, 8.0),
+                    config_sha256=bootstrap_sha256,
                 )
             ),
         ],
@@ -750,54 +1122,85 @@ def test_promote_cli_binds_manifest_compatibility_to_observed_runtime(
         digest_input_paths([observations])
     )
 
-    assert main([*common_args, "--vllm-version", "0.20.1"]) == 2
+    collision_args = list(common_args)
+    output_index = collision_args.index("--output") + 1
+    collision_args[output_index] = str(observations)
+    raw_observations = observations.read_bytes()
+    assert main([*collision_args, "--vllm-version", "0.20.2"]) == 2
+    assert observations.read_bytes() == raw_observations
+    assert "path collision" in capsys.readouterr().err
+
+    mismatch_args = list(common_args)
+    mismatch_args[output_index] = str(tmp_path / "mismatch.json")
+    assert main([*mismatch_args, "--vllm-version", "0.20.1"]) == 2
     assert "observed vLLM version" in capsys.readouterr().err
 
 
 def test_validate_manifest_uses_production_loader_and_checks_canonical_bytes(
     tmp_path: Path,
 ) -> None:
-    """Validation must catch compatibility, provenance, and byte drift."""
+    """Validation must regenerate from raw inputs and catch canonical tactic edits."""
+    inventory_path = tmp_path / "inventory.json"
+    _write_inventory_artifact(inventory_path)
+    observations = [
+        *_observations_for_tactic(-1, (10.0, 10.0, 10.0)),
+        *_observations_for_tactic(7, (8.0, 8.0, 8.0)),
+    ]
+    observations_path = tmp_path / "observations.jsonl"
+    _write_jsonl(
+        observations_path,
+        [observation.__dict__ for observation in observations],
+    )
     qualified = qualify_observations(
         [_shape()],
-        [
-            *_observations_for_tactic(-1, (10.0, 10.0, 10.0)),
-            *_observations_for_tactic(7, (8.0, 8.0, 8.0)),
-        ],
+        observations,
         minimum_repeat_count=3,
         minimum_cosine_similarity=0.999,
         minimum_speedup_vs_default=1.02,
     )
+    provenance = dict(_PROVENANCE)
+    provenance["source_hint_sha256"] = digest_input_paths(
+        [observations_path]
+    )
     manifest = build_qualified_manifest(
         qualified,
         compatibility=_COMPATIBILITY,
-        provenance=_PROVENANCE,
+        provenance=provenance,
     )
     path = tmp_path / "qualified.json"
     path.write_bytes(canonical_json_bytes(manifest))
 
     validate_manifest(
         path,
+        inventory_path=inventory_path,
+        observation_paths=[observations_path],
+        minimum_repeat_count=3,
+        minimum_cosine_similarity=0.999,
+        minimum_speedup_vs_default=1.02,
+        qualification_scope="nemo_rl_rollout",
         actual_vllm_version="0.20.2+local",
         actual_flashinfer_version="0.6.8.post1+cu130",
         actual_compute_capability=(10, 0),
         actual_model="Qwen/Qwen3-30B-A3B",
         actual_tensor_parallel_size=1,
-        expected_source_manifest_sha256="a" * 64,
-        expected_source_hint_sha256="b" * 64,
         check=True,
     )
 
-    path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="canonical"):
+    manifest["tactics"]["8x4"][0]["tactic"] = 10007
+    path.write_bytes(canonical_json_bytes(manifest))
+    with pytest.raises(ValueError, match="regenerated"):
         validate_manifest(
             path,
+            inventory_path=inventory_path,
+            observation_paths=[observations_path],
+            minimum_repeat_count=3,
+            minimum_cosine_similarity=0.999,
+            minimum_speedup_vs_default=1.02,
+            qualification_scope="nemo_rl_rollout",
             actual_vllm_version="0.20.2",
             actual_flashinfer_version="0.6.8.post1",
             actual_compute_capability=(10, 0),
             actual_model="Qwen/Qwen3-30B-A3B",
             actual_tensor_parallel_size=1,
-            expected_source_manifest_sha256="a" * 64,
-            expected_source_hint_sha256="b" * 64,
             check=True,
         )

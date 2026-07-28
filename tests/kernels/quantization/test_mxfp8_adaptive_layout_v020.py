@@ -769,6 +769,24 @@ def test_runner_and_linear_path_share_the_same_layout_choice() -> None:
     assert "use_8x4_sf_layout=use_8x4_sf_layout" in linear_source
 
 
+def test_dense_trace_layout_resolution_stays_outside_compilation() -> None:
+    """Tracing layout must not force a symbolic compile-time layout decision."""
+    linear_source = LINEAR.read_text(encoding="utf-8")
+    compiling = linear_source.index(
+        "is_compiling = _mxfp8_dense_is_compiling()"
+    )
+    layout_choice = linear_source.index(
+        "use_8x4_sf_layout = mxfp8_dense_use_8x4_sf_layout(M_padded)"
+    )
+
+    assert compiling < layout_choice
+    assert (
+        "if not is_compiling:\n"
+        "            use_8x4_sf_layout = "
+        "mxfp8_dense_use_8x4_sf_layout(M_padded)"
+    ) in linear_source
+
+
 def test_tactic_hint_table_is_parsed_once_and_looked_up_by_shape() -> None:
     source = FLASHINFER_UTILS.read_text(encoding="utf-8")
 
@@ -1475,6 +1493,7 @@ def test_dense_shape_trace_records_frozen_config_sha256(
         n_logical=8192,
         n_physical=8192,
         k=2048,
+        layout="8x4",
         backend="trtllm",
         input_shape=(32, 2048),
         weight_shape=(8192, 2048),
@@ -1484,6 +1503,7 @@ def test_dense_shape_trace_records_frozen_config_sha256(
     trace_path = next(tmp_path.glob("dense_shapes_*.jsonl"))
     record = json.loads(trace_path.read_text(encoding="utf-8"))
     assert record["config_sha256"] == "e" * 64
+    assert record["layout"] == "8x4"
 
 
 def test_adaptive_fixed_ops_validate_marker_compatible_schemas() -> None:

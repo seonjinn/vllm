@@ -17,6 +17,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, cast
 
 Layout = Literal["8x4", "128x4"]
@@ -51,6 +52,17 @@ _OBSERVATION_FIELDS = frozenset(
     }
 )
 _SUCCESS_STATUS = "success"
+_COMPATIBILITY_FIELDS = frozenset(
+    {
+        "vllm_version",
+        "vllm_base_commit",
+        "flashinfer_version",
+        "compute_capability",
+        "gpu_family",
+        "model",
+        "tensor_parallel_size",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +104,8 @@ class BenchmarkObservation:
     vllm_version: str
     flashinfer_version: str
     container_sha256: str
+    num_valid_tactics: int | None = None
+    error: str | None = None
 
     @property
     def shape_identity(self) -> ShapeIdentity:
@@ -161,6 +175,16 @@ class BenchmarkPlan:
 
 
 @dataclass(frozen=True)
+class InventoryArtifact:
+    """Inventory plus the bootstrap runtime identity that produced its trace."""
+
+    shapes: tuple[ShapeRecord, ...]
+    source_manifest_sha256: str
+    bootstrap_manifest_sha256: str
+    compatibility: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class _GpuRuntimeIdentity:
     device_name: str
     compute_capability: str
@@ -177,7 +201,11 @@ class _ShapeProfile:
         return self._shapes
 
 
-def load_shape_inventory(paths: Sequence[Path]) -> tuple[ShapeRecord, ...]:
+def load_shape_inventory(
+    paths: Sequence[Path],
+    *,
+    expected_config_sha256: str | None = None,
+) -> tuple[ShapeRecord, ...]:
     """Load, validate, and deterministically aggregate trace JSONL files."""
     if not paths:
         raise ValueError("at least one trace input is required")
@@ -214,6 +242,17 @@ def load_shape_inventory(paths: Sequence[Path]) -> tuple[ShapeRecord, ...]:
         raise ValueError("zero eligible dense MXFP8 trace records")
     if len(config_hashes) != 1:
         raise ValueError("all eligible trace records must share one config_sha256")
+    if (
+        expected_config_sha256 is not None
+        and config_hashes != {
+            _require_sha256(
+                expected_config_sha256, "expected bootstrap manifest SHA256"
+            )
+        }
+    ):
+        raise ValueError(
+            "trace config_sha256 does not match bootstrap manifest SHA256"
+        )
     records = [
         ShapeRecord(
             layout=identity[0],
@@ -340,6 +379,24 @@ def qualify_observations(
         ):
             raise ValueError(
                 f"default tactic -1 lacks passing repeats for shape {identity!r}"
+            )
+        repeat_seeds: list[int] = []
+        for repeat in required_repeats:
+            seeds = {
+                observation.seed
+                for (shape_identity, _tactic), repeats in grouped.items()
+                if shape_identity == identity and repeat in repeats
+                for observation in (repeats[repeat],)
+            }
+            if len(seeds) != 1:
+                raise ValueError(
+                    f"shape {identity!r} repeat {repeat} must use one seed "
+                    "across all tactics"
+                )
+            repeat_seeds.append(next(iter(seeds)))
+        if len(set(repeat_seeds)) != minimum_repeat_count:
+            raise ValueError(
+                f"shape {identity!r} required repeats must use distinct seeds"
             )
         default_median = statistics.median(
             cast(float, defaults[repeat].median_ms) for repeat in required_repeats
@@ -512,6 +569,118 @@ def build_tactic_plan(
     )
 
 
+def validate_resume_observations(
+    plans: Sequence[BenchmarkPlan],
+    observations: Sequence[BenchmarkObservation],
+) -> None:
+    """Reject append/resume data generated from another deterministic plan."""
+    expected_seeds = {
+        (plan.shape_identity, plan.repeat): plan.seed for plan in plans
+    }
+    if len(expected_seeds) != len(plans):
+        raise ValueError("benchmark plan contains duplicate shape/repeat identities")
+    seen_seeds: dict[tuple[ShapeIdentity, int], int] = {}
+    for observation in observations:
+        key = (observation.shape_identity, observation.repeat)
+        expected_seed = expected_seeds.get(key)
+        if expected_seed is None or observation.seed != expected_seed:
+            raise ValueError(
+                "existing observation does not match deterministic seed plan: "
+                f"{observation.identity!r}"
+            )
+        previous_seed = seen_seeds.setdefault(key, observation.seed)
+        if previous_seed != observation.seed:
+            raise ValueError(
+                "existing tactics for one shape/repeat do not share a seed"
+            )
+    repeats_by_shape: dict[ShapeIdentity, set[int]] = defaultdict(set)
+    for (shape_identity, _repeat), seed in expected_seeds.items():
+        repeats_by_shape[shape_identity].add(seed)
+    if any(
+        len(seeds) != len(
+            {
+                plan.repeat
+                for plan in plans
+                if plan.shape_identity == shape_identity
+            }
+        )
+        for shape_identity, seeds in repeats_by_shape.items()
+    ):
+        raise ValueError("benchmark plan repeats must use distinct seeds")
+
+
+def enumerate_valid_tactics(
+    runner: object, inputs: list[object], shape_profile: object
+) -> tuple[int, ...]:
+    """Enumerate all private-runner tactics and preserve ABI diagnostics."""
+    get_valid_tactics = getattr(runner, "get_valid_tactics", None)
+    if not callable(get_valid_tactics):
+        raise RuntimeError("TRTLLM runner has no callable get_valid_tactics")
+    try:
+        raw_tactics = cast(
+            Iterable[object],
+            get_valid_tactics(inputs, shape_profile),
+        )
+        tactics = {
+            _require_tactic(tactic, "valid_tactic")
+            for tactic in raw_tactics
+        }
+    except Exception as error:
+        raise RuntimeError(
+            f"TRTLLM get_valid_tactics failed: {error}"
+        ) from error
+    return tuple(sorted(tactic for tactic in tactics if tactic != -1))
+
+
+def validate_active_runtime_identity(
+    *,
+    active_vllm_version: str,
+    active_flashinfer_version: str,
+    active_compute_capability: str,
+    active_device_name: str,
+    declared_vllm_version: str,
+    declared_flashinfer_version: str,
+    inventory_compatibility: Mapping[str, object],
+) -> None:
+    """Bind installed GPU runtime identity to the traced bootstrap manifest."""
+    if active_vllm_version != declared_vllm_version:
+        raise RuntimeError(
+            "active vLLM version does not match --vllm-version"
+        )
+    if active_flashinfer_version != declared_flashinfer_version:
+        raise RuntimeError(
+            "active FlashInfer version does not match --flashinfer-version"
+        )
+    expected_vllm = inventory_compatibility.get("vllm_version")
+    expected_flashinfer = inventory_compatibility.get("flashinfer_version")
+    expected_capability = inventory_compatibility.get("compute_capability")
+    expected_gpu_family = inventory_compatibility.get("gpu_family")
+    if expected_vllm != active_vllm_version:
+        raise RuntimeError(
+            "active vLLM version does not match inventory compatibility"
+        )
+    if expected_flashinfer != active_flashinfer_version:
+        raise RuntimeError(
+            "active FlashInfer version does not match inventory compatibility"
+        )
+    if expected_capability != active_compute_capability:
+        raise RuntimeError(
+            "active compute capability does not match inventory compatibility"
+        )
+    if not isinstance(expected_gpu_family, str) or not expected_gpu_family:
+        raise ValueError("inventory GPU family must be a non-empty string")
+    normalized_family = "".join(
+        character for character in expected_gpu_family.upper() if character.isalnum()
+    )
+    normalized_device = "".join(
+        character for character in active_device_name.upper() if character.isalnum()
+    )
+    if normalized_family not in normalized_device:
+        raise RuntimeError(
+            "active device does not match inventory GPU family"
+        )
+
+
 def digest_input_paths(paths: Sequence[Path]) -> str:
     """Aggregate raw inputs by content digest, independent of paths and order."""
     if not paths:
@@ -530,31 +699,81 @@ def canonical_json_bytes(document: object) -> bytes:
     ).encode()
 
 
+def regenerate_qualified_manifest(
+    *,
+    inventory_path: Path,
+    observation_paths: Sequence[Path],
+    minimum_repeat_count: int,
+    minimum_cosine_similarity: float,
+    minimum_speedup_vs_default: float,
+    qualification_scope: str,
+) -> tuple[dict[str, object], tuple[QualifiedShape, ...]]:
+    """Regenerate the manifest through the same pure promotion data flow."""
+    artifact = _load_inventory_document(inventory_path)
+    observations = load_benchmark_observations(observation_paths)
+    observed_runtime = observations[0]
+    for field, observed in (
+        ("vllm_version", observed_runtime.vllm_version),
+        ("flashinfer_version", observed_runtime.flashinfer_version),
+        ("compute_capability", observed_runtime.compute_capability),
+    ):
+        if artifact.compatibility[field] != observed:
+            raise ValueError(
+                f"observed {field} does not match inventory compatibility"
+            )
+    qualified = qualify_observations(
+        artifact.shapes,
+        observations,
+        minimum_repeat_count=minimum_repeat_count,
+        minimum_cosine_similarity=minimum_cosine_similarity,
+        minimum_speedup_vs_default=minimum_speedup_vs_default,
+    )
+    provenance: dict[str, object] = {
+        "source_manifest_sha256": artifact.source_manifest_sha256,
+        "source_hint_sha256": digest_input_paths(observation_paths),
+        "container_sha256": observations[0].container_sha256,
+        "qualification_scope": _require_nonempty_string(
+            qualification_scope, "qualification_scope"
+        ),
+        "qualification_repeat_count": minimum_repeat_count,
+        "minimum_cosine_similarity": minimum_cosine_similarity,
+        "minimum_speedup_vs_default": minimum_speedup_vs_default,
+    }
+    return (
+        build_qualified_manifest(
+            qualified,
+            compatibility=artifact.compatibility,
+            provenance=provenance,
+        ),
+        qualified,
+    )
+
+
 def validate_manifest(
     path: Path,
     *,
+    inventory_path: Path,
+    observation_paths: Sequence[Path],
+    minimum_repeat_count: int,
+    minimum_cosine_similarity: float,
+    minimum_speedup_vs_default: float,
+    qualification_scope: str,
     actual_vllm_version: str,
     actual_flashinfer_version: str,
     actual_compute_capability: tuple[int, int],
     actual_model: str,
     actual_tensor_parallel_size: int,
-    expected_source_manifest_sha256: str,
-    expected_source_hint_sha256: str,
     check: bool,
 ) -> object:
-    """Validate exact compatibility, provenance, and deterministic bytes."""
-    document = _read_json_document(path)
-    provenance = document.get("provenance")
-    if not isinstance(provenance, dict):
-        raise ValueError("manifest provenance must be an object")
-    for key, expected in (
-        ("source_manifest_sha256", expected_source_manifest_sha256),
-        ("source_hint_sha256", expected_source_hint_sha256),
-    ):
-        _require_sha256(expected, f"expected_{key}")
-        if provenance.get(key) != expected:
-            raise ValueError(f"manifest provenance.{key} does not match raw inputs")
-
+    """Validate compatibility and optionally byte-check raw regeneration."""
+    regenerated, _qualified = regenerate_qualified_manifest(
+        inventory_path=inventory_path,
+        observation_paths=observation_paths,
+        minimum_repeat_count=minimum_repeat_count,
+        minimum_cosine_similarity=minimum_cosine_similarity,
+        minimum_speedup_vs_default=minimum_speedup_vs_default,
+        qualification_scope=qualification_scope,
+    )
     loader = _load_production_loader()
     runtime_config = loader(
         str(path),
@@ -564,8 +783,10 @@ def validate_manifest(
         actual_model=actual_model,
         actual_tensor_parallel_size=actual_tensor_parallel_size,
     )
-    if check and path.read_bytes() != canonical_json_bytes(document):
-        raise ValueError("manifest bytes are not canonical deterministic JSON")
+    if check and path.read_bytes() != canonical_json_bytes(regenerated):
+        raise ValueError(
+            "manifest bytes differ from regenerated raw qualification inputs"
+        )
     return runtime_config
 
 
@@ -678,6 +899,19 @@ def _parse_observation(
         container_sha256=_require_sha256(
             document["container_sha256"], f"{field}.container_sha256"
         ),
+        num_valid_tactics=(
+            _require_nonnegative_int(
+                document["num_valid_tactics"],
+                f"{field}.num_valid_tactics",
+            )
+            if document.get("num_valid_tactics") is not None
+            else None
+        ),
+        error=(
+            _require_nonempty_string(document["error"], f"{field}.error")
+            if document.get("error") is not None
+            else None
+        ),
     )
     _validate_observation(observation, field)
     return observation
@@ -705,6 +939,12 @@ def _validate_observation(
     ):
         _require_nonempty_string(getattr(observation, name), f"{field}.{name}")
     _require_sha256(observation.container_sha256, f"{field}.container_sha256")
+    if observation.num_valid_tactics is not None:
+        _require_nonnegative_int(
+            observation.num_valid_tactics, f"{field}.num_valid_tactics"
+        )
+    if observation.error is not None:
+        _require_nonempty_string(observation.error, f"{field}.error")
     if observation.median_ms is not None:
         _require_positive_float(observation.median_ms, f"{field}.median_ms")
     if observation.cosine_similarity is not None:
@@ -888,24 +1128,31 @@ def _observation_sort_key(
 
 
 def _inventory_document(
-    inventory: Sequence[ShapeRecord], source_manifest_sha256: str
+    inventory: Sequence[ShapeRecord],
+    source_manifest_sha256: str,
+    bootstrap_manifest_sha256: str,
+    compatibility: Mapping[str, object],
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
         "source_manifest_sha256": _require_sha256(
             source_manifest_sha256, "source_manifest_sha256"
         ),
+        "bootstrap_manifest_sha256": _require_sha256(
+            bootstrap_manifest_sha256, "bootstrap_manifest_sha256"
+        ),
+        "compatibility": _validate_compatibility_mapping(compatibility),
         "shapes": [asdict(record) for record in sorted(inventory, key=_shape_sort_key)],
     }
 
 
-def _load_inventory_document(
-    path: Path,
-) -> tuple[tuple[ShapeRecord, ...], str]:
+def _load_inventory_document(path: Path) -> InventoryArtifact:
     document = _read_json_document(path)
     if set(document) != {
         "schema_version",
         "source_manifest_sha256",
+        "bootstrap_manifest_sha256",
+        "compatibility",
         "shapes",
     }:
         raise ValueError("inventory document has unsupported fields")
@@ -916,6 +1163,14 @@ def _load_inventory_document(
     source_sha256 = _require_sha256(
         document["source_manifest_sha256"], "inventory.source_manifest_sha256"
     )
+    bootstrap_sha256 = _require_sha256(
+        document["bootstrap_manifest_sha256"],
+        "inventory.bootstrap_manifest_sha256",
+    )
+    raw_compatibility = document["compatibility"]
+    if not isinstance(raw_compatibility, dict):
+        raise ValueError("inventory.compatibility must be an object")
+    compatibility = _validate_compatibility_mapping(raw_compatibility)
     raw_shapes = document["shapes"]
     if not isinstance(raw_shapes, list):
         raise ValueError("inventory.shapes must be an array")
@@ -960,7 +1215,73 @@ def _load_inventory_document(
         raise ValueError("inventory contains duplicate shape identities")
     if len({record.config_sha256 for record in sorted_records}) != 1:
         raise ValueError("inventory shapes have mixed config_sha256")
-    return sorted_records, source_sha256
+    if {record.config_sha256 for record in sorted_records} != {
+        bootstrap_sha256
+    }:
+        raise ValueError(
+            "inventory shapes do not match bootstrap manifest SHA256"
+        )
+    return InventoryArtifact(
+        shapes=sorted_records,
+        source_manifest_sha256=source_sha256,
+        bootstrap_manifest_sha256=bootstrap_sha256,
+        compatibility=MappingProxyType(compatibility),
+    )
+
+
+def _validate_compatibility_mapping(
+    compatibility: Mapping[str, object],
+) -> dict[str, object]:
+    if set(compatibility) != _COMPATIBILITY_FIELDS:
+        raise ValueError("compatibility has unsupported fields")
+    result = dict(compatibility)
+    for key in (
+        "vllm_version",
+        "vllm_base_commit",
+        "flashinfer_version",
+        "compute_capability",
+        "gpu_family",
+        "model",
+    ):
+        _require_nonempty_string(result[key], f"compatibility.{key}")
+    _require_positive_int(
+        result["tensor_parallel_size"],
+        "compatibility.tensor_parallel_size",
+    )
+    _parse_compute_capability(
+        cast(str, result["compute_capability"])
+    )
+    return result
+
+
+def _load_bootstrap_runtime_manifest(
+    path: Path,
+) -> tuple[str, dict[str, object]]:
+    document = _read_json_document(path)
+    raw_compatibility = document.get("compatibility")
+    if not isinstance(raw_compatibility, dict):
+        raise ValueError("bootstrap manifest compatibility must be an object")
+    compatibility = _validate_compatibility_mapping(raw_compatibility)
+    compute_capability = _parse_compute_capability(
+        cast(str, compatibility["compute_capability"])
+    )
+    loader = _load_production_loader()
+    runtime_config = loader(
+        str(path),
+        actual_vllm_version=cast(str, compatibility["vllm_version"]),
+        actual_flashinfer_version=cast(
+            str, compatibility["flashinfer_version"]
+        ),
+        actual_compute_capability=compute_capability,
+        actual_model=cast(str, compatibility["model"]),
+        actual_tensor_parallel_size=cast(
+            int, compatibility["tensor_parallel_size"]
+        ),
+    )
+    source_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if runtime_config.source_sha256 != source_sha256:
+        raise RuntimeError("bootstrap manifest SHA256 changed while loading")
+    return source_sha256, compatibility
 
 
 def _load_production_loader() -> Any:
@@ -983,8 +1304,11 @@ def _import_gpu_dependencies() -> tuple[Any, ...]:
     try:
         torch = importlib.import_module("torch")
         flashinfer = importlib.import_module("flashinfer")
+        active_vllm = importlib.import_module("vllm")
     except ImportError as error:
-        raise RuntimeError("GPU shmoo requires PyTorch and FlashInfer") from error
+        raise RuntimeError(
+            "GPU shmoo requires PyTorch, FlashInfer, and vLLM"
+        ) from error
     if not torch.cuda.is_available():
         raise RuntimeError("GPU shmoo requires CUDA")
 
@@ -1015,6 +1339,7 @@ def _import_gpu_dependencies() -> tuple[Any, ...]:
     return (
         torch,
         flashinfer,
+        active_vllm,
         mm_mxfp8,
         mxfp8_quantize,
         shuffle_matrix_a,
@@ -1135,6 +1460,8 @@ def _error_observation(
     *,
     warmup: int,
     iterations: int,
+    num_valid_tactics: int,
+    error: Exception,
 ) -> BenchmarkObservation:
     return BenchmarkObservation(
         layout=plan.layout,
@@ -1156,6 +1483,8 @@ def _error_observation(
         vllm_version=runtime.vllm_version,
         flashinfer_version=runtime.flashinfer_version,
         container_sha256=runtime.container_sha256,
+        num_valid_tactics=num_valid_tactics,
+        error=str(error)[:1000] or error.__class__.__name__,
     )
 
 
@@ -1172,6 +1501,7 @@ def _benchmark_shape_repeat(
     (
         torch,
         _flashinfer,
+        _active_vllm,
         _mm_mxfp8,
         mxfp8_quantize,
         shuffle_matrix_a,
@@ -1212,21 +1542,14 @@ def _benchmark_shape_repeat(
         output,
         workspace,
     ]
-    try:
-        valid_tactics = sorted(
-            set(
-                int(tactic)
-                for tactic in runner.get_valid_tactics(
-                    inputs,
-                    _ShapeProfile(
-                        tuple(a_mxfp8.shape), tuple(weight_mxfp8_t.shape)
-                    ),
-                )
-                if int(tactic) != -1
-            )
-        )
-    except Exception:
-        valid_tactics = []
+    valid_tactics = enumerate_valid_tactics(
+        runner,
+        inputs,
+        _ShapeProfile(
+            tuple(a_mxfp8.shape), tuple(weight_mxfp8_t.shape)
+        ),
+    )
+    num_valid_tactics = len(valid_tactics)
 
     observations: list[BenchmarkObservation] = []
     for tactic in build_tactic_plan(
@@ -1262,6 +1585,7 @@ def _benchmark_shape_repeat(
                     vllm_version=runtime.vllm_version,
                     flashinfer_version=runtime.flashinfer_version,
                     container_sha256=runtime.container_sha256,
+                    num_valid_tactics=num_valid_tactics,
                 )
             else:
                 median_ms = _time_cuda(
@@ -1292,14 +1616,17 @@ def _benchmark_shape_repeat(
                     vllm_version=runtime.vllm_version,
                     flashinfer_version=runtime.flashinfer_version,
                     container_sha256=runtime.container_sha256,
+                    num_valid_tactics=num_valid_tactics,
                 )
-        except Exception:
+        except Exception as error:
             observation = _error_observation(
                 plan,
                 tactic,
                 runtime,
                 warmup=warmup,
                 iterations=iterations,
+                num_valid_tactics=num_valid_tactics,
+                error=error,
             )
         observations.append(observation)
     return tuple(observations)
@@ -1315,22 +1642,71 @@ def _write_observation(path: Path, observation: BenchmarkObservation) -> None:
         stream.flush()
 
 
+def _reject_path_collisions(
+    named_paths: Sequence[tuple[str, Path]],
+) -> None:
+    seen: dict[Path, str] = {}
+    for name, path in named_paths:
+        resolved = path.resolve()
+        previous = seen.get(resolved)
+        if previous is not None:
+            raise ValueError(
+                f"path collision between {previous} and {name}: {resolved}"
+            )
+        seen[resolved] = name
+
+
+def _require_new_output(path: Path, field: str) -> None:
+    if path.exists() or path.is_symlink():
+        raise ValueError(f"{field} already exists: {path.resolve()}")
+
+
 def _run_inventory(args: argparse.Namespace) -> int:
     trace_paths = tuple(args.trace)
-    inventory = load_shape_inventory(trace_paths)
+    _reject_path_collisions(
+        [
+            ("bootstrap manifest", args.bootstrap_manifest),
+            *((f"trace[{index}]", path) for index, path in enumerate(trace_paths)),
+            ("inventory output", args.output),
+        ]
+    )
+    _require_new_output(args.output, "inventory output")
+    bootstrap_sha256, compatibility = _load_bootstrap_runtime_manifest(
+        args.bootstrap_manifest
+    )
+    inventory = load_shape_inventory(
+        trace_paths, expected_config_sha256=bootstrap_sha256
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(
         canonical_json_bytes(
-            _inventory_document(inventory, digest_input_paths(trace_paths))
+            _inventory_document(
+                inventory,
+                digest_input_paths(trace_paths),
+                bootstrap_sha256,
+                compatibility,
+            )
         )
     )
     return 0
 
 
 def _run_shmoo(args: argparse.Namespace) -> int:
-    inventory, _source_sha256 = _load_inventory_document(args.inventory)
-    if args.workspace_mb <= 0:
-        raise ValueError("--workspace-mb must be positive")
+    _reject_path_collisions(
+        [
+            ("inventory input", args.inventory),
+            ("shmoo output", args.output),
+        ]
+    )
+    artifact = _load_inventory_document(args.inventory)
+    plans = build_benchmark_plan(
+        artifact.shapes,
+        repeat_count=args.repeat_count,
+        base_seed=args.base_seed,
+    )
+    _require_nonnegative_int(args.warmup, "--warmup")
+    _require_positive_int(args.iterations, "--iterations")
+    _require_positive_int(args.workspace_mb, "--workspace-mb")
     _require_finite_range(
         args.minimum_cosine_similarity,
         "--minimum-cosine-similarity",
@@ -1339,9 +1715,22 @@ def _run_shmoo(args: argparse.Namespace) -> int:
         minimum_inclusive=False,
     )
     _require_sha256(args.container_sha256, "--container-sha256")
+    _require_nonempty_string(args.vllm_version, "--vllm-version")
+    _require_nonempty_string(
+        args.flashinfer_version, "--flashinfer-version"
+    )
+    if args.output.exists() and args.output.is_dir():
+        raise ValueError("--output must be a JSONL file, not a directory")
+
+    existing: tuple[BenchmarkObservation, ...] = ()
+    if args.output.exists() and args.output.stat().st_size:
+        existing = load_benchmark_observations([args.output])
+        validate_resume_observations(plans, existing)
+
     (
         torch,
         flashinfer,
+        active_vllm,
         _mm_mxfp8,
         _mxfp8_quantize,
         _shuffle_matrix_a,
@@ -1349,25 +1738,33 @@ def _run_shmoo(args: argparse.Namespace) -> int:
         _get_trtllm_gemm_module,
     ) = _import_gpu_dependencies()
     major, minor = torch.cuda.get_device_capability()
+    active_vllm_version = str(
+        getattr(active_vllm, "__version__", "")
+    )
+    active_flashinfer_version = str(
+        getattr(flashinfer, "__version__", "")
+    )
+    active_device_name = str(torch.cuda.get_device_name())
+    active_compute_capability = f"{major}.{minor}"
+    validate_active_runtime_identity(
+        active_vllm_version=active_vllm_version,
+        active_flashinfer_version=active_flashinfer_version,
+        active_compute_capability=active_compute_capability,
+        active_device_name=active_device_name,
+        declared_vllm_version=args.vllm_version,
+        declared_flashinfer_version=args.flashinfer_version,
+        inventory_compatibility=artifact.compatibility,
+    )
     runtime = _GpuRuntimeIdentity(
-        device_name=str(torch.cuda.get_device_name()),
-        compute_capability=f"{major}.{minor}",
-        vllm_version=args.vllm_version,
-        flashinfer_version=str(
-            getattr(flashinfer, "__version__", args.flashinfer_version)
-        ),
+        device_name=active_device_name,
+        compute_capability=active_compute_capability,
+        vllm_version=active_vllm_version,
+        flashinfer_version=active_flashinfer_version,
         container_sha256=args.container_sha256,
     )
-    if runtime.flashinfer_version != args.flashinfer_version:
-        raise RuntimeError(
-            "active FlashInfer version does not match --flashinfer-version"
-        )
 
-    existing: tuple[BenchmarkObservation, ...] = ()
-    if args.output.exists() and args.output.stat().st_size:
-        existing = load_benchmark_observations([args.output])
-        if existing and existing[0].runtime_identity != (
-            inventory[0].config_sha256,
+    if existing and existing[0].runtime_identity != (
+            artifact.shapes[0].config_sha256,
             runtime.device_name,
             runtime.compute_capability,
             runtime.vllm_version,
@@ -1375,16 +1772,12 @@ def _run_shmoo(args: argparse.Namespace) -> int:
             runtime.container_sha256,
             args.warmup,
             args.iterations,
-        ):
-            raise RuntimeError(
-                "existing shmoo output has incompatible runtime identity"
-            )
-    completed = {observation.identity for observation in existing}
-    for plan in build_benchmark_plan(
-        inventory,
-        repeat_count=args.repeat_count,
-        base_seed=args.base_seed,
     ):
+        raise RuntimeError(
+            "existing shmoo output has incompatible runtime identity"
+        )
+    completed = {observation.identity for observation in existing}
+    for plan in plans:
         for observation in _benchmark_shape_repeat(
             plan,
             runtime=runtime,
@@ -1412,44 +1805,44 @@ def _compatibility_from_args(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _run_promote(args: argparse.Namespace) -> int:
-    inventory, source_manifest_sha256 = _load_inventory_document(
-        args.inventory
-    )
-    observations = load_benchmark_observations(tuple(args.observations))
-    observed_runtime = observations[0]
-    if observed_runtime.vllm_version != args.vllm_version:
-        raise ValueError(
-            "observed vLLM version does not match manifest compatibility"
+    observation_paths = tuple(args.observations)
+    named_paths: list[tuple[str, Path]] = [
+        ("inventory input", args.inventory),
+        *(
+            (f"observation[{index}]", path)
+            for index, path in enumerate(observation_paths)
+        ),
+        ("manifest output", args.output),
+    ]
+    if args.qualification_output is not None:
+        named_paths.append(
+            ("qualification output", args.qualification_output)
         )
-    if observed_runtime.flashinfer_version != args.flashinfer_version:
-        raise ValueError(
-            "observed FlashInfer version does not match manifest compatibility"
+    _reject_path_collisions(named_paths)
+    _require_new_output(args.output, "manifest output")
+    if args.qualification_output is not None:
+        _require_new_output(
+            args.qualification_output, "qualification output"
         )
-    if observed_runtime.compute_capability != args.compute_capability:
-        raise ValueError(
-            "observed compute capability does not match manifest compatibility"
-        )
-    qualified = qualify_observations(
-        inventory,
-        observations,
+
+    artifact = _load_inventory_document(args.inventory)
+    declared_compatibility = _compatibility_from_args(args)
+    for field, declared in declared_compatibility.items():
+        if artifact.compatibility[field] != declared:
+            display = {
+                "vllm_version": "observed vLLM version",
+                "flashinfer_version": "observed FlashInfer version",
+            }.get(field, f"declared {field}")
+            raise ValueError(
+                f"{display} does not match traced inventory compatibility"
+            )
+    manifest, qualified = regenerate_qualified_manifest(
+        inventory_path=args.inventory,
+        observation_paths=observation_paths,
         minimum_repeat_count=args.repeat_count,
         minimum_cosine_similarity=args.minimum_cosine_similarity,
         minimum_speedup_vs_default=args.minimum_speedup_vs_default,
-    )
-    source_hint_sha256 = digest_input_paths(tuple(args.observations))
-    provenance: dict[str, object] = {
-        "source_manifest_sha256": source_manifest_sha256,
-        "source_hint_sha256": source_hint_sha256,
-        "container_sha256": observations[0].container_sha256,
-        "qualification_scope": args.qualification_scope,
-        "qualification_repeat_count": args.repeat_count,
-        "minimum_cosine_similarity": args.minimum_cosine_similarity,
-        "minimum_speedup_vs_default": args.minimum_speedup_vs_default,
-    }
-    manifest = build_qualified_manifest(
-        qualified,
-        compatibility=_compatibility_from_args(args),
-        provenance=provenance,
+        qualification_scope=args.qualification_scope,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(canonical_json_bytes(manifest))
@@ -1469,8 +1862,25 @@ def _run_promote(args: argparse.Namespace) -> int:
 
 
 def _run_validate(args: argparse.Namespace) -> int:
+    observation_paths = tuple(args.observations)
+    _reject_path_collisions(
+        [
+            ("manifest input", args.manifest),
+            ("inventory input", args.inventory),
+            *(
+                (f"observation[{index}]", path)
+                for index, path in enumerate(observation_paths)
+            ),
+        ]
+    )
     validate_manifest(
         args.manifest,
+        inventory_path=args.inventory,
+        observation_paths=observation_paths,
+        minimum_repeat_count=args.repeat_count,
+        minimum_cosine_similarity=args.minimum_cosine_similarity,
+        minimum_speedup_vs_default=args.minimum_speedup_vs_default,
+        qualification_scope=args.qualification_scope,
         actual_vllm_version=args.vllm_version,
         actual_flashinfer_version=args.flashinfer_version,
         actual_compute_capability=_parse_compute_capability(
@@ -1478,8 +1888,6 @@ def _run_validate(args: argparse.Namespace) -> int:
         ),
         actual_model=args.model,
         actual_tensor_parallel_size=args.tensor_parallel_size,
-        expected_source_manifest_sha256=args.source_manifest_sha256,
-        expected_source_hint_sha256=args.source_hint_sha256,
         check=args.check,
     )
     return 0
@@ -1514,6 +1922,7 @@ def _parser() -> argparse.ArgumentParser:
         "inventory", help="aggregate exact physical shapes from trace JSONL"
     )
     inventory.add_argument("--trace", type=Path, action="append", required=True)
+    inventory.add_argument("--bootstrap-manifest", type=Path, required=True)
     inventory.add_argument("--output", type=Path, required=True)
     inventory.set_defaults(handler=_run_inventory)
 
@@ -1557,13 +1966,23 @@ def _parser() -> argparse.ArgumentParser:
         "validate", help="load a manifest and check deterministic bytes"
     )
     validate.add_argument("--manifest", type=Path, required=True)
+    validate.add_argument("--inventory", type=Path, required=True)
+    validate.add_argument(
+        "--observations", type=Path, action="append", required=True
+    )
+    validate.add_argument("--repeat-count", type=int, default=3)
+    validate.add_argument(
+        "--minimum-cosine-similarity", type=float, default=0.999
+    )
+    validate.add_argument(
+        "--minimum-speedup-vs-default", type=float, default=1.02
+    )
+    validate.add_argument("--qualification-scope", required=True)
     validate.add_argument("--vllm-version", required=True)
     validate.add_argument("--flashinfer-version", required=True)
     validate.add_argument("--compute-capability", required=True)
     validate.add_argument("--model", required=True)
     validate.add_argument("--tensor-parallel-size", type=int, required=True)
-    validate.add_argument("--source-manifest-sha256", required=True)
-    validate.add_argument("--source-hint-sha256", required=True)
     validate.add_argument("--check", action="store_true")
     validate.set_defaults(handler=_run_validate)
     return parser

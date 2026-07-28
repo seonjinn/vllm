@@ -81,6 +81,7 @@ def _mxfp8_dense_shape_trace(
     n_logical: int,
     n_physical: int,
     k: int,
+    layout: str,
     backend: str,
     input_shape: torch.Size,
     weight_shape: torch.Size,
@@ -105,6 +106,7 @@ def _mxfp8_dense_shape_trace(
         n_logical,
         n_physical,
         k,
+        layout,
         backend,
         config_sha256,
     )
@@ -135,6 +137,7 @@ def _mxfp8_dense_shape_trace(
         "n_logical": int(n_logical),
         "n_physical": int(n_physical),
         "k": int(k),
+        "layout": layout,
         "backend": backend,
         "input_shape": list(input_shape),
         "weight_shape": list(weight_shape),
@@ -392,29 +395,31 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         if pad_rows > 0:
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
-        _mxfp8_dense_shape_trace(
-            layer=layer,
-            family=_mxfp8_dense_family(layer),
-            m_logical=M_orig,
-            m_physical=M_padded,
-            n_logical=output_features,
-            n_physical=N,
-            k=K,
-            backend=backend,
-            input_shape=input_shape,
-            weight_shape=weight.shape,
-            config_sha256=(
-                prepared_configuration.config_sha256
-                if prepared_configuration is not None
-                else None
-            ),
-        )
+        is_compiling = _mxfp8_dense_is_compiling()
+        use_8x4_sf_layout = None
+        if not is_compiling:
+            use_8x4_sf_layout = mxfp8_dense_use_8x4_sf_layout(M_padded)
+            _mxfp8_dense_shape_trace(
+                layer=layer,
+                family=_mxfp8_dense_family(layer),
+                m_logical=M_orig,
+                m_physical=M_padded,
+                n_logical=output_features,
+                n_physical=N,
+                k=K,
+                layout="8x4" if use_8x4_sf_layout else "128x4",
+                backend=backend,
+                input_shape=input_shape,
+                weight_shape=weight.shape,
+                config_sha256=(
+                    prepared_configuration.config_sha256
+                    if prepared_configuration is not None
+                    else None
+                ),
+            )
 
         if not weight.is_contiguous():
             weight = weight.contiguous()
-
-        is_compiling = _mxfp8_dense_is_compiling()
-        use_8x4_sf_layout = None
 
         sync_nvtx = False
         nvtx_enabled = False
@@ -448,7 +453,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
                     layer._mxfp8_trtllm_workspace_128x4,
                 )
             else:
-                use_8x4_sf_layout = mxfp8_dense_use_8x4_sf_layout(M_padded)
+                assert use_8x4_sf_layout is not None
                 input_mxfp8, input_scale = mxfp8_e4m3_quantize(
                     input_2d,
                     is_sf_swizzled_layout=True,
