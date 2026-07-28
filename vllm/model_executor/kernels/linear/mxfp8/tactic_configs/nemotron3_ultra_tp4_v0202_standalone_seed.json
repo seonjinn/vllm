@@ -3,7 +3,7 @@
     "compute_capability": "10.0",
     "flashinfer_version": "0.6.8.post1",
     "gpu_family": "GB200",
-    "model": "Nemotron 3 Ultra MXFP8",
+    "model": "/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8",
     "tensor_parallel_size": 4,
     "vllm_base_commit": "5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1",
     "vllm_version": "0.20.2"

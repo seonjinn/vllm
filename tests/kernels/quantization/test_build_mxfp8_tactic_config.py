@@ -144,6 +144,10 @@ def test_checked_in_low_m_seed_keys_remain_reachable() -> None:
     tactics = seed["tactics"]["8x4"]
 
     assert len(tactics) == 63
+    assert seed["compatibility"]["model"] == (
+        "/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/"
+        "ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8"
+    )
     assert seed["policy"]["pad_to_128"] is False
     assert {entry["m"] for entry in tactics} == {1, 2, 4, 6, 7, 8, 15, 23, 32}
 

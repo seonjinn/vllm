@@ -191,6 +191,55 @@ def _load_trtllm_runtime_freeze_contract(
     return namespace["get_mxfp8_trtllm_configuration"]  # type: ignore[return-value]
 
 
+def _load_post_freeze_validation_contract() -> dict[str, object]:
+    tree = ast.parse(FLASHINFER_UTILS.read_text(encoding="utf-8"))
+    names = {
+        "_Mxfp8TrtllmConfigurationFingerprint",
+        "_parse_mxfp8_tactic_hints",
+        "_mxfp8_trtllm_configuration_fingerprint",
+        "_validate_mxfp8_trtllm_configuration",
+        "validate_mxfp8_trtllm_configuration",
+    }
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
+    ]
+    assert {node.name for node in selected} == names
+    namespace: dict[str, object] = {
+        "functools": functools,
+        "_load_mxfp8_dense_runtime_config": (
+            lambda reference, *, actual_model, actual_tensor_parallel_size: (
+                _TACTIC_CONFIG_MODULE.load_mxfp8_dense_runtime_config(
+                    reference,
+                    actual_vllm_version="0.20.2+local",
+                    actual_flashinfer_version="0.6.8.post1+cu129",
+                    actual_compute_capability=(10, 0),
+                    actual_model=actual_model,
+                    actual_tensor_parallel_size=actual_tensor_parallel_size,
+                )
+            )
+        ),
+        "_active_mxfp8_model_and_tp": lambda: (
+            "Nemotron 3 Ultra MXFP8",
+            4,
+        ),
+        "NamedTuple": NamedTuple,
+        "os": os,
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
+        ),
+        "_MXFP8_TRTLLM_CONFIGURATION": None,
+    }
+    exec(
+        compile(
+            ast.Module(body=selected, type_ignores=[]), str(FLASHINFER_UTILS), "exec"
+        ),
+        namespace,
+    )
+    return namespace
+
+
 def _function_source(path: Path, name: str) -> str:
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -836,6 +885,8 @@ def test_adaptive_fingerprint_covers_every_direct_execution_input() -> None:
     }
 
     assert {
+        "model",
+        "tensor_parallel_size",
         "layout_mode",
         "switch_m",
         "gemm_backend",
@@ -952,6 +1003,8 @@ def test_config_file_fingerprint_freezes_resolved_path_sha_and_complete_policy(
     assert fingerprint.config_sha256 == hashlib.sha256(
         config_path.read_bytes()
     ).hexdigest()
+    assert fingerprint.model == "Nemotron 3 Ultra MXFP8"
+    assert fingerprint.tensor_parallel_size == 4
     assert fingerprint.layout_mode == "adaptive"
     assert fingerprint.switch_m == 256
     assert fingerprint.gemm_backend == "trtllm"
@@ -992,6 +1045,20 @@ def test_config_file_rejects_simultaneous_inline_tactics(
         current_fingerprint()
 
 
+def test_config_file_runtime_rejects_non_minus_one_default_tactic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manifest = _runtime_manifest()
+    manifest["policy"]["default_tactic"] = 7
+    config_path = tmp_path / "invalid-default.json"
+    config_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(config_path))
+    _, current_fingerprint, _ = _load_trtllm_configuration_contract()
+
+    with pytest.raises(ValueError, match="policy.default_tactic"):
+        current_fingerprint()
+
+
 def test_config_file_byte_mutation_fails_frozen_fingerprint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1008,6 +1075,39 @@ def test_config_file_byte_mutation_fails_frozen_fingerprint(
     assert active.config_sha256 != prepared.config_sha256
     with pytest.raises(RuntimeError, match="configuration changed after preparation"):
         validate(prepared, active)
+
+
+def test_post_freeze_validation_reuses_workload_identity_and_detects_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "qualified.json"
+    manifest = _runtime_manifest()
+    config_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(config_path))
+    namespace = _load_post_freeze_validation_contract()
+    current_fingerprint = namespace["_mxfp8_trtllm_configuration_fingerprint"]
+    validate = namespace["validate_mxfp8_trtllm_configuration"]
+    prepared = current_fingerprint()  # type: ignore[operator]
+    namespace["_MXFP8_TRTLLM_CONFIGURATION"] = prepared
+    namespace["_active_mxfp8_model_and_tp"] = lambda: pytest.fail(
+        "post-freeze validation queried initialization-only VllmConfig"
+    )
+
+    validate(prepared)  # type: ignore[operator]
+
+    monkeypatch.setenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS",
+        "1,2048,8192:66",
+    )
+    with pytest.raises(
+        ValueError, match="VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS"
+    ):
+        validate(prepared)  # type: ignore[operator]
+
+    monkeypatch.delenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS")
+    config_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="configuration changed after preparation"):
+        validate(prepared)  # type: ignore[operator]
 
 
 def test_config_file_logs_startup_provenance_once(
@@ -1089,8 +1189,9 @@ def test_compilation_configuration_validates_active_environment() -> None:
 
     assert "_Mxfp8TrtllmConfigurationFingerprint" in source
     assert configure.index(
-        "_mxfp8_trtllm_configuration_fingerprint()"
+        "_mxfp8_trtllm_configuration_fingerprint("
     ) < configure.index("compilation_config.inductor_compile_config")
+    assert "_MXFP8_TRTLLM_CONFIGURATION" in configure
     assert "_validate_mxfp8_trtllm_configuration(" in configure
 
 
@@ -1122,6 +1223,9 @@ def test_adaptive_dispatch_trace_records_layout_tactic_and_lookup_source(
         "Path": Path,
         "socket": socket,
         "time": time,
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
+        ),
         "_MXFP8_ADAPTIVE_DISPATCH_TRACE_SEEN": set(),
     }
     exec(trace_source, namespace)
@@ -1161,6 +1265,36 @@ def test_adaptive_dispatch_trace_records_layout_tactic_and_lookup_source(
         "tactic_source": "static_hint",
         "time": None,
     }
+
+
+def test_adaptive_dispatch_trace_performs_no_io_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace_source = _function_source(
+        FLASHINFER_UTILS, "_trace_mxfp8_adaptive_dispatch"
+    )
+    namespace: dict[str, object] = {
+        "json": json,
+        "os": os,
+        "Path": lambda _path: pytest.fail("capture trace attempted filesystem I/O"),
+        "socket": socket,
+        "time": time,
+        "torch": SimpleNamespace(
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: True)
+        ),
+        "_MXFP8_ADAPTIVE_DISPATCH_TRACE_SEEN": set(),
+    }
+    exec(trace_source, namespace)
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE", "1")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", "/capture-forbidden")
+
+    namespace["_trace_mxfp8_adaptive_dispatch"](  # type: ignore[operator]
+        shape_key=(32, 8192, 2048),
+        use_8x4_sf_layout=True,
+        tactic=71,
+        tactic_hit=True,
+        config_sha256="f" * 64,
+    )
 
 
 def test_dense_shape_trace_records_frozen_config_sha256(

@@ -160,6 +160,10 @@ def test_loads_relative_manifest_only_from_injected_config_directory(
             ),
             "policy.require_direct_trtllm",
         ),
+        (
+            lambda data: data["policy"].__setitem__("default_tactic", 7),
+            "policy.default_tactic",
+        ),
         (lambda data: data["policy"].__setitem__("switch_m", 0), "policy.switch_m"),
         (lambda data: data["policy"].__setitem__("switch_m", 129), "policy.switch_m"),
         (

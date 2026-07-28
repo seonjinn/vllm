@@ -310,6 +310,8 @@ def _validate_policy(policy: Mapping[str, object]) -> _ValidatedPolicy:
     }:
         raise ValueError("policy.quant_backend must be 'cuda' or 'flashinfer'")
     _require_integer(policy, "default_tactic", "policy.default_tactic")
+    if policy["default_tactic"] != -1:
+        raise ValueError("policy.default_tactic must be -1")
     return _ValidatedPolicy(
         switch_m=switch_m,
         gemm_backend="trtllm",

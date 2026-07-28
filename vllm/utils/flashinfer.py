@@ -52,6 +52,8 @@ def _trace_mxfp8_adaptive_dispatch(
     raw_enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "")
     if raw_enabled.strip().lower() in ("", "0", "false", "no", "off"):
         return
+    if torch.cuda.is_current_stream_capturing():
+        return
     trace_dir = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", "").strip()
     if not trace_dir:
         return
@@ -112,6 +114,8 @@ class _Mxfp8TrtllmConfigurationFingerprint(NamedTuple):
     config_path: str
     config_sha256: str
     qualification_scope: str
+    model: str
+    tensor_parallel_size: int
     layout_mode: str
     switch_m: int
     gemm_backend: str
@@ -159,7 +163,9 @@ def _load_mxfp8_dense_runtime_config(
     )
 
 
-def _mxfp8_trtllm_configuration_fingerprint() -> _Mxfp8TrtllmConfigurationFingerprint:
+def _mxfp8_trtllm_configuration_fingerprint(
+    prepared: _Mxfp8TrtllmConfigurationFingerprint | None = None,
+) -> _Mxfp8TrtllmConfigurationFingerprint:
     def env_flag(name: str, default: bool = False) -> bool:
         raw = os.environ.get(name)
         if raw is None:
@@ -185,7 +191,13 @@ def _mxfp8_trtllm_configuration_fingerprint() -> _Mxfp8TrtllmConfigurationFinger
                 raise ValueError(
                     f"{variable} cannot be set with VLLM_MXFP8_DENSE_CONFIG_FILE"
                 )
-        actual_model, actual_tensor_parallel_size = _active_mxfp8_model_and_tp()
+        if prepared is None:
+            actual_model, actual_tensor_parallel_size = (
+                _active_mxfp8_model_and_tp()
+            )
+        else:
+            actual_model = prepared.model
+            actual_tensor_parallel_size = prepared.tensor_parallel_size
         runtime_config = _load_mxfp8_dense_runtime_config(
             config_reference,
             actual_model=actual_model,
@@ -197,6 +209,8 @@ def _mxfp8_trtllm_configuration_fingerprint() -> _Mxfp8TrtllmConfigurationFinger
             qualification_scope=str(
                 runtime_config.provenance["qualification_scope"]
             ),
+            model=actual_model,
+            tensor_parallel_size=actual_tensor_parallel_size,
             layout_mode=runtime_config.layout,
             switch_m=runtime_config.switch_m,
             gemm_backend=runtime_config.gemm_backend,
@@ -242,6 +256,8 @@ def _mxfp8_trtllm_configuration_fingerprint() -> _Mxfp8TrtllmConfigurationFinger
         config_path="",
         config_sha256="",
         qualification_scope="",
+        model="",
+        tensor_parallel_size=0,
         layout_mode="adaptive",
         switch_m=switch_m,
         gemm_backend=gemm_backend,
@@ -334,7 +350,7 @@ def validate_mxfp8_trtllm_configuration(
             prepared, _MXFP8_TRTLLM_CONFIGURATION
         )
         return
-    active = _mxfp8_trtllm_configuration_fingerprint()
+    active = _mxfp8_trtllm_configuration_fingerprint(prepared)
     _validate_mxfp8_trtllm_configuration(prepared, active)
     if _MXFP8_TRTLLM_CONFIGURATION is not None:
         _validate_mxfp8_trtllm_configuration(_MXFP8_TRTLLM_CONFIGURATION, active)
@@ -398,7 +414,9 @@ def prepare_mxfp8_trtllm_direct_state(
         tactic_map_128x4: dict[tuple[int, int, int], int] = {}
         if is_adaptive_layout:
             configuration = _freeze_mxfp8_trtllm_configuration(
-                _mxfp8_trtllm_configuration_fingerprint()
+                _mxfp8_trtllm_configuration_fingerprint(
+                    _MXFP8_TRTLLM_CONFIGURATION
+                )
             )
 
         prepared_state = _MXFP8_TRTLLM_DIRECT_STATES.get(device_key)
@@ -674,7 +692,7 @@ def configure_mxfp8_adaptive_layout_compilation() -> None:
     from vllm.config import get_current_vllm_config
 
     active_configuration = _freeze_mxfp8_trtllm_configuration(
-        _mxfp8_trtllm_configuration_fingerprint()
+        _mxfp8_trtllm_configuration_fingerprint(_MXFP8_TRTLLM_CONFIGURATION)
     )
     _validate_mxfp8_adaptive_op_schemas()
     vllm_config = get_current_vllm_config()
