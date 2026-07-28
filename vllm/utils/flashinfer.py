@@ -291,6 +291,7 @@ def _validate_mxfp8_trtllm_configuration(
 
 _MXFP8_TRTLLM_CONFIGURATION: _Mxfp8TrtllmConfigurationFingerprint | None = None
 _MXFP8_DENSE_CONFIG_LOGGED = False
+_MXFP8_TRTLLM_SOURCE_VALIDATED = False
 
 
 def _log_mxfp8_dense_config_once(
@@ -337,23 +338,42 @@ def get_mxfp8_trtllm_configuration() -> _Mxfp8TrtllmConfigurationFingerprint:
     )
 
 
+def get_mxfp8_trtllm_file_configuration(
+) -> _Mxfp8TrtllmConfigurationFingerprint | None:
+    if _MXFP8_TRTLLM_CONFIGURATION is not None:
+        if _MXFP8_TRTLLM_CONFIGURATION.config_path:
+            return _MXFP8_TRTLLM_CONFIGURATION
+        return None
+    if not os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip():
+        return None
+    return get_mxfp8_trtllm_configuration()
+
+
 def validate_mxfp8_trtllm_configuration(
     prepared: _Mxfp8TrtllmConfigurationFingerprint,
 ) -> None:
-    if torch.cuda.is_current_stream_capturing():
-        if _MXFP8_TRTLLM_CONFIGURATION is None:
-            raise RuntimeError(
-                "MXFP8 TRTLLM configuration was not prepared before "
-                "CUDA Graph capture"
-            )
-        _validate_mxfp8_trtllm_configuration(
-            prepared, _MXFP8_TRTLLM_CONFIGURATION
+    if _MXFP8_TRTLLM_CONFIGURATION is None:
+        raise RuntimeError(
+            "MXFP8 TRTLLM configuration was not prepared before execution"
         )
-        return
-    active = _mxfp8_trtllm_configuration_fingerprint(prepared)
-    _validate_mxfp8_trtllm_configuration(prepared, active)
-    if _MXFP8_TRTLLM_CONFIGURATION is not None:
-        _validate_mxfp8_trtllm_configuration(_MXFP8_TRTLLM_CONFIGURATION, active)
+    _validate_mxfp8_trtllm_configuration(
+        prepared, _MXFP8_TRTLLM_CONFIGURATION
+    )
+
+
+def validate_mxfp8_trtllm_configuration_source(
+    prepared: _Mxfp8TrtllmConfigurationFingerprint | None = None,
+) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MXFP8 TRTLLM configuration source cannot be validated during "
+            "CUDA Graph capture"
+        )
+    frozen = get_mxfp8_trtllm_configuration()
+    if prepared is not None:
+        _validate_mxfp8_trtllm_configuration(prepared, frozen)
+    active = _mxfp8_trtllm_configuration_fingerprint(frozen)
+    _validate_mxfp8_trtllm_configuration(frozen, active)
 
 
 class _Mxfp8TrtllmDirectState(NamedTuple):
@@ -392,12 +412,10 @@ def prepare_mxfp8_trtllm_direct_state(
                 "MXFP8 TRTLLM direct state must be prepared before CUDA Graph capture"
             )
 
-        config_reference = os.environ.get(
-            "VLLM_MXFP8_DENSE_CONFIG_FILE", ""
-        ).strip()
+        runtime_configuration = get_mxfp8_trtllm_file_configuration()
         layout_mode = (
-            "adaptive"
-            if config_reference
+            runtime_configuration.layout_mode
+            if runtime_configuration is not None
             else os.environ.get(
                 "VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4"
             )
@@ -413,11 +431,7 @@ def prepare_mxfp8_trtllm_direct_state(
         tactic_map_8x4: dict[tuple[int, int, int], int] = {}
         tactic_map_128x4: dict[tuple[int, int, int], int] = {}
         if is_adaptive_layout:
-            configuration = _freeze_mxfp8_trtllm_configuration(
-                _mxfp8_trtllm_configuration_fingerprint(
-                    _MXFP8_TRTLLM_CONFIGURATION
-                )
-            )
+            configuration = get_mxfp8_trtllm_configuration()
 
         prepared_state = _MXFP8_TRTLLM_DIRECT_STATES.get(device_key)
         if prepared_state is not None:
@@ -481,10 +495,10 @@ def _require_mxfp8_trtllm_direct_state(
                 f"device={device_key}"
             )
         return prepare_mxfp8_trtllm_direct_state(device)
-    config_reference = os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip()
+    runtime_configuration = get_mxfp8_trtllm_file_configuration()
     layout_mode = (
-        "adaptive"
-        if config_reference
+        runtime_configuration.layout_mode
+        if runtime_configuration is not None
         else os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4")
         .strip()
         .lower()
@@ -689,11 +703,15 @@ class _Mxfp8AdaptiveLayoutSpecializationPass(InductorPass):
 
 
 def configure_mxfp8_adaptive_layout_compilation() -> None:
+    global _MXFP8_TRTLLM_SOURCE_VALIDATED
     from vllm.config import get_current_vllm_config
 
-    active_configuration = _freeze_mxfp8_trtllm_configuration(
-        _mxfp8_trtllm_configuration_fingerprint(_MXFP8_TRTLLM_CONFIGURATION)
-    )
+    active_configuration = get_mxfp8_trtllm_configuration()
+    if not _MXFP8_TRTLLM_SOURCE_VALIDATED:
+        validate_mxfp8_trtllm_configuration_source(active_configuration)
+        _MXFP8_TRTLLM_SOURCE_VALIDATED = True
+    else:
+        validate_mxfp8_trtllm_configuration(active_configuration)
     _validate_mxfp8_adaptive_op_schemas()
     vllm_config = get_current_vllm_config()
     compilation_config = vllm_config.compilation_config
@@ -1311,11 +1329,7 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
-        runtime_configuration = (
-            get_mxfp8_trtllm_configuration()
-            if os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip()
-            else None
-        )
+        runtime_configuration = get_mxfp8_trtllm_file_configuration()
         layout_mode = (
             runtime_configuration.layout_mode
             if runtime_configuration is not None

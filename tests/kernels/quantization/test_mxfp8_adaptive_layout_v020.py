@@ -1,4 +1,5 @@
 import ast
+import builtins
 import functools
 import hashlib
 import importlib.util
@@ -34,6 +35,25 @@ sys.modules[_TACTIC_CONFIG_SPEC.name] = _TACTIC_CONFIG_MODULE
 _TACTIC_CONFIG_SPEC.loader.exec_module(_TACTIC_CONFIG_MODULE)
 
 
+def _isolated_import(
+    name: str,
+    globals_: dict[str, object] | None = None,
+    locals_: dict[str, object] | None = None,
+    fromlist: tuple[str, ...] = (),
+    level: int = 0,
+) -> object:
+    if name == "vllm.utils":
+        runtime_module = sys.modules.get("vllm.utils")
+        if runtime_module is not None:
+            return runtime_module
+        return SimpleNamespace(
+            flashinfer=SimpleNamespace(
+                get_mxfp8_trtllm_file_configuration=lambda: None
+            )
+        )
+    return builtins.__import__(name, globals_, locals_, fromlist, level)
+
+
 def _load_layout_policy() -> Callable[[int], bool]:
     tree = ast.parse(UTILS.read_text(encoding="utf-8"))
     names = {
@@ -52,6 +72,7 @@ def _load_layout_policy() -> Callable[[int], bool]:
         "mxfp8_dense_use_8x4_sf_layout",
     } <= {node.name for node in selected}
     namespace: dict[str, object] = {
+        "__builtins__": {**vars(builtins), "__import__": _isolated_import},
         "os": os,
         "_Mxfp8DenseRuntimeConfiguration": object,
     }
@@ -191,14 +212,22 @@ def _load_trtllm_runtime_freeze_contract(
     return namespace["get_mxfp8_trtllm_configuration"]  # type: ignore[return-value]
 
 
-def _load_post_freeze_validation_contract() -> dict[str, object]:
+def _load_post_freeze_validation_contract(
+    loader_calls: list[str],
+    context_calls: list[None],
+) -> dict[str, object]:
     tree = ast.parse(FLASHINFER_UTILS.read_text(encoding="utf-8"))
     names = {
         "_Mxfp8TrtllmConfigurationFingerprint",
         "_parse_mxfp8_tactic_hints",
         "_mxfp8_trtllm_configuration_fingerprint",
         "_validate_mxfp8_trtllm_configuration",
+        "_log_mxfp8_dense_config_once",
+        "_freeze_mxfp8_trtllm_configuration",
+        "get_mxfp8_trtllm_configuration",
+        "get_mxfp8_trtllm_file_configuration",
         "validate_mxfp8_trtllm_configuration",
+        "validate_mxfp8_trtllm_configuration_source",
     }
     selected = [
         node
@@ -208,27 +237,30 @@ def _load_post_freeze_validation_contract() -> dict[str, object]:
     assert {node.name for node in selected} == names
     namespace: dict[str, object] = {
         "functools": functools,
-        "_load_mxfp8_dense_runtime_config": (
-            lambda reference, *, actual_model, actual_tensor_parallel_size: (
-                _TACTIC_CONFIG_MODULE.load_mxfp8_dense_runtime_config(
-                    reference,
-                    actual_vllm_version="0.20.2+local",
-                    actual_flashinfer_version="0.6.8.post1+cu129",
-                    actual_compute_capability=(10, 0),
-                    actual_model=actual_model,
-                    actual_tensor_parallel_size=actual_tensor_parallel_size,
-                )
+        "_load_mxfp8_dense_runtime_config": lambda reference,
+        *,
+        actual_model,
+        actual_tensor_parallel_size: (
+            loader_calls.append(reference)
+            or _TACTIC_CONFIG_MODULE.load_mxfp8_dense_runtime_config(
+                reference,
+                actual_vllm_version="0.20.2+local",
+                actual_flashinfer_version="0.6.8.post1+cu129",
+                actual_compute_capability=(10, 0),
+                actual_model=actual_model,
+                actual_tensor_parallel_size=actual_tensor_parallel_size,
             )
         ),
         "_active_mxfp8_model_and_tp": lambda: (
-            "Nemotron 3 Ultra MXFP8",
-            4,
+            context_calls.append(None) or ("Nemotron 3 Ultra MXFP8", 4)
         ),
+        "logger": SimpleNamespace(info=lambda *_args: None),
         "NamedTuple": NamedTuple,
         "os": os,
         "torch": SimpleNamespace(
             cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)
         ),
+        "_MXFP8_DENSE_CONFIG_LOGGED": False,
         "_MXFP8_TRTLLM_CONFIGURATION": None,
     }
     exec(
@@ -297,6 +329,9 @@ def _load_direct_state_contract(cuda: _FakeCuda) -> dict[str, object]:
         "_mxfp8_trtllm_configuration_fingerprint",
         "_validate_mxfp8_trtllm_configuration",
         "_freeze_mxfp8_trtllm_configuration",
+        "get_mxfp8_trtllm_configuration",
+        "get_mxfp8_trtllm_file_configuration",
+        "validate_mxfp8_trtllm_configuration",
         "_mxfp8_trtllm_device_key",
         "prepare_mxfp8_trtllm_direct_state",
     }
@@ -385,6 +420,7 @@ def _load_fixed_quantizer(
     ]
     assert {node.name for node in selected} == names
     namespace: dict[str, object] = {
+        "__builtins__": {**vars(builtins), "__import__": _isolated_import},
         "os": os,
         "torch": torch_module,
         "_Mxfp8DenseRuntimeConfiguration": object,
@@ -535,8 +571,9 @@ def test_config_file_alone_selects_adaptive_layout_policy(
     ):
         monkeypatch.delenv(legacy_name, raising=False)
     _, current_fingerprint, _ = _load_trtllm_configuration_contract()
+    prepared = current_fingerprint()
     runtime_module = SimpleNamespace(
-        get_mxfp8_trtllm_configuration=current_fingerprint
+        get_mxfp8_trtllm_file_configuration=lambda: prepared
     )
     monkeypatch.setitem(
         sys.modules,
@@ -556,6 +593,33 @@ def test_config_file_alone_selects_adaptive_layout_policy(
     assert policy(257) is False
 
 
+def test_frozen_config_keeps_layout_policy_after_environment_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "adaptive.json"
+    config_path.write_text(json.dumps(_runtime_manifest()), encoding="utf-8")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(config_path))
+    _, current_fingerprint, _ = _load_trtllm_configuration_contract()
+    prepared = current_fingerprint()
+    runtime_module = SimpleNamespace(
+        get_mxfp8_trtllm_file_configuration=lambda: prepared
+    )
+    monkeypatch.setitem(sys.modules, "vllm.utils.flashinfer", runtime_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils",
+        SimpleNamespace(flashinfer=runtime_module),
+    )
+    monkeypatch.delenv("VLLM_MXFP8_DENSE_CONFIG_FILE")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4")
+
+    policy = _load_layout_policy()
+
+    assert policy(1) is True
+    assert policy(256) is True
+    assert policy(257) is False
+
+
 def test_config_file_alone_selects_linear_backend_and_unpadded_shape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -565,8 +629,9 @@ def test_config_file_alone_selects_linear_backend_and_unpadded_shape(
     monkeypatch.delenv("VLLM_MXFP8_DENSE_GEMM_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_MXFP8_DENSE_PAD_TO_128", raising=False)
     _, current_fingerprint, _ = _load_trtllm_configuration_contract()
+    prepared = current_fingerprint()
     fake_runtime = SimpleNamespace(
-        get_mxfp8_trtllm_configuration=current_fingerprint
+        get_mxfp8_trtllm_file_configuration=lambda: prepared
     )
     tree = ast.parse(LINEAR.read_text(encoding="utf-8"))
     names = {"_mxfp8_dense_backend", "_mxfp8_dense_pad_to_128"}
@@ -576,6 +641,46 @@ def test_config_file_alone_selects_linear_backend_and_unpadded_shape(
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
     assert {node.name for node in selected} == names
+    namespace: dict[str, object] = {
+        "os": os,
+        "vllm_flashinfer": fake_runtime,
+        "_SUPPORTED_MXFP8_DENSE_BACKENDS": (
+            "cutlass",
+            "trtllm",
+            "cute-dsl",
+            "auto",
+        ),
+    }
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), str(LINEAR), "exec"),
+        namespace,
+    )
+
+    assert namespace["_mxfp8_dense_backend"]() == "trtllm"  # type: ignore[operator]
+    assert namespace["_mxfp8_dense_pad_to_128"]() is False  # type: ignore[operator]
+
+
+def test_frozen_config_keeps_linear_policy_after_environment_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "adaptive.json"
+    config_path.write_text(json.dumps(_runtime_manifest()), encoding="utf-8")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(config_path))
+    _, current_fingerprint, _ = _load_trtllm_configuration_contract()
+    prepared = current_fingerprint()
+    fake_runtime = SimpleNamespace(
+        get_mxfp8_trtllm_file_configuration=lambda: prepared
+    )
+    monkeypatch.delenv("VLLM_MXFP8_DENSE_CONFIG_FILE")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_GEMM_BACKEND", "cutlass")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_PAD_TO_128", "1")
+    tree = ast.parse(LINEAR.read_text(encoding="utf-8"))
+    names = {"_mxfp8_dense_backend", "_mxfp8_dense_pad_to_128"}
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
     namespace: dict[str, object] = {
         "os": os,
         "vllm_flashinfer": fake_runtime,
@@ -606,8 +711,9 @@ def test_config_file_alone_selects_quant_backend_and_strict_8x4(
     monkeypatch.delenv("VLLM_MXFP8_DENSE_QUANT_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_MXFP8_DENSE_REQUIRE_8X4_QUANT", raising=False)
     _, current_fingerprint, _ = _load_trtllm_configuration_contract()
+    prepared = current_fingerprint()
     runtime_module = SimpleNamespace(
-        get_mxfp8_trtllm_configuration=current_fingerprint
+        get_mxfp8_trtllm_file_configuration=lambda: prepared
     )
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__path__=[]))
     monkeypatch.setitem(
@@ -1077,37 +1183,77 @@ def test_config_file_byte_mutation_fails_frozen_fingerprint(
         validate(prepared, active)
 
 
-def test_post_freeze_validation_reuses_workload_identity_and_detects_mutation(
+def test_hot_path_uses_frozen_configuration_without_source_io(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config_path = tmp_path / "qualified.json"
     manifest = _runtime_manifest()
     config_path.write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(config_path))
-    namespace = _load_post_freeze_validation_contract()
-    current_fingerprint = namespace["_mxfp8_trtllm_configuration_fingerprint"]
+    loader_calls: list[str] = []
+    context_calls: list[None] = []
+    namespace = _load_post_freeze_validation_contract(
+        loader_calls, context_calls
+    )
+    get_configuration = namespace["get_mxfp8_trtllm_configuration"]
+    get_file_configuration = namespace[
+        "get_mxfp8_trtllm_file_configuration"
+    ]
     validate = namespace["validate_mxfp8_trtllm_configuration"]
-    prepared = current_fingerprint()  # type: ignore[operator]
-    namespace["_MXFP8_TRTLLM_CONFIGURATION"] = prepared
-    namespace["_active_mxfp8_model_and_tp"] = lambda: pytest.fail(
-        "post-freeze validation queried initialization-only VllmConfig"
-    )
+    validate_source = namespace[
+        "validate_mxfp8_trtllm_configuration_source"
+    ]
 
-    validate(prepared)  # type: ignore[operator]
+    prepared = get_configuration()  # type: ignore[operator]
+    validate_source(prepared)  # type: ignore[operator]
+    assert len(loader_calls) == 2
+    assert len(context_calls) == 1
 
-    monkeypatch.setenv(
-        "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS",
-        "1,2048,8192:66",
-    )
-    with pytest.raises(
-        ValueError, match="VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS"
-    ):
+    for _ in range(5):
         validate(prepared)  # type: ignore[operator]
+        assert get_configuration() is prepared  # type: ignore[operator]
+        assert get_file_configuration() is prepared  # type: ignore[operator]
+    assert len(loader_calls) == 2
+    assert len(context_calls) == 1
 
-    monkeypatch.delenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS")
     config_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    monkeypatch.delenv("VLLM_MXFP8_DENSE_CONFIG_FILE")
+    validate(prepared)  # type: ignore[operator]
+    assert get_configuration() is prepared  # type: ignore[operator]
+    assert get_file_configuration() is prepared  # type: ignore[operator]
+    assert len(loader_calls) == 2
+    assert len(context_calls) == 1
+
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(config_path))
     with pytest.raises(RuntimeError, match="configuration changed after preparation"):
-        validate(prepared)  # type: ignore[operator]
+        validate_source(prepared)  # type: ignore[operator]
+    assert len(loader_calls) == 3
+    assert len(context_calls) == 1
+
+    other_path = tmp_path / "other-qualified.json"
+    other_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_CONFIG_FILE", str(other_path))
+    validate(prepared)  # type: ignore[operator]
+    assert get_file_configuration() is prepared  # type: ignore[operator]
+    assert len(loader_calls) == 3
+    with pytest.raises(RuntimeError, match="configuration changed after preparation"):
+        validate_source(prepared)  # type: ignore[operator]
+    assert len(loader_calls) == 4
+    assert len(context_calls) == 1
+
+
+def test_eager_gemm_checks_only_frozen_configuration() -> None:
+    apply_weights = _function_source(LINEAR, "apply_weights")
+    require_state = _function_source(
+        FLASHINFER_UTILS, "_require_mxfp8_trtllm_direct_state"
+    )
+    run_prepared = _function_source(
+        FLASHINFER_UTILS, "_mxfp8_trtllm_run_prepared"
+    )
+
+    for source in (apply_weights, require_state, run_prepared):
+        assert "validate_mxfp8_trtllm_configuration_source" not in source
+        assert "_mxfp8_trtllm_configuration_fingerprint" not in source
 
 
 def test_config_file_logs_startup_provenance_once(
@@ -1189,10 +1335,9 @@ def test_compilation_configuration_validates_active_environment() -> None:
 
     assert "_Mxfp8TrtllmConfigurationFingerprint" in source
     assert configure.index(
-        "_mxfp8_trtllm_configuration_fingerprint("
+        "validate_mxfp8_trtllm_configuration_source("
     ) < configure.index("compilation_config.inductor_compile_config")
-    assert "_MXFP8_TRTLLM_CONFIGURATION" in configure
-    assert "_validate_mxfp8_trtllm_configuration(" in configure
+    assert "get_mxfp8_trtllm_configuration()" in configure
 
 
 def test_adaptive_layout_uses_separate_tactic_tables_with_unknown_minus_one() -> None:

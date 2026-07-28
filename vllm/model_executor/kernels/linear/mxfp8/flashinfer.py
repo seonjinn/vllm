@@ -162,9 +162,7 @@ def _mxfp8_dense_nvtx_pop(enabled: bool) -> None:
 
 def _mxfp8_dense_backend() -> str:
     runtime_configuration = (
-        vllm_flashinfer.get_mxfp8_trtllm_configuration()
-        if os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip()
-        else None
+        vllm_flashinfer.get_mxfp8_trtllm_file_configuration()
     )
     backend = (
         runtime_configuration.gemm_backend
@@ -181,8 +179,11 @@ def _mxfp8_dense_backend() -> str:
 
 
 def _mxfp8_dense_pad_to_128() -> bool:
-    if os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip():
-        return vllm_flashinfer.get_mxfp8_trtllm_configuration().pad_to_128
+    runtime_configuration = (
+        vllm_flashinfer.get_mxfp8_trtllm_file_configuration()
+    )
+    if runtime_configuration is not None:
+        return runtime_configuration.pad_to_128
     return _env_flag("VLLM_MXFP8_DENSE_PAD_TO_128", True)
 
 

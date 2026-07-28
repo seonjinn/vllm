@@ -25,11 +25,9 @@ class _Mxfp8DenseRuntimeConfiguration(Protocol):
 
 def _mxfp8_dense_runtime_configuration(
 ) -> _Mxfp8DenseRuntimeConfiguration | None:
-    if not os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip():
-        return None
     from vllm.utils import flashinfer as vllm_flashinfer
 
-    return vllm_flashinfer.get_mxfp8_trtllm_configuration()
+    return vllm_flashinfer.get_mxfp8_trtllm_file_configuration()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
