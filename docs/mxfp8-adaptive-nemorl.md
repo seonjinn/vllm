@@ -308,4 +308,3 @@ Treat zero hits as a negative applicability result:
 - do not claim rollout improvement from this kernel path;
 - inspect fused MoE and ignored-module routing before expanding scope;
 - preserve the original-selection baseline.
-
