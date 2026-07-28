@@ -47,7 +47,7 @@ def _manifest() -> dict[str, Any]:
             "require_direct_trtllm": True,
             "quant_backend": "cuda",
             "require_8x4_quant": True,
-            "pad_to_128": True,
+            "pad_to_128": False,
             "default_tactic": -1,
         },
         "tactics": {
@@ -77,6 +77,8 @@ def _load(
     *,
     actual_vllm_version: str = "0.20.2+local",
     actual_flashinfer_version: str = "0.6.8.post1+cu129",
+    actual_model: str = "Nemotron 3 Ultra MXFP8",
+    actual_tensor_parallel_size: int = 4,
     config_dir: Path | None = None,
 ) -> Any:
     return load_mxfp8_dense_runtime_config(
@@ -84,6 +86,8 @@ def _load(
         actual_vllm_version=actual_vllm_version,
         actual_flashinfer_version=actual_flashinfer_version,
         actual_compute_capability=(10, 0),
+        actual_model=actual_model,
+        actual_tensor_parallel_size=actual_tensor_parallel_size,
         package_config_dir=config_dir,
     )
 
@@ -145,6 +149,16 @@ def test_loads_relative_manifest_only_from_injected_config_directory(
                 "compute_capability", "9.0"
             ),
             "compatibility.compute_capability",
+        ),
+        (
+            lambda data: data["policy"].__setitem__("direct_trtllm", False),
+            "policy.direct_trtllm",
+        ),
+        (
+            lambda data: data["policy"].__setitem__(
+                "require_direct_trtllm", False
+            ),
+            "policy.require_direct_trtllm",
         ),
         (lambda data: data["policy"].__setitem__("switch_m", 0), "policy.switch_m"),
         (lambda data: data["policy"].__setitem__("switch_m", 129), "policy.switch_m"),
@@ -259,6 +273,31 @@ def test_rejects_version_qualifier_mismatches(
             str(path),
             actual_vllm_version=actual_vllm_version,
             actual_flashinfer_version=actual_flashinfer_version,
+        )
+
+
+@pytest.mark.parametrize(
+    ("actual_model", "actual_tensor_parallel_size", "error"),
+    [
+        ("Qwen/Qwen3-235B-A22B-FP8", 4, "compatibility.model"),
+        ("Nemotron 3 Ultra MXFP8", 1, "compatibility.tensor_parallel_size"),
+    ],
+)
+def test_rejects_model_or_tensor_parallel_mismatch(
+    tmp_path: Path,
+    actual_model: str,
+    actual_tensor_parallel_size: int,
+    error: str,
+) -> None:
+    """A qualified model/TP tactic table cannot run on another workload."""
+    path = tmp_path / "workload-mismatch.json"
+    _write_manifest(path, _manifest())
+
+    with pytest.raises(RuntimeError, match=re.escape(error)):
+        _load(
+            str(path),
+            actual_model=actual_model,
+            actual_tensor_parallel_size=actual_tensor_parallel_size,
         )
 
 

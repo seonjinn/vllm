@@ -14,7 +14,7 @@
     "direct_trtllm": true,
     "gemm_backend": "trtllm",
     "layout": "adaptive",
-    "pad_to_128": true,
+    "pad_to_128": false,
     "quant_backend": "cuda",
     "require_8x4_quant": true,
     "require_direct_trtllm": true,

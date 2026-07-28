@@ -85,6 +85,8 @@ def load_mxfp8_dense_runtime_config(
     actual_vllm_version: str,
     actual_flashinfer_version: str,
     actual_compute_capability: tuple[int, int],
+    actual_model: str,
+    actual_tensor_parallel_size: int,
     package_config_dir: Path | None = None,
 ) -> Mxfp8DenseRuntimeConfig:
     """Load a qualified tactic manifest and reject every incompatible input."""
@@ -101,6 +103,8 @@ def load_mxfp8_dense_runtime_config(
         actual_vllm_version,
         actual_flashinfer_version,
         actual_compute_capability,
+        actual_model,
+        actual_tensor_parallel_size,
     )
     policy = _require_mapping(document, "policy", "policy")
     validated_policy = _validate_policy(policy)
@@ -227,6 +231,8 @@ def _validate_compatibility(
     actual_vllm_version: str,
     actual_flashinfer_version: str,
     actual_compute_capability: tuple[int, int],
+    actual_model: str,
+    actual_tensor_parallel_size: int,
 ) -> None:
     _require_exact_fields(compatibility, _COMPATIBILITY_FIELDS, "compatibility")
     for key in (
@@ -255,6 +261,13 @@ def _validate_compatibility(
         raise RuntimeError(
             "compatibility.compute_capability does not match actual compute "
             "capability"
+        )
+    if compatibility["model"] != actual_model:
+        raise RuntimeError("compatibility.model does not match the active model")
+    if compatibility["tensor_parallel_size"] != actual_tensor_parallel_size:
+        raise RuntimeError(
+            "compatibility.tensor_parallel_size does not match the active "
+            "tensor parallel size"
         )
 
 
@@ -287,6 +300,9 @@ def _validate_policy(policy: Mapping[str, object]) -> _ValidatedPolicy:
         "pad_to_128",
     ):
         _require_bool(policy, key, f"policy.{key}")
+    for key in ("direct_trtllm", "require_direct_trtllm"):
+        if policy[key] is not True:
+            raise ValueError(f"policy.{key} must be true for adaptive execution")
     quant_backend = policy["quant_backend"]
     if not isinstance(quant_backend, str) or quant_backend not in {
         "cuda",

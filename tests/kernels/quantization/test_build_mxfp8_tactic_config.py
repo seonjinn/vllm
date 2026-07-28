@@ -106,6 +106,48 @@ def test_build_manifest_includes_high_m_entries_only_when_requested() -> None:
     ]
 
 
+def test_low_m_tactic_keys_remain_reachable_under_generated_policy() -> None:
+    """Adaptive low-M lookup must use the same unpadded M keys as qualification."""
+    manifest = build_manifest(
+        parse_legacy_hints(_HINTS),
+        switch_m=256,
+        high_m_policy="empty",
+        compatibility=_COMPATIBILITY,
+        provenance=_PROVENANCE,
+    )
+    policy = manifest["policy"]
+    tactics = manifest["tactics"]["8x4"]
+
+    assert policy["pad_to_128"] is False
+    tactic_shapes = {
+        (entry["m"], entry["n"], entry["k"])
+        for entry in tactics
+    }
+    for entry in tactics:
+        logical_m = entry["m"]
+        physical_m = (
+            ((logical_m + 127) // 128) * 128
+            if policy["pad_to_128"]
+            else logical_m
+        )
+        assert (physical_m, entry["n"], entry["k"]) in tactic_shapes
+
+
+def test_checked_in_low_m_seed_keys_remain_reachable() -> None:
+    """The shipped 63-entry seed must preserve actual low-M benchmark shapes."""
+    seed_path = (
+        Path(__file__).parents[3]
+        / "vllm/model_executor/kernels/linear/mxfp8/tactic_configs"
+        / "nemotron3_ultra_tp4_v0202_standalone_seed.json"
+    )
+    seed = json.loads(seed_path.read_text(encoding="utf-8"))
+    tactics = seed["tactics"]["8x4"]
+
+    assert len(tactics) == 63
+    assert seed["policy"]["pad_to_128"] is False
+    assert {entry["m"] for entry in tactics} == {1, 2, 4, 6, 7, 8, 15, 23, 32}
+
+
 def test_cli_writes_key_sorted_json_with_single_trailing_newline(
     tmp_path: Path,
 ) -> None:

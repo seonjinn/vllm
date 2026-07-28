@@ -84,7 +84,7 @@ def build_manifest(
             "require_direct_trtllm": True,
             "quant_backend": "cuda",
             "require_8x4_quant": True,
-            "pad_to_128": True,
+            "pad_to_128": False,
             "default_tactic": -1,
         },
         "tactics": {"8x4": low_entries, "128x4": high_entries},

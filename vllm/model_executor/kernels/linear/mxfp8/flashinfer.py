@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import json
 import os
 import socket
@@ -22,7 +23,6 @@ from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
-
 
 _SUPPORTED_MXFP8_DENSE_BACKENDS = ("cutlass", "trtllm", "cute-dsl", "auto")
 _MXFP8_DENSE_TRACE_SEEN: set[tuple[object, ...]] = set()
@@ -84,6 +84,7 @@ def _mxfp8_dense_shape_trace(
     backend: str,
     input_shape: torch.Size,
     weight_shape: torch.Size,
+    config_sha256: str | None,
 ) -> None:
     if not _env_flag("VLLM_MXFP8_DENSE_SHAPE_TRACE", False):
         return
@@ -105,13 +106,14 @@ def _mxfp8_dense_shape_trace(
         n_physical,
         k,
         backend,
+        config_sha256,
     )
     max_records = int(os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"))
 
     global _MXFP8_DENSE_TRACE_WRITTEN
     if key in _MXFP8_DENSE_TRACE_SEEN:
         return
-    if _MXFP8_DENSE_TRACE_WRITTEN >= max_records:
+    if max_records <= _MXFP8_DENSE_TRACE_WRITTEN:
         return
     _MXFP8_DENSE_TRACE_SEEN.add(key)
     _MXFP8_DENSE_TRACE_WRITTEN += 1
@@ -121,6 +123,7 @@ def _mxfp8_dense_shape_trace(
     output = path / f"dense_shapes_{socket.gethostname()}_{os.getpid()}.jsonl"
     record = {
         "event": "mxfp8_dense_shape",
+        "config_sha256": config_sha256,
         "time": time.time(),
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
@@ -153,14 +156,21 @@ def _mxfp8_dense_nvtx_push(message: str) -> bool:
 def _mxfp8_dense_nvtx_pop(enabled: bool) -> None:
     if not enabled:
         return
-    try:
+    with contextlib.suppress(Exception):
         torch.cuda.nvtx.range_pop()
-    except Exception:
-        pass
 
 
 def _mxfp8_dense_backend() -> str:
-    backend = os.environ.get("VLLM_MXFP8_DENSE_GEMM_BACKEND", "cutlass")
+    runtime_configuration = (
+        vllm_flashinfer.get_mxfp8_trtllm_configuration()
+        if os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip()
+        else None
+    )
+    backend = (
+        runtime_configuration.gemm_backend
+        if runtime_configuration is not None
+        else os.environ.get("VLLM_MXFP8_DENSE_GEMM_BACKEND", "cutlass")
+    )
     backend = backend.strip().lower()
     if backend not in _SUPPORTED_MXFP8_DENSE_BACKENDS:
         raise ValueError(
@@ -168,6 +178,12 @@ def _mxfp8_dense_backend() -> str:
             f"{_SUPPORTED_MXFP8_DENSE_BACKENDS}, got {backend!r}"
         )
     return backend
+
+
+def _mxfp8_dense_pad_to_128() -> bool:
+    if os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip():
+        return vllm_flashinfer.get_mxfp8_trtllm_configuration().pad_to_128
+    return _env_flag("VLLM_MXFP8_DENSE_PAD_TO_128", True)
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -350,7 +366,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         # The original CUTLASS path pads low-M inputs to 128 rows before
         # GEMM. Keep that default for correctness and only let opt-in smoke
         # runs test TRTLLM/CuTe-DSL on the real low-M shape.
-        pad_to_128 = _env_flag("VLLM_MXFP8_DENSE_PAD_TO_128", True)
+        pad_to_128 = _mxfp8_dense_pad_to_128()
         if backend in ("cutlass", "auto"):
             pad_to_128 = True
 
@@ -366,10 +382,11 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             f"out_features is too small for mm_mxfp8."
         )
 
-        if pad_to_128:
-            M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
-        else:
-            M_padded = M_orig
+        M_padded = (
+            ((M_orig + min_dim - 1) // min_dim) * min_dim
+            if pad_to_128
+            else M_orig
+        )
         pad_rows = M_padded - M_orig
         if pad_rows > 0:
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
@@ -385,6 +402,11 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             backend=backend,
             input_shape=input_shape,
             weight_shape=weight.shape,
+            config_sha256=(
+                prepared_configuration.config_sha256
+                if prepared_configuration is not None
+                else None
+            ),
         )
 
         if not weight.is_contiguous():

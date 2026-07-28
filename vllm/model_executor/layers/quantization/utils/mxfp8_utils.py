@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from typing import Protocol
 
 import torch
 
@@ -15,6 +16,22 @@ MXFP8_BLOCK_SIZE = 32
 _MXFP8_DENSE_QUANT_BACKEND: str | None = None
 
 
+class _Mxfp8DenseRuntimeConfiguration(Protocol):
+    layout_mode: str
+    switch_m: int
+    quant_backend: str
+    require_8x4_quant: bool
+
+
+def _mxfp8_dense_runtime_configuration(
+) -> _Mxfp8DenseRuntimeConfiguration | None:
+    if not os.environ.get("VLLM_MXFP8_DENSE_CONFIG_FILE", "").strip():
+        return None
+    from vllm.utils import flashinfer as vllm_flashinfer
+
+    return vllm_flashinfer.get_mxfp8_trtllm_configuration()
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -24,18 +41,23 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def prepare_mxfp8_dense_quant_backend(backend: str | None = None) -> str:
     global _MXFP8_DENSE_QUANT_BACKEND
+    runtime_configuration = _mxfp8_dense_runtime_configuration()
     active_backend = (
         (
             backend
             if backend is not None
-            else os.environ.get("VLLM_MXFP8_DENSE_QUANT_BACKEND", "cuda")
+            else (
+                runtime_configuration.quant_backend
+                if runtime_configuration is not None
+                else os.environ.get("VLLM_MXFP8_DENSE_QUANT_BACKEND", "cuda")
+            )
         )
         .strip()
         .lower()
     )
     if _MXFP8_DENSE_QUANT_BACKEND is None:
         _MXFP8_DENSE_QUANT_BACKEND = active_backend
-    elif _MXFP8_DENSE_QUANT_BACKEND != active_backend:
+    elif active_backend != _MXFP8_DENSE_QUANT_BACKEND:
         raise RuntimeError(
             "MXFP8 dense quantization backend changed after preparation; "
             "restart the worker before changing it"
@@ -48,6 +70,9 @@ def _mxfp8_dense_quant_backend() -> str:
 
 
 def _mxfp8_dense_a_sf_layout() -> str:
+    runtime_configuration = _mxfp8_dense_runtime_configuration()
+    if runtime_configuration is not None:
+        return runtime_configuration.layout_mode
     return os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4").strip().lower()
 
 
@@ -58,7 +83,16 @@ def mxfp8_dense_use_8x4_sf_layout(m: int) -> bool:
     if layout in ("128x4", "layout_128x4", "false", "0"):
         return False
     if layout in ("adaptive", "shape-aware", "shape_aware"):
-        threshold = int(os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M", "256"))
+        runtime_configuration = _mxfp8_dense_runtime_configuration()
+        threshold = (
+            runtime_configuration.switch_m
+            if runtime_configuration is not None
+            else int(
+                os.environ.get(
+                    "VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M", "256"
+                )
+            )
+        )
         if threshold <= 0:
             raise ValueError("VLLM_MXFP8_DENSE_A_SF_LAYOUT_SWITCH_M must be positive")
         return int(m) <= threshold
@@ -165,8 +199,14 @@ def _flashinfer_mxfp8_quantize_impl(
     try:
         x_q, x_scales = flashinfer_mxfp8_quantize(**quant_kwargs)
     except TypeError:
+        runtime_configuration = _mxfp8_dense_runtime_configuration()
+        require_8x4_quant = (
+            runtime_configuration.require_8x4_quant
+            if runtime_configuration is not None
+            else _env_flag("VLLM_MXFP8_DENSE_REQUIRE_8X4_QUANT")
+        )
         if use_8x4 and (
-            require_exact_8x4_layout or _env_flag("VLLM_MXFP8_DENSE_REQUIRE_8X4_QUANT")
+            require_exact_8x4_layout or require_8x4_quant
         ):
             raise
         x_q, x_scales = flashinfer_mxfp8_quantize(
