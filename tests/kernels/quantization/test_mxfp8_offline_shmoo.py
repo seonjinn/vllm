@@ -65,6 +65,7 @@ class _ObservationOverrides(TypedDict, total=False):
     status: str
     device_name: str
     vllm_version: str
+    flashinfer_version: str
     seed: int
 
 
@@ -162,6 +163,7 @@ def _observation(
     status: str = "success",
     device_name: str = "NVIDIA GB200",
     vllm_version: str = "0.20.2",
+    flashinfer_version: str = "0.6.8.post1",
     seed: int | None = None,
 ) -> Any:
     return BenchmarkObservation(
@@ -182,7 +184,7 @@ def _observation(
         device_name=device_name,
         compute_capability="10.0",
         vllm_version=vllm_version,
-        flashinfer_version="0.6.8.post1",
+        flashinfer_version=flashinfer_version,
         container_sha256=_CONTAINER_SHA256,
     )
 
@@ -848,6 +850,98 @@ def test_active_runtime_identity_rejects_declared_version_or_gpu_mismatch() -> N
             active_flashinfer_version="0.6.8.post1",
             active_compute_capability="10.0",
             active_device_name="NVIDIA H100",
+            declared_vllm_version="0.20.2",
+            declared_flashinfer_version="0.6.8.post1",
+            inventory_compatibility=_COMPATIBILITY,
+        )
+
+
+def test_active_runtime_identity_accepts_compatible_local_version_labels() -> None:
+    """Container-local build labels must follow the production loader contract."""
+    validate_active_runtime_identity = (
+        _MODULE.validate_active_runtime_identity
+    )
+
+    validate_active_runtime_identity(
+        active_vllm_version="0.20.2+local.cu130",
+        active_flashinfer_version="0.6.8.post1+cu130",
+        active_compute_capability="10.0",
+        active_device_name="NVIDIA GB200",
+        declared_vllm_version="0.20.2+custom",
+        declared_flashinfer_version="0.6.8.post1",
+        inventory_compatibility=_COMPATIBILITY,
+    )
+
+    with pytest.raises(RuntimeError, match="active vLLM"):
+        validate_active_runtime_identity(
+            active_vllm_version="0.20.2rc1",
+            active_flashinfer_version="0.6.8.post1+cu130",
+            active_compute_capability="10.0",
+            active_device_name="NVIDIA GB200",
+            declared_vllm_version="0.20.2",
+            declared_flashinfer_version="0.6.8.post1",
+            inventory_compatibility=_COMPATIBILITY,
+        )
+
+
+def test_regeneration_accepts_observation_local_version_labels(
+    tmp_path: Path,
+) -> None:
+    """Shmoo observations with local tags must match base manifest versions."""
+    inventory = tmp_path / "inventory.json"
+    _write_inventory_artifact(inventory)
+    observations = tmp_path / "observations.jsonl"
+    records = [
+        *_observations_for_tactic(
+            -1,
+            (10.0, 10.0, 10.0),
+            vllm_version="0.20.2+local.cu130",
+            flashinfer_version="0.6.8.post1+cu130",
+        ),
+        *_observations_for_tactic(
+            7,
+            (8.0, 8.0, 8.0),
+            vllm_version="0.20.2+local.cu130",
+            flashinfer_version="0.6.8.post1+cu130",
+        ),
+    ]
+    _write_jsonl(
+        observations, [observation.__dict__ for observation in records]
+    )
+
+    manifest, _qualified = _MODULE.regenerate_qualified_manifest(
+        inventory_path=inventory,
+        observation_paths=[observations],
+        minimum_repeat_count=3,
+        minimum_cosine_similarity=0.999,
+        minimum_speedup_vs_default=1.02,
+        qualification_scope="nemo_rl_rollout",
+    )
+
+    assert manifest["compatibility"] == _COMPATIBILITY
+
+
+def test_gpu_family_matching_uses_exact_alias_tokens_not_substrings() -> None:
+    """B200 must never satisfy a GB200 bootstrap identity, or vice versa."""
+    b200_compatibility = dict(_COMPATIBILITY)
+    b200_compatibility["gpu_family"] = "B200"
+
+    with pytest.raises(RuntimeError, match="GPU family"):
+        _MODULE.validate_active_runtime_identity(
+            active_vllm_version="0.20.2",
+            active_flashinfer_version="0.6.8.post1",
+            active_compute_capability="10.0",
+            active_device_name="NVIDIA GB200",
+            declared_vllm_version="0.20.2",
+            declared_flashinfer_version="0.6.8.post1",
+            inventory_compatibility=b200_compatibility,
+        )
+    with pytest.raises(RuntimeError, match="GPU family"):
+        _MODULE.validate_active_runtime_identity(
+            active_vllm_version="0.20.2",
+            active_flashinfer_version="0.6.8.post1",
+            active_compute_capability="10.0",
+            active_device_name="NVIDIA B200",
             declared_vllm_version="0.20.2",
             declared_flashinfer_version="0.6.8.post1",
             inventory_compatibility=_COMPATIBILITY,

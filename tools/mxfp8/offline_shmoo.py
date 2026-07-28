@@ -11,6 +11,7 @@ import importlib
 import importlib.util
 import json
 import math
+import re
 import statistics
 import sys
 from collections import defaultdict
@@ -19,6 +20,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, cast
+
+from packaging.version import InvalidVersion, Version
 
 Layout = Literal["8x4", "128x4"]
 ShapeIdentity = tuple[Layout, int, int, int]
@@ -63,6 +66,13 @@ _COMPATIBILITY_FIELDS = frozenset(
         "tensor_parallel_size",
     }
 )
+_GPU_FAMILY_ALIASES: dict[str, frozenset[str]] = {
+    "B200": frozenset({"B200"}),
+    "GB200": frozenset({"GB200"}),
+    "GB300": frozenset({"GB300"}),
+    "H100": frozenset({"H100"}),
+    "H200": frozenset({"H200"}),
+}
 
 
 @dataclass(frozen=True)
@@ -643,11 +653,23 @@ def validate_active_runtime_identity(
     inventory_compatibility: Mapping[str, object],
 ) -> None:
     """Bind installed GPU runtime identity to the traced bootstrap manifest."""
-    if active_vllm_version != declared_vllm_version:
+    active_vllm_public = _public_version(
+        active_vllm_version, "active vLLM version"
+    )
+    declared_vllm_public = _public_version(
+        declared_vllm_version, "declared vLLM version"
+    )
+    active_flashinfer_public = _public_version(
+        active_flashinfer_version, "active FlashInfer version"
+    )
+    declared_flashinfer_public = _public_version(
+        declared_flashinfer_version, "declared FlashInfer version"
+    )
+    if active_vllm_public != declared_vllm_public:
         raise RuntimeError(
             "active vLLM version does not match --vllm-version"
         )
-    if active_flashinfer_version != declared_flashinfer_version:
+    if active_flashinfer_public != declared_flashinfer_public:
         raise RuntimeError(
             "active FlashInfer version does not match --flashinfer-version"
         )
@@ -655,11 +677,17 @@ def validate_active_runtime_identity(
     expected_flashinfer = inventory_compatibility.get("flashinfer_version")
     expected_capability = inventory_compatibility.get("compute_capability")
     expected_gpu_family = inventory_compatibility.get("gpu_family")
-    if expected_vllm != active_vllm_version:
+    if not isinstance(expected_vllm, str) or (
+        _public_version(expected_vllm, "inventory vLLM version")
+        != active_vllm_public
+    ):
         raise RuntimeError(
             "active vLLM version does not match inventory compatibility"
         )
-    if expected_flashinfer != active_flashinfer_version:
+    if not isinstance(expected_flashinfer, str) or (
+        _public_version(expected_flashinfer, "inventory FlashInfer version")
+        != active_flashinfer_public
+    ):
         raise RuntimeError(
             "active FlashInfer version does not match inventory compatibility"
         )
@@ -672,13 +700,36 @@ def validate_active_runtime_identity(
     normalized_family = "".join(
         character for character in expected_gpu_family.upper() if character.isalnum()
     )
-    normalized_device = "".join(
-        character for character in active_device_name.upper() if character.isalnum()
+    accepted_aliases = _GPU_FAMILY_ALIASES.get(
+        normalized_family, frozenset({normalized_family})
     )
-    if normalized_family not in normalized_device:
+    device_tokens = frozenset(
+        re.findall(r"[A-Z]+[0-9]+[A-Z0-9]*", active_device_name.upper())
+    )
+    if accepted_aliases.isdisjoint(device_tokens):
         raise RuntimeError(
             "active device does not match inventory GPU family"
         )
+
+
+def _public_version(raw: str, field: str) -> str:
+    try:
+        return Version(raw).public
+    except InvalidVersion as error:
+        raise RuntimeError(f"{field} is not a valid version") from error
+
+
+def _compatibility_values_match(
+    field: str, expected: object, actual: object
+) -> bool:
+    if field in {"vllm_version", "flashinfer_version"}:
+        return (
+            isinstance(expected, str)
+            and isinstance(actual, str)
+            and _public_version(expected, f"compatibility.{field}")
+            == _public_version(actual, f"observed {field}")
+        )
+    return expected == actual
 
 
 def digest_input_paths(paths: Sequence[Path]) -> str:
@@ -717,7 +768,9 @@ def regenerate_qualified_manifest(
         ("flashinfer_version", observed_runtime.flashinfer_version),
         ("compute_capability", observed_runtime.compute_capability),
     ):
-        if artifact.compatibility[field] != observed:
+        if not _compatibility_values_match(
+            field, artifact.compatibility[field], observed
+        ):
             raise ValueError(
                 f"observed {field} does not match inventory compatibility"
             )
@@ -1828,7 +1881,9 @@ def _run_promote(args: argparse.Namespace) -> int:
     artifact = _load_inventory_document(args.inventory)
     declared_compatibility = _compatibility_from_args(args)
     for field, declared in declared_compatibility.items():
-        if artifact.compatibility[field] != declared:
+        if not _compatibility_values_match(
+            field, artifact.compatibility[field], declared
+        ):
             display = {
                 "vllm_version": "observed vLLM version",
                 "flashinfer_version": "observed FlashInfer version",
