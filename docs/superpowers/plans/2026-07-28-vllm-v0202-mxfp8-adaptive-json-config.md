@@ -2,9 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Create a clean custom vLLM 0.20.2 fork branch that contains the validated adaptive dense MXFP8 implementation and loads qualified exact-shape tactics from one fail-closed JSON manifest.
+**Goal:** Create a clean custom vLLM 0.20.2 fork branch that contains the
+validated adaptive dense MXFP8 implementation, loads qualified exact-shape
+tactics from one fail-closed JSON manifest, and reproducibly generates that
+manifest from offline shmoo results.
 
-**Architecture:** Port the three validated Python override files onto the clean `nemo-speed-v0.20.2` base, then isolate JSON parsing and compatibility checks in a small typed module. The existing adaptive runtime consumes the validated immutable object during pre-CUDA-Graph preparation, while no config file preserves the original vLLM MXFP8 path.
+**Architecture:** Port the three validated Python override files onto the clean
+`nemo-speed-v0.20.2` base, then isolate JSON parsing and compatibility checks
+in a small typed module. The existing adaptive runtime consumes the validated
+immutable object during pre-CUDA-Graph preparation, while no config file
+preserves the original vLLM MXFP8 path. A separate offline CLI converts runtime
+shape traces into a deterministic inventory, benchmarks every eligible
+physical shape against runner default `-1`, applies correctness and repeat
+gates, and emits the immutable runtime JSON. Runtime code never modifies the
+manifest.
 
 **Tech Stack:** Python 3.12, vLLM 0.20.2 fork, PyTorch 2.11/cu130, FlashInfer 0.6.8.post1, pytest, JSON, CUDA Graph.
 
@@ -461,7 +472,145 @@ git add \
 git commit -s -m "feat(mxfp8): configure adaptive state from JSON"
 ```
 
-### Task 5: Verify the custom fork handoff
+### Task 5: Add the offline trace-to-shmoo qualification pipeline
+
+**Files:**
+- Create: `tools/mxfp8/offline_shmoo.py`
+- Create: `tests/kernels/quantization/test_mxfp8_offline_shmoo.py`
+
+**Interfaces:**
+- Consumes: adaptive dense shape-trace JSONL and raw per-tactic benchmark JSONL.
+- Produces: a deterministic shape inventory, per-shape qualification results,
+  and a schema-1 runtime manifest compatible with
+  `load_mxfp8_dense_runtime_config`.
+
+The tool has four explicit stages:
+
+```text
+inventory: trace JSONL -> unique physical (layout,m,n,k) shapes + frequencies
+shmoo:     inventory -> correctness/timing observations for runner -1 and tactics
+promote:   repeated observations -> one qualified tactic or default -1 per shape
+validate:  generated manifest -> production loader + deterministic regeneration
+```
+
+- [ ] **Step 1: Add failing pure tests for trace inventory**
+
+Use literal JSONL fixtures. Assert deterministic aggregation by
+`(layout, m, n, k)`, summed call frequency, retained config SHA256, and
+rejection of malformed records, mixed config hashes, unsupported layouts,
+non-positive dimensions, and an empty eligible inventory.
+
+- [ ] **Step 2: Add failing pure tests for qualification**
+
+Use literal benchmark observations with at least three repeats per candidate.
+Assert:
+
+```text
+runner default tactic is always -1
+only numerically correct observations are eligible
+all required repeats must be present
+median timing chooses the fastest candidate
+promotion requires speedup >= 1.02 versus default -1
+ties are resolved by the lower tactic ID
+unqualified shapes remain absent from both tactic tables
+8x4 and 128x4 shapes cannot cross tables
+```
+
+- [ ] **Step 3: Run and verify failure**
+
+Run:
+
+```bash
+uv run --no-project --with pytest python -m pytest \
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py -q
+```
+
+Expected: collection fails because `tools/mxfp8/offline_shmoo.py` is absent.
+
+- [ ] **Step 4: Implement deterministic inventory and promotion**
+
+Provide typed pure functions:
+
+```python
+def load_shape_inventory(paths: Sequence[Path]) -> tuple[ShapeRecord, ...]:
+    ...
+
+def qualify_observations(
+    inventory: Sequence[ShapeRecord],
+    observations: Sequence[BenchmarkObservation],
+    *,
+    minimum_repeat_count: int,
+    minimum_cosine_similarity: float,
+    minimum_speedup_vs_default: float,
+) -> tuple[QualifiedShape, ...]:
+    ...
+
+def build_qualified_manifest(
+    qualified_shapes: Sequence[QualifiedShape],
+    *,
+    compatibility: Mapping[str, object],
+    provenance: Mapping[str, object],
+) -> dict[str, object]:
+    ...
+```
+
+Stable JSON output uses sorted keys, two-space indentation, and one trailing
+newline. Raw trace and shmoo input SHA256 values are included in provenance.
+An inventory with zero eligible dense MXFP8 shapes exits nonzero with a clear
+message so a Qwen run that bypasses the dense path cannot silently produce an
+empty “optimized” table.
+
+- [ ] **Step 5: Port the validated GPU shmoo runner**
+
+Adapt only the reusable direct-TRTLLM benchmark logic from benchmark commit
+`4bb11d11b2fdef33cd84b5430d4403428c07a2e1`:
+
+```text
+experiments/sweep/microbench_mxfp8_trtllm_tactic_sweep.py
+```
+
+The `shmoo` command:
+
+```text
+uses the exact traced physical M/N/K and recorded 8x4 or 128x4 layout
+benchmarks runner default -1 and every enumerated valid tactic
+uses BF16/reference output for correctness
+runs at least three independent repeats
+records warmup, iteration count, seed, device, versions, and container digest
+never pads a traced 8x4 shape to 128 rows
+writes append-only raw JSONL and supports safe resume by exact identity
+```
+
+GPU-specific imports are lazy so inventory, promotion, validation, and unit
+tests run on CPU-only developer machines.
+
+- [ ] **Step 6: Validate generated manifests through production code**
+
+The `validate` command loads the emitted file through
+`load_mxfp8_dense_runtime_config`, verifies the exact model, tensor parallel
+size, versions, compute capability, and source hashes, then regenerates the
+file in memory and fails if bytes differ. Provide `--check` for CI.
+
+- [ ] **Step 7: Run focused verification and commit**
+
+Run:
+
+```bash
+uv run --no-project --with pytest python -m pytest \
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py \
+  tests/kernels/quantization/test_mxfp8_tactic_config.py \
+  tests/kernels/quantization/test_build_mxfp8_tactic_config.py -q
+uvx ruff check \
+  tools/mxfp8/offline_shmoo.py \
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py
+git diff --check
+git add \
+  tools/mxfp8/offline_shmoo.py \
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py
+git commit -s -m "feat(mxfp8): add offline tactic qualification pipeline"
+```
+
+### Task 6: Verify the custom fork handoff
 
 **Files:**
 - Create: `docs/mxfp8-adaptive-nemorl.md`
@@ -485,6 +634,7 @@ VLLM_MXFP8_DENSE_CONFIG_FILE relative and absolute forms
 original versus adaptive A/B behavior
 JSON schema and fail-closed conditions
 TP/model/version specificity of tactic IDs
+offline inventory, shmoo, promotion, validation, and zero-hit failure workflow
 ```
 
 - [ ] **Step 2: Run fresh CPU verification**
@@ -496,17 +646,20 @@ uv run --no-project --with pytest python -m pytest \
   tests/kernels/quantization/test_mxfp8_adaptive_layout_v020.py \
   tests/kernels/quantization/test_mxfp8_trtllm_weight_shuffle_contract.py \
   tests/kernels/quantization/test_mxfp8_tactic_config.py \
-  tests/kernels/quantization/test_build_mxfp8_tactic_config.py -q
+  tests/kernels/quantization/test_build_mxfp8_tactic_config.py \
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py -q
 uvx ruff check \
   vllm/model_executor/kernels/linear/mxfp8/flashinfer.py \
   vllm/model_executor/layers/quantization/utils/mxfp8_utils.py \
   vllm/model_executor/kernels/linear/mxfp8/tactic_config.py \
   vllm/utils/flashinfer.py \
   tools/mxfp8/build_tactic_config.py \
+  tools/mxfp8/offline_shmoo.py \
   tests/kernels/quantization/test_mxfp8_adaptive_layout_v020.py \
   tests/kernels/quantization/test_mxfp8_trtllm_weight_shuffle_contract.py \
   tests/kernels/quantization/test_mxfp8_tactic_config.py \
-  tests/kernels/quantization/test_build_mxfp8_tactic_config.py
+  tests/kernels/quantization/test_build_mxfp8_tactic_config.py \
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py
 git diff --check
 ```
 
