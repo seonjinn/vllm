@@ -614,6 +614,7 @@ git commit -s -m "feat(mxfp8): add offline tactic qualification pipeline"
 
 **Files:**
 - Create: `docs/mxfp8-adaptive-nemorl.md`
+- Modify: `tests/test_ray_env.py`
 
 **Interfaces:**
 - Produces: reproducible branch/build/runtime instructions for the NeMo-RL
@@ -635,9 +636,18 @@ original versus adaptive A/B behavior
 JSON schema and fail-closed conditions
 TP/model/version specificity of tactic IDs
 offline inventory, shmoo, promotion, validation, and zero-hit failure workflow
+vLLM 0.20 native VLLM_* forwarding into internal Ray workers
 ```
 
-- [ ] **Step 2: Run fresh CPU verification**
+- [ ] **Step 2: Lock the internal Ray environment contract**
+
+Add a focused test that places
+`VLLM_MXFP8_DENSE_CONFIG_FILE=qwen3_30ba3b_tp1_v0202_rollout_trace_bootstrap.json`
+in the environment and asserts `get_env_vars_to_copy()` returns that exact
+key/value without `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`. Preserve the existing
+additive behavior for explicitly listed non-`VLLM_*` variables.
+
+- [ ] **Step 3: Run fresh CPU verification**
 
 Run:
 
@@ -647,7 +657,8 @@ uv run --no-project --with pytest python -m pytest \
   tests/kernels/quantization/test_mxfp8_trtllm_weight_shuffle_contract.py \
   tests/kernels/quantization/test_mxfp8_tactic_config.py \
   tests/kernels/quantization/test_build_mxfp8_tactic_config.py \
-  tests/kernels/quantization/test_mxfp8_offline_shmoo.py -q
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py \
+  tests/test_ray_env.py -q
 uvx ruff check \
   vllm/model_executor/kernels/linear/mxfp8/flashinfer.py \
   vllm/model_executor/layers/quantization/utils/mxfp8_utils.py \
@@ -659,20 +670,21 @@ uvx ruff check \
   tests/kernels/quantization/test_mxfp8_trtllm_weight_shuffle_contract.py \
   tests/kernels/quantization/test_mxfp8_tactic_config.py \
   tests/kernels/quantization/test_build_mxfp8_tactic_config.py \
-  tests/kernels/quantization/test_mxfp8_offline_shmoo.py
+  tests/kernels/quantization/test_mxfp8_offline_shmoo.py \
+  tests/test_ray_env.py
 git diff --check
 ```
 
 Expected: pytest and Ruff exit zero with no failures.
 
-- [ ] **Step 3: Commit the handoff document**
+- [ ] **Step 4: Commit the handoff document and Ray regression**
 
 ```bash
-git add docs/mxfp8-adaptive-nemorl.md
+git add docs/mxfp8-adaptive-nemorl.md tests/test_ray_env.py
 git commit -s -m "docs: describe NeMo-RL adaptive MXFP8 handoff"
 ```
 
-- [ ] **Step 4: Record the exact branch head**
+- [ ] **Step 5: Record the exact branch head**
 
 Run:
 
