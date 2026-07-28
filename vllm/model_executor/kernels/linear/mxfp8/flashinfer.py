@@ -445,6 +445,15 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
                     if bindings is not None
                     else _MXFP8_CAPTURE_DEFAULT_BINDING
                 )
+                if os.environ.get(
+                    "VLLM_MXFP8_DENSE_REQUIRE_EXACT_TACTIC", ""
+                ).strip().lower() in {"1", "true", "yes", "on"} and (
+                    tactic < 0 or tactic_source != "exact_table"
+                ):
+                    raise RuntimeError(
+                        "MXFP8 exact tactic is required before CUDA Graph "
+                        f"capture for M={m}: source={tactic_source}, tactic={tactic}"
+                    )
                 tactic_specialization_fingerprint = (
                     mxfp8_trtllm_specialization_fingerprint(input_2d.device)
                 )

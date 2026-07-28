@@ -766,6 +766,27 @@ def _record_mxfp8_tactic_resolution(
         )
 
 
+def _require_exact_mxfp8_tactic() -> bool:
+    value = os.environ.get("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TACTIC", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_required_exact_mxfp8_tactic(
+    key: Mxfp8TacticKey,
+    *,
+    selected_tactic: int,
+    tactic_source: str,
+    artifact_lookup_hit: bool | None,
+) -> None:
+    if not _require_exact_mxfp8_tactic():
+        return
+    if artifact_lookup_hit is not True or selected_tactic < 0:
+        raise RuntimeError(
+            "MXFP8 exact tactic is required but unavailable for "
+            f"{key}: source={tactic_source}, tactic={selected_tactic}"
+        )
+
+
 def _resolve_mxfp8_trtllm_tactic(
     state: _Mxfp8TrtllmTacticState,
     key: Mxfp8TacticKey,
@@ -796,6 +817,12 @@ def _resolve_mxfp8_trtllm_tactic_locked(
             selected_tactic=existing,
             tactic_source=tactic_source,
             requested_tactic=requested_tactic,
+            artifact_lookup_hit=artifact_lookup_hit,
+        )
+        _validate_required_exact_mxfp8_tactic(
+            key,
+            selected_tactic=existing,
+            tactic_source=tactic_source,
             artifact_lookup_hit=artifact_lookup_hit,
         )
         return existing, tactic_source
@@ -837,6 +864,12 @@ def _resolve_mxfp8_trtllm_tactic_locked(
         selected_tactic=selected_tactic,
         tactic_source=tactic_source,
         requested_tactic=requested_tactic,
+        artifact_lookup_hit=artifact_lookup_hit,
+    )
+    _validate_required_exact_mxfp8_tactic(
+        key,
+        selected_tactic=selected_tactic,
+        tactic_source=tactic_source,
         artifact_lookup_hit=artifact_lookup_hit,
     )
     return selected_tactic, tactic_source
@@ -1263,12 +1296,6 @@ def _mxfp8_trtllm_linear_fixed_impl(
                 key,
                 runner_inputs,
             )
-    output = _run_mxfp8_trtllm_pre_resolved(
-        state,
-        use_8x4_sf_layout=use_8x4_sf_layout,
-        runner_inputs=runner_inputs,
-        tactic=selected_tactic,
-    )
     if (
         not torch.compiler.is_compiling()
         and not is_capturing
@@ -1296,6 +1323,12 @@ def _mxfp8_trtllm_linear_fixed_impl(
                 else {}
             ),
         )
+    output = _run_mxfp8_trtllm_pre_resolved(
+        state,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+        runner_inputs=runner_inputs,
+        tactic=selected_tactic,
+    )
     return output[:, :output_features].contiguous()
 
 

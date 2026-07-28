@@ -396,6 +396,28 @@ def test_exact_miss_uses_matching_direct_runner_default(
     assert source == "exact_miss"
 
 
+def test_exact_miss_fails_before_launch_when_exact_tactic_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_8x4 = FakeRunner([61, 65, 66])
+    dispatch_state = state(
+        tactics={key(layout="8x4"): 65},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([17]),
+    )
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TACTIC", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    with pytest.raises(RuntimeError, match="exact tactic is required"):
+        _resolve_mxfp8_trtllm_tactic(
+            dispatch_state,
+            key(layout="8x4", m=33),
+            runner_inputs(),
+        )
+
+    assert runner_8x4.forward_tactics == []
+
+
 def test_runtime_illegal_tactic_is_downgraded_to_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -807,6 +829,72 @@ def test_fixed_impl_validates_exact_forward_contract_before_registration(
     assert active_inputs[4] is torch.bfloat16
     assert active_inputs[5].shape == (2, 8)
     assert active_inputs[6] is dispatch_state.workspace_8x4
+
+
+def test_shape_trace_is_written_before_runner_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    exact_key = Mxfp8TacticKey(
+        m_logical=2,
+        n_logical=7,
+        k_logical=4,
+        n_physical=8,
+        k_physical=4,
+        activation_scale_layout="8x4",
+        output_dtype="bfloat16",
+    )
+
+    class OrderedRunner(FakeRunner):
+        def forward(self, inputs: list[Any], tactic: int) -> torch.Tensor:
+            events.append("launch")
+            return super().forward(inputs, tactic)
+
+    dispatch_state = state(
+        tactics={exact_key: 65},
+        runner_8x4=OrderedRunner([65]),
+        runner_128x4=FakeRunner([]),
+    )
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_STATES_BY_DEVICE_INDEX",
+        [dispatch_state],
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "_MXFP8_TRTLLM_TRACE_CALLBACK",
+        lambda **_kwargs: events.append("trace"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(
+            SfLayout=SimpleNamespace(layout_8x4="8x4", layout_128x4="128x4"),
+            mxfp8_quantize=lambda *_args, **_kwargs: (
+                torch.empty((2, 4), dtype=torch.float8_e4m3fn),
+                torch.empty(1, dtype=torch.uint8),
+            ),
+        ),
+    )
+
+    _mxfp8_trtllm_linear_fixed_impl(
+        torch.empty((2, 4), dtype=torch.bfloat16),
+        torch.empty((8, 4), dtype=torch.float8_e4m3fn),
+        torch.empty(1, dtype=torch.uint8),
+        7,
+        -2,
+        "unresolved_eager",
+        "",
+        "model.layers.0.mlp.fc1",
+        "FC1",
+        "eager",
+        "eager",
+        use_8x4_sf_layout=True,
+    )
+
+    assert events == ["trace", "launch"]
 
 
 def test_static_specialization_lifecycle_binds_worker_validated_tactic(

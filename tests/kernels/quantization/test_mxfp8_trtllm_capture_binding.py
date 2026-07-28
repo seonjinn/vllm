@@ -33,8 +33,10 @@ def test_capture_uses_layer_prewarmed_tactic(
     monkeypatch.setattr(
         flashinfer,
         "mxfp8_trtllm_adaptive_linear",
-        lambda *args: calls.append(args)
-        or torch.empty((args[0].shape[0], args[3]), dtype=torch.bfloat16),
+        lambda *args: (
+            calls.append(args)
+            or torch.empty((args[0].shape[0], args[3]), dtype=torch.bfloat16)
+        ),
     )
     kernel = object.__new__(flashinfer.FlashInferTrtllmMxfp8LinearKernel)
 
@@ -60,8 +62,10 @@ def test_capture_unseen_m_uses_default_tactic_without_mutation(
     monkeypatch.setattr(
         flashinfer,
         "mxfp8_trtllm_adaptive_linear",
-        lambda *args: calls.append(args)
-        or torch.empty((args[0].shape[0], args[3]), dtype=torch.bfloat16),
+        lambda *args: (
+            calls.append(args)
+            or torch.empty((args[0].shape[0], args[3]), dtype=torch.bfloat16)
+        ),
     )
     kernel = object.__new__(flashinfer.FlashInferTrtllmMxfp8LinearKernel)
 
@@ -72,6 +76,21 @@ def test_capture_unseen_m_uses_default_tactic_without_mutation(
 
     assert calls[0][6:9] == (-1, "capture_exact_miss", "worker-fingerprint")
     assert not hasattr(layer, "_mxfp8_trtllm_capture_bindings")
+
+
+def test_capture_unseen_m_fails_when_exact_tactic_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = _layer(2, None)
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TACTIC", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    kernel = object.__new__(flashinfer.FlashInferTrtllmMxfp8LinearKernel)
+
+    with pytest.raises(RuntimeError, match="exact tactic is required"):
+        kernel.apply_weights(
+            layer,
+            torch.empty((2, 4), dtype=torch.bfloat16),
+        )
 
 
 def test_eager_prewarm_caches_resolved_tactic(
