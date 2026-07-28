@@ -215,6 +215,7 @@ def _load_mxfp8_exact_tactic_table(
             k = entry["k"]
             layout = entry["layout"]
             tactic = entry["tactic"]
+            valid_tactics = entry["valid_tactics"]
         except KeyError as exc:
             raise ValueError(
                 f"Invalid MXFP8 exact tactic entry {index}: {exc}"
@@ -246,6 +247,22 @@ def _load_mxfp8_exact_tactic_table(
         if tactic < -1:
             raise ValueError(
                 f"MXFP8 exact tactic entry {index} has invalid tactic {tactic}."
+            )
+        if not isinstance(valid_tactics, list) or any(
+            type(value) is not int or value < 0 for value in valid_tactics
+        ):
+            raise ValueError(
+                f"MXFP8 exact tactic entry {index} valid_tactics must be "
+                "a list of nonnegative JSON integers."
+            )
+        if len(valid_tactics) != len(set(valid_tactics)):
+            raise ValueError(
+                f"MXFP8 exact tactic entry {index} has duplicate valid tactics."
+            )
+        if tactic != -1 and tactic not in valid_tactics:
+            raise ValueError(
+                f"MXFP8 exact tactic entry {index} pins tactic {tactic}, "
+                f"which is not in valid_tactics={valid_tactics}."
             )
         key = (m, n_logical, n_physical, k, layout)
         if key in tactics:

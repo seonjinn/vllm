@@ -241,6 +241,7 @@ def test_mxfp8_exact_tactic_table_uses_full_execution_signature(
                 "k": 8192,
                 "layout": "8x4",
                 "tactic": 65,
+                "valid_tactics": [61, 65, 66],
             },
             {
                 "m": 1000,
@@ -249,6 +250,7 @@ def test_mxfp8_exact_tactic_table_uses_full_execution_signature(
                 "k": 8192,
                 "layout": "128x4",
                 "tactic": 92,
+                "valid_tactics": [91, 92, 93],
             },
         ],
     }
@@ -331,6 +333,7 @@ def test_mxfp8_exact_tactic_table_rejects_non_integer_fields(
         "k": 8192,
         "layout": "8x4",
         "tactic": 65,
+        "valid_tactics": [61, 65, 66],
     }
     entry[field] = invalid_value
     payload = {
@@ -368,6 +371,42 @@ def test_mxfp8_exact_tactic_table_rejects_runtime_fingerprint_mismatch() -> None
 
     with pytest.raises(ValueError, match="flashinfer_version"):
         _validate_mxfp8_runtime_fingerprint(expected, current)
+
+
+def test_mxfp8_exact_tactic_table_rejects_tactic_outside_valid_set(
+    tmp_path: Path,
+) -> None:
+    table_path = tmp_path / "invalid-tactic.json"
+    payload = {
+        "schema_version": 1,
+        "metadata": {
+            "runtime_fingerprint": {
+                "vllm_version": "0.25.1",
+                "flashinfer_version": "0.6.13",
+                "cuda_version": "12.9",
+                "device_name": "NVIDIA GB200",
+                "compute_capability": [10, 0],
+            }
+        },
+        "entries": [
+            {
+                "m": 8,
+                "n_logical": 8768,
+                "n_physical": 8832,
+                "k": 8192,
+                "layout": "8x4",
+                "tactic": 999,
+                "valid_tactics": [61, 65, 66],
+            }
+        ],
+    }
+    table_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not in valid_tactics"):
+        _load_mxfp8_exact_tactic_table(
+            str(table_path),
+            hashlib.sha256(table_path.read_bytes()).hexdigest(),
+        )
 
 
 def test_mxfp8_exact_tactic_table_is_opt_in(
