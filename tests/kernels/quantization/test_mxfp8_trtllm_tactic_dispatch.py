@@ -418,6 +418,48 @@ def test_exact_miss_fails_before_launch_when_exact_tactic_is_required(
     assert runner_8x4.forward_tactics == []
 
 
+def test_table_default_is_allowed_when_exact_table_entry_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_8x4 = FakeRunner([61, 65, 66])
+    dispatch_state = state(
+        tactics={key(layout="8x4"): -1},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([17]),
+    )
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TABLE_ENTRY", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    tactic, source = _resolve_mxfp8_trtllm_tactic(
+        dispatch_state,
+        key(layout="8x4"),
+        runner_inputs(),
+    )
+
+    assert tactic == -1
+    assert source == "exact_table_default"
+
+
+def test_exact_miss_fails_when_exact_table_entry_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_8x4 = FakeRunner([61, 65, 66])
+    dispatch_state = state(
+        tactics={key(layout="8x4"): 65},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([17]),
+    )
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TABLE_ENTRY", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    with pytest.raises(RuntimeError, match="exact table entry is required"):
+        _resolve_mxfp8_trtllm_tactic(
+            dispatch_state,
+            key(layout="8x4", m=33),
+            runner_inputs(),
+        )
+
+
 def test_runtime_illegal_tactic_is_downgraded_to_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -452,6 +494,26 @@ def test_runtime_illegal_tactic_is_downgraded_to_default(
     assert dispatch_state.resolved_tactics[key(layout="8x4")] == -1
     assert audit.hits == 1
     assert audit.misses == 0
+
+
+def test_runtime_illegal_tactic_fails_when_exact_table_entry_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_8x4 = FakeRunner([61, 66])
+    dispatch_state = state(
+        tactics={key(layout="8x4"): 65},
+        runner_8x4=runner_8x4,
+        runner_128x4=FakeRunner([17]),
+    )
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TABLE_ENTRY", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    with pytest.raises(RuntimeError, match="exact table entry is required"):
+        _resolve_mxfp8_trtllm_tactic(
+            dispatch_state,
+            key(layout="8x4"),
+            runner_inputs(),
+        )
 
 
 def test_per_key_resolution_is_serialized(

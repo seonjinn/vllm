@@ -93,6 +93,50 @@ def test_capture_unseen_m_fails_when_exact_tactic_is_required(
         )
 
 
+def test_capture_uses_table_default_when_exact_table_entry_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TABLE_ENTRY", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        flashinfer,
+        "mxfp8_trtllm_specialization_fingerprint",
+        lambda _device: "worker-fingerprint",
+    )
+    monkeypatch.setattr(
+        flashinfer,
+        "mxfp8_trtllm_adaptive_linear",
+        lambda *args: (
+            calls.append(args)
+            or torch.empty((args[0].shape[0], args[3]), dtype=torch.bfloat16)
+        ),
+    )
+    kernel = object.__new__(flashinfer.FlashInferTrtllmMxfp8LinearKernel)
+
+    kernel.apply_weights(
+        _layer(2, (-1, "exact_table_default")),
+        torch.empty((2, 4), dtype=torch.bfloat16),
+    )
+
+    assert calls[0][6:9] == (-1, "exact_table_default", "worker-fingerprint")
+
+
+def test_capture_unseen_m_fails_when_exact_table_entry_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = _layer(2, None)
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TABLE_ENTRY", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    kernel = object.__new__(flashinfer.FlashInferTrtllmMxfp8LinearKernel)
+
+    with pytest.raises(RuntimeError, match="exact table entry is required"):
+        kernel.apply_weights(
+            layer,
+            torch.empty((2, 4), dtype=torch.bfloat16),
+        )
+
+
 def test_eager_prewarm_caches_resolved_tactic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

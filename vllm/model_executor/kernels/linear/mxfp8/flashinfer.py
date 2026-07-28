@@ -15,6 +15,8 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     configure_mxfp8_trtllm_adaptive_compilation,
     mxfp8_e4m3_quantize,
     mxfp8_trtllm_adaptive_linear,
+    mxfp8_trtllm_exact_table_entry_required,
+    mxfp8_trtllm_is_exact_table_binding,
     mxfp8_trtllm_resolved_binding,
     mxfp8_trtllm_specialization_fingerprint,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -452,6 +454,13 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
                 ):
                     raise RuntimeError(
                         "MXFP8 exact tactic is required before CUDA Graph "
+                        f"capture for M={m}: source={tactic_source}, tactic={tactic}"
+                    )
+                if mxfp8_trtllm_exact_table_entry_required() and (
+                    not mxfp8_trtllm_is_exact_table_binding(tactic, tactic_source)
+                ):
+                    raise RuntimeError(
+                        "MXFP8 exact table entry is required before CUDA Graph "
                         f"capture for M={m}: source={tactic_source}, tactic={tactic}"
                     )
                 tactic_specialization_fingerprint = (

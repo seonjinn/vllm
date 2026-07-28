@@ -771,6 +771,20 @@ def _require_exact_mxfp8_tactic() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def mxfp8_trtllm_exact_table_entry_required() -> bool:
+    value = os.environ.get("VLLM_MXFP8_DENSE_REQUIRE_EXACT_TABLE_ENTRY", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def mxfp8_trtllm_is_exact_table_binding(
+    selected_tactic: int,
+    tactic_source: str,
+) -> bool:
+    return (tactic_source == "exact_table" and selected_tactic >= 0) or (
+        tactic_source == "exact_table_default" and selected_tactic == -1
+    )
+
+
 def _validate_required_exact_mxfp8_tactic(
     key: Mxfp8TacticKey,
     *,
@@ -778,11 +792,19 @@ def _validate_required_exact_mxfp8_tactic(
     tactic_source: str,
     artifact_lookup_hit: bool | None,
 ) -> None:
-    if not _require_exact_mxfp8_tactic():
-        return
-    if artifact_lookup_hit is not True or selected_tactic < 0:
+    if _require_exact_mxfp8_tactic() and (
+        artifact_lookup_hit is not True or selected_tactic < 0
+    ):
         raise RuntimeError(
             "MXFP8 exact tactic is required but unavailable for "
+            f"{key}: source={tactic_source}, tactic={selected_tactic}"
+        )
+    if mxfp8_trtllm_exact_table_entry_required() and (
+        artifact_lookup_hit is not True
+        or not mxfp8_trtllm_is_exact_table_binding(selected_tactic, tactic_source)
+    ):
+        raise RuntimeError(
+            "MXFP8 exact table entry is required but unavailable for "
             f"{key}: source={tactic_source}, tactic={selected_tactic}"
         )
 
