@@ -2,10 +2,61 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for vllm.ray.ray_env — env var propagation to Ray workers."""
 
+import importlib.util
+import logging
 import os
+import sys
+from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
-from vllm.ray.ray_env import get_env_vars_to_copy
+
+class _EnvModule(ModuleType):
+    VLLM_CONFIG_ROOT = str(Path(__file__).with_name(".missing-vllm-config"))
+    environment_variables: dict[str, object] = {}
+
+    def __getattr__(self, name: str) -> str:
+        if name in {
+            "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY",
+            "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY",
+        }:
+            return os.getenv(name, "")
+        raise AttributeError(name)
+
+
+def _load_ray_env_module() -> ModuleType:
+    module_path = Path(__file__).parents[1] / "vllm/ray/ray_env.py"
+    spec = importlib.util.spec_from_file_location(
+        "_standalone_vllm_ray_env", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load vLLM Ray environment module")
+
+    fake_vllm = ModuleType("vllm")
+    fake_envs = _EnvModule("vllm.envs")
+    fake_logger = ModuleType("vllm.logger")
+    fake_logger.init_logger = logging.getLogger  # type: ignore[attr-defined]
+    original_modules = {
+        name: sys.modules.get(name)
+        for name in ("vllm", "vllm.envs", "vllm.logger")
+    }
+    try:
+        sys.modules["vllm"] = fake_vllm
+        sys.modules["vllm.envs"] = fake_envs
+        sys.modules["vllm.logger"] = fake_logger
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, original in original_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+
+
+_RAY_ENV = _load_ray_env_module()
+get_env_vars_to_copy = _RAY_ENV.get_env_vars_to_copy
 
 # ---------------------------------------------------------------------------
 # Default prefix matching
@@ -15,6 +66,28 @@ from vllm.ray.ray_env import get_env_vars_to_copy
 class TestDefaultPrefixes:
     """Built-in prefixes (VLLM_, LMCACHE_, NCCL_, UCX_, HF_, HUGGING_FACE_)
     should be forwarded without any extra configuration."""
+
+    @patch.dict(
+        os.environ,
+        {
+            "VLLM_MXFP8_DENSE_CONFIG_FILE": (
+                "qwen3_30ba3b_tp1_v0202_rollout_trace_bootstrap.json"
+            )
+        },
+        clear=True,
+    )
+    def test_mxfp8_dense_config_uses_native_vllm_prefix(self):
+        """The one-file MXFP8 contract reaches Ray workers without extra vars."""
+        expected = "qwen3_30ba3b_tp1_v0202_rollout_trace_bootstrap.json"
+
+        assert "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY" not in os.environ
+        result = get_env_vars_to_copy()
+        copied = {
+            name: os.environ[name] for name in result if name in os.environ
+        }
+
+        assert "VLLM_MXFP8_DENSE_CONFIG_FILE" in result
+        assert copied["VLLM_MXFP8_DENSE_CONFIG_FILE"] == expected
 
     @patch.dict(os.environ, {"LMCACHE_LOCAL_CPU": "True"}, clear=False)
     def test_lmcache_prefix(self):
@@ -107,8 +180,9 @@ class TestExclusion:
         assert "CUDA_VISIBLE_DEVICES" not in result
 
     @patch.dict(os.environ, {"LMCACHE_LOCAL_CPU": "True"}, clear=False)
-    @patch(
-        "vllm.ray.ray_env.RAY_NON_CARRY_OVER_ENV_VARS",
+    @patch.object(
+        _RAY_ENV,
+        "RAY_NON_CARRY_OVER_ENV_VARS",
         {"LMCACHE_LOCAL_CPU"},
     )
     def test_non_carry_over_blacklist(self):
