@@ -60,6 +60,7 @@ def _manifest() -> dict[str, Any]:
             "source_manifest_sha256": "a" * 64,
             "source_hint_sha256": "b" * 64,
             "container_sha256": "c" * 64,
+            "qualification_scope": "standalone_serving_seed",
             "qualification_repeat_count": 3,
             "minimum_cosine_similarity": 0.999,
             "minimum_speedup_vs_default": 1.02,
@@ -71,11 +72,17 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
-def _load(reference: str, *, config_dir: Path | None = None) -> Any:
+def _load(
+    reference: str,
+    *,
+    actual_vllm_version: str = "0.20.2+local",
+    actual_flashinfer_version: str = "0.6.8.post1+cu129",
+    config_dir: Path | None = None,
+) -> Any:
     return load_mxfp8_dense_runtime_config(
         reference,
-        actual_vllm_version="0.20.2+local",
-        actual_flashinfer_version="0.6.8.post1+cu129",
+        actual_vllm_version=actual_vllm_version,
+        actual_flashinfer_version=actual_flashinfer_version,
         actual_compute_capability=(10, 0),
         package_config_dir=config_dir,
     )
@@ -92,6 +99,7 @@ def test_loads_absolute_manifest_with_immutable_metadata(tmp_path: Path) -> None
     assert config.tactics_8x4 == (((1, 2048, 8192), 66),)
     assert config.tactics_128x4 == (((1000, 2048, 8192), 70),)
     assert config.source_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert config.provenance["qualification_scope"] == "standalone_serving_seed"
     with pytest.raises(TypeError):
         config.compatibility["model"] = "other"
     with pytest.raises(TypeError):
@@ -207,7 +215,11 @@ def test_rejects_missing_required_metadata(tmp_path: Path, section: str) -> None
 
 @pytest.mark.parametrize(
     ("section", "field"),
-    [("policy", "switch_m"), ("provenance", "source_manifest_sha256")],
+    [
+        ("policy", "switch_m"),
+        ("provenance", "source_manifest_sha256"),
+        ("provenance", "qualification_scope"),
+    ],
 )
 def test_rejects_missing_required_metadata_field(
     tmp_path: Path, section: str, field: str
@@ -220,6 +232,51 @@ def test_rejects_missing_required_metadata_field(
 
     with pytest.raises(ValueError, match=re.escape(section)):
         _load(str(path))
+
+
+@pytest.mark.parametrize(
+    ("actual_vllm_version", "actual_flashinfer_version", "error"),
+    [
+        ("0.20.2rc1", "0.6.8.post1+cu129", "compatibility.vllm_version"),
+        ("0.20.2.dev1", "0.6.8.post1+cu129", "compatibility.vllm_version"),
+        ("0.20.2+local", "0.6.8", "compatibility.flashinfer_version"),
+        ("0.20.2+local", "0.6.8rc1", "compatibility.flashinfer_version"),
+        ("0.20.2+local", "0.6.8.post2", "compatibility.flashinfer_version"),
+    ],
+)
+def test_rejects_version_qualifier_mismatches(
+    tmp_path: Path,
+    actual_vllm_version: str,
+    actual_flashinfer_version: str,
+    error: str,
+) -> None:
+    """Only a local version label may differ from a qualified manifest version."""
+    path = tmp_path / "version-mismatch.json"
+    _write_manifest(path, _manifest())
+
+    with pytest.raises(RuntimeError, match=re.escape(error)):
+        _load(
+            str(path),
+            actual_vllm_version=actual_vllm_version,
+            actual_flashinfer_version=actual_flashinfer_version,
+        )
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_rejects_non_finite_json_constants(constant: str) -> None:
+    """JSON parser constants cannot create non-finite qualification values."""
+    raw_json = f'{{"minimum_speedup_vs_default": {constant}}}'.encode()
+
+    with pytest.raises(ValueError, match="non-finite"):
+        _MODULE._load_document(raw_json)
+
+
+def test_rejects_duplicate_json_object_keys() -> None:
+    """The parser cannot silently overwrite a duplicate manifest field."""
+    raw_json = b'{"schema_version": 1, "schema_version": 2}'
+
+    with pytest.raises(ValueError, match="duplicate JSON key: schema_version"):
+        _MODULE._load_document(raw_json)
 
 
 def test_rejects_relative_path_traversal(tmp_path: Path) -> None:

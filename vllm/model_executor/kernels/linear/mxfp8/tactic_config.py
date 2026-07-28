@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ _PROVENANCE_FIELDS = frozenset(
         "source_manifest_sha256",
         "source_hint_sha256",
         "container_sha256",
+        "qualification_scope",
         "qualification_repeat_count",
         "minimum_cosine_similarity",
         "minimum_speedup_vs_default",
@@ -159,7 +161,14 @@ def _read_config(reference: str, package_config_dir: Path | None) -> tuple[Path,
 
 def _load_document(source_bytes: bytes) -> Mapping[str, object]:
     try:
-        parsed = cast(object, json.loads(source_bytes))
+        parsed = cast(
+            object,
+            json.loads(
+                source_bytes,
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_non_finite_json_constant,
+            ),
+        )
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("MXFP8 config must contain valid JSON") from error
     if not isinstance(parsed, dict) or not all(
@@ -167,6 +176,21 @@ def _load_document(source_bytes: bytes) -> Mapping[str, object]:
     ):
         raise ValueError("config must be a JSON object")
     return cast(Mapping[str, object], parsed)
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON key: {key}")
+        parsed[key] = value
+    return parsed
+
+
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError(f"JSON must not contain non-finite constant: {value}")
 
 
 def _require_exact_fields(
@@ -240,12 +264,12 @@ def _require_matching_base_version(
     if not isinstance(expected, str):
         raise ValueError(f"{field} must be a version string")
     try:
-        expected_base = Version(expected).base_version
-        actual_base = Version(actual).base_version
+        expected_public = Version(expected).public
+        actual_public = Version(actual).public
     except InvalidVersion as error:
         raise ValueError(f"{field} must be a valid version") from error
-    if expected_base != actual_base:
-        raise RuntimeError(f"{field} does not match the active base version")
+    if expected_public != actual_public:
+        raise RuntimeError(f"{field} does not match the active public version")
 
 
 def _validate_policy(policy: Mapping[str, object]) -> _ValidatedPolicy:
@@ -338,6 +362,11 @@ def _validate_provenance(provenance: Mapping[str, object]) -> None:
             character not in "0123456789abcdefABCDEF" for character in value
         ):
             raise ValueError(f"provenance.{key} must be a SHA-256 hexadecimal digest")
+    _require_nonempty_string(
+        provenance,
+        "qualification_scope",
+        "provenance.qualification_scope",
+    )
     _require_positive_integer(
         provenance,
         "qualification_repeat_count",
@@ -347,6 +376,8 @@ def _validate_provenance(provenance: Mapping[str, object]) -> None:
         value = provenance[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"provenance.{key} must be a number")
+        if not math.isfinite(value):
+            raise ValueError(f"provenance.{key} must be finite")
     cosine = cast(float | int, provenance["minimum_cosine_similarity"])
     if not 0 <= cosine <= 1:
         raise ValueError("provenance.minimum_cosine_similarity must be between 0 and 1")
