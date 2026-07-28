@@ -948,6 +948,147 @@ def test_gpu_family_matching_uses_exact_alias_tokens_not_substrings() -> None:
         )
 
 
+def test_qwen_trace_bootstrap_cli_writes_canonical_loader_validated_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fixed Qwen trace bootstrap must be reproducible and runtime-valid."""
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    common = [
+        "trace-bootstrap-qwen3-30ba3b-tp1",
+        "--source-manifest-sha256",
+        "a" * 64,
+        "--source-hint-sha256",
+        "b" * 64,
+        "--container-sha256",
+        _CONTAINER_SHA256,
+        "--output",
+    ]
+    expected = {
+        "schema_version": 1,
+        "mode": "adaptive",
+        "compatibility": {
+            "vllm_version": "0.20.2",
+            "vllm_base_commit": (
+                "5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1"
+            ),
+            "flashinfer_version": "0.6.8.post1",
+            "compute_capability": "10.0",
+            "gpu_family": "GB200",
+            "model": "Qwen/Qwen3-30B-A3B",
+            "tensor_parallel_size": 1,
+        },
+        "policy": {
+            "gemm_backend": "trtllm",
+            "layout": "adaptive",
+            "switch_m": 256,
+            "direct_trtllm": True,
+            "require_direct_trtllm": True,
+            "quant_backend": "cuda",
+            "require_8x4_quant": True,
+            "pad_to_128": False,
+            "default_tactic": -1,
+        },
+        "tactics": {"8x4": [], "128x4": []},
+        "provenance": {
+            "source_manifest_sha256": "a" * 64,
+            "source_hint_sha256": "b" * 64,
+            "container_sha256": _CONTAINER_SHA256,
+            "qualification_scope": (
+                "nemo_rl_qwen3_30ba3b_mxfp8_rollout_trace_bootstrap"
+            ),
+            "qualification_repeat_count": 3,
+            "minimum_cosine_similarity": 0.999,
+            "minimum_speedup_vs_default": 1.02,
+        },
+    }
+
+    assert main([*common, str(first)]) == 0
+    first_sha256 = capsys.readouterr().out.strip()
+    assert main([*common, str(second)]) == 0
+    second_sha256 = capsys.readouterr().out.strip()
+
+    expected_bytes = (
+        json.dumps(expected, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
+    assert first.read_bytes() == expected_bytes
+    assert second.read_bytes() == expected_bytes
+    assert first_sha256 == hashlib.sha256(expected_bytes).hexdigest()
+    assert second_sha256 == first_sha256
+    loaded_sha256, compatibility = _MODULE._load_bootstrap_runtime_manifest(
+        first
+    )
+    assert loaded_sha256 == first_sha256
+    assert compatibility == expected["compatibility"]
+
+
+@pytest.mark.parametrize(
+    ("invalid_flag", "invalid_value"),
+    [
+        ("--source-manifest-sha256", "not-a-digest"),
+        ("--source-hint-sha256", "A" * 64),
+        ("--container-sha256", "f" * 63),
+    ],
+)
+def test_qwen_trace_bootstrap_cli_rejects_invalid_provenance_before_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    invalid_flag: str,
+    invalid_value: str,
+) -> None:
+    """Malformed provenance must not leave a bootstrap artifact."""
+    output = tmp_path / "bootstrap.json"
+    arguments = {
+        "--source-manifest-sha256": "a" * 64,
+        "--source-hint-sha256": "b" * 64,
+        "--container-sha256": _CONTAINER_SHA256,
+    }
+    arguments[invalid_flag] = invalid_value
+    cli = ["trace-bootstrap-qwen3-30ba3b-tp1"]
+    for flag, value in arguments.items():
+        cli.extend((flag, value))
+    cli.extend(("--output", str(output)))
+
+    assert main(cli) == 2
+    assert not output.exists()
+    assert "lowercase SHA-256" in capsys.readouterr().err
+
+
+def test_qwen_trace_bootstrap_cli_fails_closed_on_loader_or_output_conflict(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loader rejection or existing target must never be overwritten."""
+    output = tmp_path / "bootstrap.json"
+    common = [
+        "trace-bootstrap-qwen3-30ba3b-tp1",
+        "--source-manifest-sha256",
+        "a" * 64,
+        "--source-hint-sha256",
+        "b" * 64,
+        "--container-sha256",
+        _CONTAINER_SHA256,
+        "--output",
+        str(output),
+    ]
+
+    def reject_manifest(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("simulated production loader rejection")
+
+    monkeypatch.setattr(
+        _MODULE, "_load_production_loader", lambda: reject_manifest
+    )
+    assert main(common) == 2
+    assert not output.exists()
+    assert "loader rejection" in capsys.readouterr().err
+
+    output.write_text("preserve", encoding="utf-8")
+    assert main(common) == 2
+    assert output.read_text(encoding="utf-8") == "preserve"
+    assert "already exists" in capsys.readouterr().err
+
+
 def test_aggregate_input_digest_is_path_and_argument_order_independent(
     tmp_path: Path,
 ) -> None:

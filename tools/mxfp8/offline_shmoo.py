@@ -11,9 +11,11 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 import re
 import statistics
 import sys
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -73,6 +75,20 @@ _GPU_FAMILY_ALIASES: dict[str, frozenset[str]] = {
     "H100": frozenset({"H100"}),
     "H200": frozenset({"H200"}),
 }
+_QWEN_TRACE_BOOTSTRAP_COMPATIBILITY = MappingProxyType(
+    {
+        "vllm_version": "0.20.2",
+        "vllm_base_commit": "5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1",
+        "flashinfer_version": "0.6.8.post1",
+        "compute_capability": "10.0",
+        "gpu_family": "GB200",
+        "model": "Qwen/Qwen3-30B-A3B",
+        "tensor_parallel_size": 1,
+    }
+)
+_QWEN_TRACE_BOOTSTRAP_SCOPE = (
+    "nemo_rl_qwen3_30ba3b_mxfp8_rollout_trace_bootstrap"
+)
 
 
 @dataclass(frozen=True)
@@ -512,6 +528,35 @@ def build_qualified_manifest(
         "tactics": entries,
         "provenance": dict(provenance),
     }
+
+
+def build_qwen3_30ba3b_tp1_trace_bootstrap_manifest(
+    *,
+    source_manifest_sha256: str,
+    source_hint_sha256: str,
+    container_sha256: str,
+) -> dict[str, object]:
+    """Build the one fixed empty manifest allowed for Qwen rollout tracing."""
+    provenance = {
+        "source_manifest_sha256": _require_sha256(
+            source_manifest_sha256, "source_manifest_sha256"
+        ),
+        "source_hint_sha256": _require_sha256(
+            source_hint_sha256, "source_hint_sha256"
+        ),
+        "container_sha256": _require_sha256(
+            container_sha256, "container_sha256"
+        ),
+        "qualification_scope": _QWEN_TRACE_BOOTSTRAP_SCOPE,
+        "qualification_repeat_count": 3,
+        "minimum_cosine_similarity": 0.999,
+        "minimum_speedup_vs_default": 1.02,
+    }
+    return build_qualified_manifest(
+        (),
+        compatibility=_QWEN_TRACE_BOOTSTRAP_COMPATIBILITY,
+        provenance=provenance,
+    )
 
 
 def build_benchmark_plan(
@@ -1714,6 +1759,57 @@ def _require_new_output(path: Path, field: str) -> None:
         raise ValueError(f"{field} already exists: {path.resolve()}")
 
 
+def _publish_validated_bootstrap(path: Path, payload: bytes) -> str:
+    _require_new_output(path, "bootstrap output")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, 0o644)
+        source_sha256, compatibility = _load_bootstrap_runtime_manifest(
+            temporary_path
+        )
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+        if source_sha256 != expected_sha256:
+            raise RuntimeError("validated bootstrap SHA256 does not match bytes")
+        if compatibility != dict(_QWEN_TRACE_BOOTSTRAP_COMPATIBILITY):
+            raise RuntimeError("validated bootstrap compatibility changed")
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError as error:
+            raise ValueError(
+                f"bootstrap output already exists: {path.resolve()}"
+            ) from error
+        return expected_sha256
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _run_trace_bootstrap_qwen3_30ba3b_tp1(
+    args: argparse.Namespace,
+) -> int:
+    manifest = build_qwen3_30ba3b_tp1_trace_bootstrap_manifest(
+        source_manifest_sha256=args.source_manifest_sha256,
+        source_hint_sha256=args.source_hint_sha256,
+        container_sha256=args.container_sha256,
+    )
+    source_sha256 = _publish_validated_bootstrap(
+        args.output, canonical_json_bytes(manifest)
+    )
+    print(source_sha256)
+    return 0
+
+
 def _run_inventory(args: argparse.Namespace) -> int:
     trace_paths = tuple(args.trace)
     _reject_path_collisions(
@@ -1972,6 +2068,16 @@ def _add_compatibility_arguments(parser: argparse.ArgumentParser) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    bootstrap = subparsers.add_parser(
+        "trace-bootstrap-qwen3-30ba3b-tp1",
+        help="write the fixed empty Qwen TP1 NeMo-RL trace manifest",
+    )
+    bootstrap.add_argument("--source-manifest-sha256", required=True)
+    bootstrap.add_argument("--source-hint-sha256", required=True)
+    bootstrap.add_argument("--container-sha256", required=True)
+    bootstrap.add_argument("--output", type=Path, required=True)
+    bootstrap.set_defaults(handler=_run_trace_bootstrap_qwen3_30ba3b_tp1)
 
     inventory = subparsers.add_parser(
         "inventory", help="aggregate exact physical shapes from trace JSONL"
