@@ -70,7 +70,8 @@ git commit -s -m "docs: record DSpark v0.25.1 PR stack"
 ### Task 2: Apply the correctness stage
 
 **Files:**
-- Modify: files changed by PRs #48167, #48524, #48639, #49617, and #48909.
+- Modify: files changed by PRs #48167, #48639, #48524, #48909, #49617, and
+  the non-loader commits from #48932.
 - Test: upstream tests added or modified by those PRs.
 
 **Interfaces:**
@@ -79,13 +80,16 @@ git commit -s -m "docs: record DSpark v0.25.1 PR stack"
 
 - [ ] **Step 1: Cherry-pick merged correctness PRs**
 
-Cherry-pick upstream squash commits for #48167, #48524, and #48639 in that
+Cherry-pick upstream squash commits for #48167, #48639, and #48524 in that
 order.
 
 - [ ] **Step 2: Port open loader and scheduler fixes**
 
-Cherry-pick #49617 and #48909 commits in their original order. Resolve conflicts
+Cherry-pick #48909 and #49617 commits in their original order. Resolve conflicts
 against v0.25.1 by preserving v0.25.1 APIs and the PR behavior.
+
+Then skip #48932's superseded loader commit and cherry-pick its seven
+repetition-penalty commits. Keep the feature disabled in the current benchmark.
 
 - [ ] **Step 3: Run static validation**
 
@@ -301,4 +305,3 @@ python3 -m py_compile \
 
 Commit only the files owned by this experiment and preserve unrelated user
 changes.
-

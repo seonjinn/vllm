@@ -34,11 +34,13 @@ of changes.
 1. `stage0-v0251`: unmodified vLLM 0.25.1.
 2. `stage1-correctness`:
    - #48167: Blackwell non-causal draft attention fix.
-   - #48524: auxiliary-layer-based DFlash/DSpark FC sizing.
    - #48639: load `sample_from_anchor` from Speculators checkpoints.
+   - #48524: auxiliary-layer-based DFlash/DSpark FC sizing.
+   - #48909: account for bonus-anchor query width in scheduler capacity.
    - #49617: place DSpark Speculators attributes in the nested config consumed
      by the Qwen DSpark model.
-   - #48909: account for bonus-anchor query width in scheduler capacity.
+   - #48932, loader commit excluded: retain only the opt-in repetition-penalty
+     mirror commits after #49617 supplies the newer loader fix.
 3. `stage2-prefix-cache`:
    - #47926: mask prefix-cache-restored tokens whose draft context KV was not
      constructed.
@@ -52,14 +54,19 @@ of changes.
 7. `stage6-fp8-head`:
    - #47584: opt-in row-wise FP8 DSpark draft LM head.
 
-#48932 is not stacked initially because its loader change overlaps #49617 and
-its repetition-penalty optimization is inactive for the current benchmark.
-It receives a separate compatibility review only if #49617 is insufficient.
+#48932's repetition-penalty feature remains disabled for the current benchmark
+because the default repetition penalty is 1.0. Its code is retained so a later
+probabilistic-drafting experiment can activate it without changing builds.
 
 #48692 changes scheduling, request representation, CUDA Graph dispatch, and
 attention metadata together. It is evaluated on a separate
 `dspark/v0251-adaptive-20260729` branch so failures or regressions cannot
 invalidate the fixed-K stack.
+
+#49969 is a draft WIP with no PR description or benchmark receipt. Its top-k
+Markov proposal path is evaluated only on a separate TP1 branch after the
+fixed-K stack is stable. #50169 changes KV-cache grouping and sizing broadly;
+it receives a separate memory-capacity A/B before being folded into a runtime.
 
 ## Validation Matrix
 
@@ -134,4 +141,3 @@ immutable saved container with:
 - Correctness fixes may be retained with neutral performance. Performance
   changes are excluded from the recommended runtime if they regress matched
   throughput or destabilize output.
-
