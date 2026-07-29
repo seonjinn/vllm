@@ -70,6 +70,28 @@ def test_shape_trace_writes_exact_high_m_record_once(
     ]
 
 
+def test_shape_trace_deduplicates_same_signature_across_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE", "1")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "8")
+
+    trace_once(tmp_path)
+    flashinfer_kernel._trace_mxfp8_dense_shape(
+        prefix="model.layers.47.mlp.fc1",
+        family="FC1",
+        m=1000,
+        n_logical=8768,
+        n_physical=8832,
+        k=8192,
+        layout="128x4",
+    )
+
+    path = next(tmp_path.glob("dense_shapes_*.jsonl"))
+    assert len(path.read_text().splitlines()) == 1
+
+
 def test_shape_trace_honors_record_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
