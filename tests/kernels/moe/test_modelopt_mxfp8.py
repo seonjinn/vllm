@@ -9,13 +9,18 @@ from types import SimpleNamespace
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferCutlassMxfp8LinearKernel,
 )
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.quantization import modelopt
+from vllm.model_executor.model_loader.reload.meta import (
+    capture_layer_to_meta,
+    restore_layer_on_meta,
+)
+from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
 
 
 class FakeActivationType(Enum):
@@ -106,6 +111,28 @@ def test_flashinfer_mxfp8_linear_keeps_checkpoint_scale_for_refit():
     assert layer.weight_scale is checkpoint_scale
     assert layer.weight_scale_for_apply is apply_scale
     assert torch.all(layer.weight_scale_for_apply == 2)
+
+
+def test_flashinfer_mxfp8_linear_refit_preserves_derived_apply_scale():
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 128), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = Parameter(
+        torch.ones((128, 4), dtype=torch.uint8), requires_grad=False
+    )
+    reload_info = LayerReloadingInfo(
+        restore_metadata=capture_layer_to_meta(layer),
+        restore_device=torch.device("cpu"),
+    )
+
+    kernel = object.__new__(FlashInferCutlassMxfp8LinearKernel)
+    kernel.process_weights_after_loading(layer)
+    apply_scale = layer.weight_scale_for_apply
+
+    restore_layer_on_meta(layer, reload_info)
+
+    assert layer.weight_scale_for_apply is apply_scale
 
 
 def test_modelopt_mxfp8_moe_reuses_apply_scales_for_refit(monkeypatch):
