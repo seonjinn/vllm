@@ -21,18 +21,22 @@ Use these source coordinates:
 ```text
 fork:                          https://github.com/seonjinn/vllm.git
 branch:                        sna/mxfp8-adaptive-v0.20.2-nemorl
-approved runtime build pin:    bc5881924556fcf830f8158815d5a62cef0fbcba
+source-install runtime pin:    bc5881924556fcf830f8158815d5a62cef0fbcba
+wheel builder introduced:      9070391094c14af61dad0a3872113b09fe0619eb
+approved wheel source pin:     e8bb60a254c7d823b3e1b2d30bdc90e43d0e770d
 functional implementation:    e32ce4fdd30ef313e10bf3a328352ead2a4c0054
 upstream vLLM base:            5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1
 vLLM public version:           0.20.2
 FlashInfer public version:     0.6.8.post1
 ```
 
-The functional implementation commit is a historical lower bound, not the
-final build pin. It does not include later offline-bootstrap, NeMo-RL handoff,
-or review fixes. Fetch the published branch to make the approved object
-available, then verify its ancestry and build that immutable runtime commit on
-every node. Later documentation-only branch commits do not change this pin:
+The functional implementation commit is a historical lower bound, not a final
+build pin. It does not include later offline-bootstrap, NeMo-RL handoff, wheel
+builder, or review fixes. The source-install runtime pin predates the wheel
+builder and is only for the existing source-install workflow. Fetch the
+published branch to make the approved object available, then verify its
+ancestry and build that immutable source-install runtime commit on every node.
+Later documentation-only branch commits do not change this pin:
 
 ```bash
 git fetch origin sna/mxfp8-adaptive-v0.20.2-nemorl
@@ -45,7 +49,10 @@ printf 'VLLM_BUILD_COMMIT=%s\n' "$VLLM_BUILD_COMMIT"
 ```
 
 Do not build from the branch name or the historical functional commit alone.
-The experiment record and container must name `VLLM_BUILD_COMMIT`.
+The experiment record and container must name `VLLM_BUILD_COMMIT`. Do not use
+this source-install pin for the team-distributable wheel: the builder first
+appears at `9070391094c14af61dad0a3872113b09fe0619eb`, and its hardened approved
+wheel source pin is documented separately below.
 
 The direct TRTLLM runner and tactic enumeration are FlashInfer private APIs.
 Changing FlashInfer can change the API, tactic IDs, or both. Requalify instead
@@ -79,6 +86,8 @@ the result retained the complete official native payload and
 `manylinux_2_35_aarch64` compatibility. The custom builder instead:
 
 - requires a clean, exact Git `HEAD` on Linux `aarch64`;
+- requires the base wheel and output directory to be outside the source
+  checkout;
 - verifies that the source commit descends from upstream base
   `5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1`;
 - requires vLLM's official precompiled-build environment variables;
@@ -88,16 +97,25 @@ the result retained the complete official native payload and
   except tracked runtime files intentionally overlaid or deleted by the exact
   custom source commit; base metadata changes are limited to the WHEEL build
   header and regenerated RECORD;
+- reads tracked runtime files from NUL-delimited Git tree records, retains
+  regular-file modes, and rejects symlinks, gitlinks, other non-regular
+  entries, non-UTF-8 paths, and paths containing control characters;
 - overlays only tracked `vllm` Python and declared runtime package data, not
-  `tools`, tests, benchmarks, or other developer files;
+  `tools`, tests, benchmarks, or other developer files, and removes
+  renamed-away or deleted runtime paths;
 - includes every tracked
   `vllm/model_executor/kernels/linear/mxfp8/tactic_configs/*.json`;
 - keeps package metadata at exactly `Version: 0.20.2` for NeMo's strict
   version gate;
 - adds a wheel build tag, embeds the full custom commit and base-wheel digest
   in package and dist-info provenance JSON, and regenerates RECORD;
-- validates the completed wheel before publishing it, then emits deterministic
-  adjacent metadata and SHA256 files without overwriting existing artifacts.
+- derives and validates the exact completed member transformation before
+  publication, including every unchanged base member's bytes, file mode, and
+  ZIP compression method, and rejects missing, added, or modified payload;
+- revalidates exact `HEAD`, index, worktree, and untracked-file cleanliness
+  immediately before create-only publication;
+- emits deterministic adjacent metadata and SHA256 files without overwriting
+  existing artifacts and fsyncs temporary files and publication directories.
 
 The only accepted base artifact is:
 
@@ -123,12 +141,18 @@ VLLM_ROOT=/workspace/vllm
 WHEEL_WORK=/shared/vllm-mxfp8-wheel
 VLLM_BASE_WHEEL="$WHEEL_WORK/vllm-0.20.2-cp38-abi3-manylinux_2_35_aarch64.whl"
 WHEEL_OUT="$WHEEL_WORK/custom"
-VLLM_WHEEL_COMMIT=$(git -C "$VLLM_ROOT" rev-parse HEAD)
+VLLM_WHEEL_COMMIT=e8bb60a254c7d823b3e1b2d30bdc90e43d0e770d
 
 test "$(uname -s)" = Linux
 test "$(uname -m)" = aarch64
+git -C "$VLLM_ROOT" fetch origin sna/mxfp8-adaptive-v0.20.2-nemorl
+git -C "$VLLM_ROOT" checkout --detach "$VLLM_WHEEL_COMMIT"
 test "$(git -C "$VLLM_ROOT" status --porcelain --untracked-files=all)" = ""
+test "$(git -C "$VLLM_ROOT" rev-parse HEAD)" = "$VLLM_WHEEL_COMMIT"
 test "$(git -C "$VLLM_ROOT" rev-parse "$VLLM_WHEEL_COMMIT^{commit}")" = \
+  "$VLLM_WHEEL_COMMIT"
+git -C "$VLLM_ROOT" merge-base --is-ancestor \
+  9070391094c14af61dad0a3872113b09fe0619eb \
   "$VLLM_WHEEL_COMMIT"
 git -C "$VLLM_ROOT" merge-base --is-ancestor \
   5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1 \
@@ -176,6 +200,8 @@ CUSTOM_WHEEL=$(
     -print -quit
 )
 test -n "$CUSTOM_WHEEL"
+test -f "${CUSTOM_WHEEL}.metadata.json"
+test -f "${CUSTOM_WHEEL}.sha256"
 (
   cd "$WHEEL_OUT"
   sha256sum --check "$(basename "$CUSTOM_WHEEL").sha256"
@@ -190,6 +216,14 @@ Copy the wheel together with its `.metadata.json` and `.sha256` files. A
 teammate installs only the wheel; the adjacent files are the review and
 transfer-integrity record. Record the full embedded `source_commit`, not the
 12-character filename abbreviation, in every experiment.
+
+The builder publishes the three adjacent files with create-only filesystem
+links and rolls back the files it linked if an ordinary publication error
+occurs. The three directory entries are not one crash-atomic transaction:
+process or host failure can leave a partial set. After any interruption, do not
+install from that directory until all three exact names exist and the SHA256
+check succeeds. Treat a partial set as invalid; remove only those exact partial
+artifact names or select a fresh output directory, then rerun the builder.
 
 Record the following in every experiment:
 
