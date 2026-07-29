@@ -133,6 +133,13 @@ class _GitTreeEntry:
     object_id: str
 
 
+@dataclass(frozen=True)
+class _GitCheckoutPaths:
+    worktree: Path
+    git_dir: Path
+    common_dir: Path
+
+
 def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -177,13 +184,36 @@ def _validate_source_checkout(
     repo_root: Path,
     source_commit: str,
     upstream_base_commit: str,
-) -> None:
+) -> _GitCheckoutPaths:
     if not repo_root.is_dir():
         raise BuildError(f"repository root does not exist: {repo_root}")
     if _COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise BuildError("source commit must be a full lowercase 40-character Git SHA")
     if _COMMIT_PATTERN.fullmatch(upstream_base_commit) is None:
         raise BuildError("upstream base commit must be a full lowercase Git SHA")
+
+    top_level = Path(
+        _run_git(repo_root, "rev-parse", "--show-toplevel").stdout.strip()
+    ).resolve()
+    if repo_root != top_level:
+        raise BuildError(
+            f"repository root must equal Git worktree top level {top_level}: "
+            f"{repo_root}"
+        )
+    git_dir = Path(
+        _run_git(repo_root, "rev-parse", "--absolute-git-dir").stdout.strip()
+    ).resolve()
+    raw_common_dir = Path(
+        _run_git(repo_root, "rev-parse", "--git-common-dir").stdout.strip()
+    )
+    common_dir = (
+        raw_common_dir if raw_common_dir.is_absolute() else repo_root / raw_common_dir
+    ).resolve()
+    checkout_paths = _GitCheckoutPaths(
+        worktree=top_level,
+        git_dir=git_dir,
+        common_dir=common_dir,
+    )
 
     head = _run_git(repo_root, "rev-parse", "HEAD").stdout.strip()
     if head != source_commit:
@@ -213,10 +243,11 @@ def _validate_source_checkout(
             f"expected upstream base {upstream_base_commit} is not an ancestor "
             f"of source commit {source_commit}"
         )
+    return checkout_paths
 
 
 def _validate_external_build_paths(
-    repo_root: Path,
+    checkout_paths: _GitCheckoutPaths,
     base_wheel: Path,
     output_dir: Path,
 ) -> None:
@@ -224,11 +255,16 @@ def _validate_external_build_paths(
         ("base wheel", base_wheel),
         ("output directory", output_dir),
     ):
-        try:
-            path.relative_to(repo_root)
-        except ValueError:
-            continue
-        raise BuildError(f"{label} must be outside the source checkout: {path}")
+        for restricted_label, restricted_root in (
+            ("source checkout", checkout_paths.worktree),
+            ("worktree Git directory", checkout_paths.git_dir),
+            ("common Git directory", checkout_paths.common_dir),
+        ):
+            try:
+                path.relative_to(restricted_root)
+            except ValueError:
+                continue
+            raise BuildError(f"{label} must be outside the {restricted_label}: {path}")
 
 
 def _is_runtime_source(path: str) -> bool:
@@ -831,12 +867,12 @@ def build_custom_wheel(request: WheelBuildRequest) -> BuildArtifacts:
     base_wheel = request.base_wheel.resolve()
     output_dir = request.output_dir.resolve()
     _validate_host(request.host)
-    _validate_external_build_paths(repo_root, base_wheel, output_dir)
-    _validate_source_checkout(
+    checkout_paths = _validate_source_checkout(
         repo_root,
         request.source_commit,
         request.policy.upstream_base_commit,
     )
+    _validate_external_build_paths(checkout_paths, base_wheel, output_dir)
     base_members, dist_info, _ = _validate_base_wheel(
         base_wheel,
         request.policy,
@@ -901,11 +937,12 @@ def build_custom_wheel(request: WheelBuildRequest) -> BuildArtifacts:
         ):
             _fsync_file(path)
         _fsync_directory(temporary_root)
-        _validate_source_checkout(
+        checkout_paths = _validate_source_checkout(
             repo_root,
             request.source_commit,
             request.policy.upstream_base_commit,
         )
+        _validate_external_build_paths(checkout_paths, base_wheel, output_dir)
         _publish_create_only(
             (temporary_wheel, temporary_metadata, temporary_sha256),
             targets,

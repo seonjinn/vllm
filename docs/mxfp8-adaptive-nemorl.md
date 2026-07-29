@@ -194,19 +194,32 @@ Verify and install exactly that wheel:
 ```bash
 set -euo pipefail
 
-CUSTOM_WHEEL=$(
-  find "$WHEEL_OUT" -maxdepth 1 -type f \
-    -name 'vllm-0.20.2-1mxfp8g*-cp38-abi3-manylinux_2_35_aarch64.whl' \
-    -print -quit
-)
-test -n "$CUSTOM_WHEEL"
+CUSTOM_WHEEL="$WHEEL_OUT/vllm-0.20.2-1mxfp8g${VLLM_WHEEL_COMMIT:0:12}-cp38-abi3-manylinux_2_35_aarch64.whl"
+test -f "$CUSTOM_WHEEL"
 test -f "${CUSTOM_WHEEL}.metadata.json"
 test -f "${CUSTOM_WHEEL}.sha256"
 (
   cd "$WHEEL_OUT"
   sha256sum --check "$(basename "$CUSTOM_WHEEL").sha256"
 )
-unzip -p "$CUSTOM_WHEEL" vllm/mxfp8_wheel_provenance.json
+CUSTOM_WHEEL="$CUSTOM_WHEEL" \
+VLLM_WHEEL_COMMIT="$VLLM_WHEEL_COMMIT" \
+uv run --no-project python - <<'PY'
+import json
+import os
+import zipfile
+from pathlib import Path
+
+wheel = Path(os.environ["CUSTOM_WHEEL"])
+expected_commit = os.environ["VLLM_WHEEL_COMMIT"]
+with zipfile.ZipFile(wheel) as archive:
+    embedded = json.loads(
+        archive.read("vllm/mxfp8_wheel_provenance.json")
+    )
+sidecar = json.loads(Path(f"{wheel}.metadata.json").read_text(encoding="utf-8"))
+assert embedded["source_commit"] == expected_commit
+assert sidecar["source_commit"] == expected_commit
+PY
 unzip -p "$CUSTOM_WHEEL" vllm-0.20.2.dist-info/METADATA |
   grep -Fx 'Version: 0.20.2'
 uv pip install --reinstall "$CUSTOM_WHEEL" --torch-backend=auto

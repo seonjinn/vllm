@@ -576,6 +576,89 @@ def test_build_refuses_base_or_output_inside_checkout(
         )
 
 
+def test_build_refuses_nested_repo_root_with_artifacts_in_real_git_dir(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    nested_root = repo / "vllm"
+    git_dir = repo / ".git"
+    base_wheel = git_dir / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+    output_dir = git_dir / "custom-wheel-output"
+
+    with pytest.raises(BuildError, match="top level"):
+        build_custom_wheel(
+            _make_request(
+                nested_root,
+                source_commit,
+                base_wheel,
+                output_dir,
+                policy,
+            )
+        )
+
+    assert not tuple(output_dir.glob("*.whl"))
+
+
+@pytest.mark.parametrize(
+    ("admin_root", "contained_path"),
+    [
+        ("git_dir", "base"),
+        ("common_dir", "output"),
+    ],
+)
+def test_build_refuses_artifact_path_in_linked_worktree_git_administration(
+    tmp_path: Path,
+    admin_root: str,
+    contained_path: str,
+) -> None:
+    main_repo = tmp_path / "main"
+    upstream_commit, source_commit = _initialize_source_repo(main_repo)
+    worktree = tmp_path / "linked"
+    _run_git(
+        main_repo,
+        "worktree",
+        "add",
+        "--detach",
+        str(worktree),
+        source_commit,
+    )
+    git_dir = Path(_run_git(worktree, "rev-parse", "--absolute-git-dir")).resolve()
+    raw_common_dir = Path(_run_git(worktree, "rev-parse", "--git-common-dir"))
+    common_dir = (
+        raw_common_dir if raw_common_dir.is_absolute() else worktree / raw_common_dir
+    ).resolve()
+    administration_dir = {
+        "git_dir": git_dir,
+        "common_dir": common_dir,
+    }[admin_root]
+    outside_base = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(outside_base, _base_members())
+    base_wheel = outside_base
+    output_dir = tmp_path / "dist"
+    if contained_path == "base":
+        base_wheel = administration_dir / outside_base.name
+        base_wheel.write_bytes(outside_base.read_bytes())
+    else:
+        output_dir = administration_dir / "custom-wheel-output"
+    policy = _make_policy(base_wheel, upstream_commit)
+
+    with pytest.raises(BuildError, match="Git.*directory"):
+        build_custom_wheel(
+            _make_request(
+                worktree,
+                source_commit,
+                base_wheel,
+                output_dir,
+                policy,
+            )
+        )
+
+    assert not tuple(output_dir.glob("*.whl"))
+
+
 @pytest.mark.parametrize("tamper_kind", ["worktree", "HEAD"])
 def test_build_refuses_concurrent_source_tamper_before_publication(
     tmp_path: Path,
@@ -881,3 +964,18 @@ def test_setup_declares_mxfp8_tactic_json_as_package_data() -> None:
     setup_source = (_REPO_ROOT / "setup.py").read_text(encoding="utf-8")
 
     assert '"model_executor/kernels/linear/mxfp8/tactic_configs/*.json"' in setup_source
+
+
+def test_docs_select_and_verify_exact_pinned_custom_wheel() -> None:
+    documentation = (_REPO_ROOT / "docs/mxfp8-adaptive-nemorl.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'CUSTOM_WHEEL="$WHEEL_OUT/vllm-0.20.2-'
+        "1mxfp8g${VLLM_WHEEL_COMMIT:0:12}-"
+        'cp38-abi3-manylinux_2_35_aarch64.whl"'
+    ) in documentation
+    assert "-name 'vllm-0.20.2-1mxfp8g*" not in documentation
+    assert 'embedded["source_commit"] == expected_commit' in documentation
+    assert 'sidecar["source_commit"] == expected_commit' in documentation
