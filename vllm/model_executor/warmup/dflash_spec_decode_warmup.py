@@ -46,14 +46,15 @@ logger = init_logger(__name__)
 # Powers of two reachable by ``min(256, next_power_of_2(max_tokens_per_req))``.
 _DFLASH_BLOCK_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
-# Grid specializations.  Triton specializes ``tl.num_programs`` when an axis
-# is 1, so cover the four "which axes are 1" combinations.
-_DFLASH_GRID_COMBOS: tuple[tuple[int, int], ...] = (
-    (1, 1),
-    (1, 8),
-    (50, 1),
-    (50, 8),
-)
+
+def _dflash_grid_combos(max_num_reqs: int) -> tuple[tuple[int, int], ...]:
+    """Return reachable grid specializations without exceeding live buffers."""
+    assert max_num_reqs >= 1
+    combos = [(1, 1), (1, 8)]
+    if max_num_reqs > 1:
+        multi_req = min(50, max_num_reqs)
+        combos.extend(((multi_req, 1), (multi_req, 8)))
+    return tuple(combos)
 
 
 def _alloc(
@@ -94,13 +95,14 @@ def _warmup_prepare_dflash_inputs_kernel(
     exactly.
 
     Total cache entries generated:
-        len(_DFLASH_BLOCK_SIZES) * len(_DFLASH_GRID_COMBOS)
+        len(_DFLASH_BLOCK_SIZES) * len(grid_combos)
     """
     from vllm.v1.attention.backends.utils import PAD_SLOT_ID
     from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
         _prepare_dflash_inputs_kernel,
     )
 
+    grid_combos = _dflash_grid_combos(max_num_reqs)
     max_sampled = max_num_reqs * max(num_speculative_steps, 1)
 
     logger.info(
@@ -111,8 +113,8 @@ def _warmup_prepare_dflash_inputs_kernel(
         "max_num_reqs=%d, max_num_tokens=%d, max_model_len=%d)",
         device,
         len(_DFLASH_BLOCK_SIZES),
-        len(_DFLASH_GRID_COMBOS),
-        len(_DFLASH_BLOCK_SIZES) * len(_DFLASH_GRID_COMBOS),
+        len(grid_combos),
+        len(_DFLASH_BLOCK_SIZES) * len(grid_combos),
         num_speculative_steps,
         num_query_per_req,
         sample_from_anchor,
@@ -124,7 +126,7 @@ def _warmup_prepare_dflash_inputs_kernel(
     )
 
     for bs in _DFLASH_BLOCK_SIZES:
-        for num_reqs, num_blocks in _DFLASH_GRID_COMBOS:
+        for num_reqs, num_blocks in grid_combos:
             try:
                 n = num_reqs if num_reqs > 0 else 1
                 # Per-request inputs.

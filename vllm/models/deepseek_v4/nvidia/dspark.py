@@ -40,6 +40,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -356,6 +357,21 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 "VLLM_DSPARK_FP8_DRAFT_HEAD is set but this device has no "
                 "fp8 support (SM89+ required); using the unquantized "
                 "draft lm_head."
+            )
+            return
+        if not isinstance(self.lm_head.quant_method, UnquantizedEmbeddingMethod):
+            logger.warning(
+                "VLLM_DSPARK_FP8_DRAFT_HEAD only supports an unquantized "
+                "draft lm_head; using its configured quantization path."
+            )
+            return
+        if (
+            self.lm_head.weight.ndim != 2
+            or self.lm_head.weight.shape[1] != self.config.hidden_size
+        ):
+            logger.warning(
+                "VLLM_DSPARK_FP8_DRAFT_HEAD requires lm_head weight layout "
+                "[local_vocab, hidden_size]; using the unquantized path."
             )
             return
         self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
