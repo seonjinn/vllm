@@ -1704,6 +1704,8 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
     """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
 
+    preserves_checkpoint_weight_scale_for_refit = True
+
     def __init__(
         self,
         quant_config: ModelOptMxFp8Config,
@@ -1909,11 +1911,18 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             layer.w13_scale_for_apply = Parameter(
                 w13_scale_for_apply, requires_grad=False
             )
-            layer.w2_scale_for_apply = Parameter(w2_scale_for_apply, requires_grad=False)
+            layer.w2_scale_for_apply = Parameter(
+                w2_scale_for_apply, requires_grad=False
+            )
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading_refit_safe(
+        self, layer: torch.nn.Module
+    ) -> None:
         self._check_weight_dtypes(layer)
         self._shuffle_weights_for_trtllm(layer)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.process_weights_after_loading_refit_safe(layer)
 
     def maybe_make_prepare_finalize(
         self,

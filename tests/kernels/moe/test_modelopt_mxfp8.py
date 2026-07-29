@@ -192,6 +192,7 @@ def test_modelopt_mxfp8_moe_reuses_apply_scales_for_refit(monkeypatch):
 
     method = object.__new__(modelopt.ModelOptMxFp8FusedMoE)
     method.moe = SimpleNamespace(is_act_and_mul=False)
+    assert method.preserves_checkpoint_weight_scale_for_refit
 
     method.process_weights_after_loading(layer)
 
@@ -209,3 +210,45 @@ def test_modelopt_mxfp8_moe_reuses_apply_scales_for_refit(monkeypatch):
     assert layer.w2_scale_for_apply is apply_w2_scale
     assert torch.all(layer.w13_scale_for_apply == 2)
     assert torch.all(layer.w2_scale_for_apply == 2)
+
+
+def test_modelopt_mxfp8_moe_first_refit_preserves_new_apply_scales(monkeypatch):
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.reorder_rows_for_gated_act_gemm = lambda x: x
+    fake_flashinfer.shuffle_matrix_a = lambda x, epilogue_tile_m: x
+    fake_flashinfer.shuffle_matrix_sf_a = lambda x, epilogue_tile_m: x
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+
+    layer = torch.nn.Module()
+    layer.intermediate_size_per_partition = 32
+    layer.hidden_size = 32
+    layer.w13_weight = Parameter(
+        torch.empty((2, 32, 32), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.w2_weight = Parameter(
+        torch.empty((2, 32, 32), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.w13_weight_scale = Parameter(
+        torch.ones((2, 32, 1), dtype=torch.uint8), requires_grad=False
+    )
+    layer.w2_weight_scale = Parameter(
+        torch.ones((2, 32, 1), dtype=torch.uint8), requires_grad=False
+    )
+    reload_info = LayerReloadingInfo(
+        restore_metadata=capture_layer_to_meta(layer),
+        restore_device=torch.device("cpu"),
+        kernel_tensors=get_layer_params_buffers(layer),
+    )
+    restore_layer_on_meta(layer, reload_info)
+    materialize_layer(layer, reload_info)
+
+    method = object.__new__(modelopt.ModelOptMxFp8FusedMoE)
+    method.moe = SimpleNamespace(is_act_and_mul=False)
+    method.process_weights_after_loading(layer)
+    apply_w13_scale = layer.w13_scale_for_apply
+    apply_w2_scale = layer.w2_scale_for_apply
+
+    _copy_and_restore_kernel_tensors(layer, reload_info)
+
+    assert layer.w13_scale_for_apply is apply_w13_scale
+    assert layer.w2_scale_for_apply is apply_w2_scale
