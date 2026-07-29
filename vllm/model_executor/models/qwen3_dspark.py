@@ -19,8 +19,15 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fp8_draft_head import (
+    Fp8DraftHead,
+    fp8_draft_head_logits,
+    fp8_draft_head_supported,
+    quantize_draft_head,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -125,6 +132,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        self._fp8_draft_head: Fp8DraftHead | None = None
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
@@ -137,9 +145,39 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
+    def maybe_init_fp8_draft_head(self) -> None:
+        """Materialize the opt-in rowwise-FP8 draft head before graph capture."""
+        if not envs.VLLM_DSPARK_FP8_DRAFT_HEAD:
+            return
+        if not fp8_draft_head_supported(self.lm_head.weight.device):
+            logger.warning(
+                "VLLM_DSPARK_FP8_DRAFT_HEAD is set but this device has no "
+                "FP8 support (SM89+ required); using the unquantized "
+                "Qwen3 DSpark lm_head."
+            )
+            return
+        self._fp8_draft_head = quantize_draft_head(self.lm_head.weight)
+        logger.info_once(
+            "Qwen3 DSpark draft-proposal logits use a rowwise-FP8 copy of "
+            "the lm_head (draft-time only; verify pass untouched)."
+        )
+
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Draft-vocab logits without the d2t scatter: the speculator adds the
         # Markov bias in draft space, then remaps via map_draft_to_target.
+        if self._fp8_draft_head is not None:
+            logits = fp8_draft_head_logits(hidden_states, self._fp8_draft_head)
+            if self.lm_head.tp_size > 1:
+                logits = self.logits_processor._gather_logits(logits)
+            if logits is not None:
+                logits = logits[..., : self.logits_processor.org_vocab_size]
+                if self.logits_processor.soft_cap is not None:
+                    logits = torch.tanh(
+                        logits / self.logits_processor.soft_cap
+                    ) * self.logits_processor.soft_cap
+                if self.logits_processor.scale != 1.0:
+                    logits *= self.logits_processor.scale
+            return logits
         return self.logits_processor(self.lm_head, hidden_states)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
