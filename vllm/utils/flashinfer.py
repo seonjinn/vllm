@@ -67,6 +67,7 @@ def _trace_mxfp8_adaptive_dispatch(
     path.mkdir(parents=True, exist_ok=True)
     output = path / f"adaptive_dispatch_{socket.gethostname()}_{os.getpid()}.jsonl"
     record = {
+        "backend": "trtllm",
         "event": "mxfp8_adaptive_dispatch",
         "config_sha256": config_sha256,
         "time": time.time(),
@@ -1381,7 +1382,19 @@ if has_flashinfer():
                 m = int(A.shape[0])
                 k = int(A.shape[1])
                 n = int(B.shape[1])
+                shape_key = (m, n, k)
+                tactic_hit = shape_key in tactic_table
                 tactic = tactic_table.get((m, n, k), tactic)
+                if is_adaptive_layout:
+                    _trace_mxfp8_adaptive_dispatch(
+                        shape_key=shape_key,
+                        use_8x4_sf_layout=use_8x4_sf_layout,
+                        tactic=tactic,
+                        tactic_hit=tactic_hit,
+                        config_sha256=(
+                            configuration.config_sha256 if configuration else None
+                        ),
+                    )
                 workspace = (
                     state.workspace_8x4 if use_8x4_sf_layout else state.workspace_128x4
                 )

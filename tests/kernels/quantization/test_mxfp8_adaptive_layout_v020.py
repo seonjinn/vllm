@@ -1416,6 +1416,7 @@ def test_adaptive_dispatch_trace_records_layout_tactic_and_lookup_source(
     rows = paths[0].read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0]) | {"time": None} == {
+        "backend": "trtllm",
         "event": "mxfp8_adaptive_dispatch",
         "config_sha256": "d" * 64,
         "hostname": socket.gethostname(),
@@ -1428,6 +1429,100 @@ def test_adaptive_dispatch_trace_records_layout_tactic_and_lookup_source(
         "tactic_source": "static_hint",
         "time": None,
     }
+
+
+def test_direct_mm_mxfp8_traces_exact_shape_tactic_before_prepared_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = ast.parse(FLASHINFER_UTILS.read_text(encoding="utf-8"))
+    mm_mxfp8 = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "mm_mxfp8"
+    )
+    mm_mxfp8.decorator_list = []
+    calls: list[tuple[str, object]] = []
+    shape_key = (384, 896, 512)
+    configuration = SimpleNamespace(
+        default_tactic=11,
+        low_tactic_map=(),
+        high_tactic_map=((shape_key, 73),),
+        config_sha256="a" * 64,
+    )
+    state = SimpleNamespace(
+        configuration=configuration,
+        workspace_8x4="workspace-8x4",
+        workspace_128x4="workspace-128x4",
+    )
+    namespace: dict[str, object] = {
+        "os": os,
+        "torch": SimpleNamespace(Tensor=object, dtype=object),
+        "get_mxfp8_trtllm_file_configuration": lambda: SimpleNamespace(
+            layout_mode="adaptive"
+        ),
+        "_mxfp8_env_flag": lambda _name: False,
+        "_require_mxfp8_trtllm_direct_state": lambda _device: state,
+        "_parse_mxfp8_tactic_hints": lambda _raw: pytest.fail(
+            "direct state must use its frozen tactic table"
+        ),
+        "_trace_mxfp8_adaptive_dispatch": lambda **kwargs: calls.append(
+            ("trace", kwargs)
+        ),
+        "_mxfp8_trtllm_run_prepared": lambda *args: calls.append(
+            ("runner", args)
+        )
+        or "prepared-output",
+    }
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=object()))
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[mm_mxfp8], type_ignores=[])),
+            str(FLASHINFER_UTILS),
+            "exec",
+        ),
+        namespace,
+    )
+
+    a = SimpleNamespace(shape=(384, 512), device="cuda:0")
+    b = SimpleNamespace(shape=(512, 896))
+    a_scale = object()
+    b_scale = object()
+    output = namespace["mm_mxfp8"](  # type: ignore[operator]
+        a,
+        b,
+        a_scale,
+        b_scale,
+        "bfloat16",
+        backend="trtllm",
+        use_8x4_sf_layout=False,
+    )
+
+    assert output == "prepared-output"
+    assert calls == [
+        (
+            "trace",
+            {
+                "shape_key": shape_key,
+                "use_8x4_sf_layout": False,
+                "tactic": 73,
+                "tactic_hit": True,
+                "config_sha256": "a" * 64,
+            },
+        ),
+        (
+            "runner",
+            (
+                a,
+                b,
+                a_scale,
+                b_scale,
+                "bfloat16",
+                "workspace-128x4",
+                False,
+                73,
+            ),
+        ),
+    ]
 
 
 def test_adaptive_dispatch_trace_performs_no_io_during_capture(
