@@ -26,7 +26,7 @@ from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
-_MXFP8_DENSE_TRACE_SEEN: set[tuple[str, str, int, int, int, int, str]] = set()
+_MXFP8_DENSE_TRACE_SEEN: set[tuple[int, int, int, int, str]] = set()
 _MXFP8_DENSE_TRACE_WRITTEN = 0
 logger = init_logger(__name__)
 
@@ -74,7 +74,7 @@ def _trace_mxfp8_dense_shape(
     if not trace_dir:
         return
 
-    key = (prefix, family, m, n_logical, n_physical, k, layout)
+    key = (m, n_logical, n_physical, k, layout)
     max_records = int(os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"))
     global _MXFP8_DENSE_TRACE_WRITTEN
     if key in _MXFP8_DENSE_TRACE_SEEN or max_records <= _MXFP8_DENSE_TRACE_WRITTEN:
