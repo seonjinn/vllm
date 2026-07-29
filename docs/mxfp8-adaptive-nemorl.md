@@ -64,6 +64,133 @@ same Python, PyTorch, CUDA, architecture, and native-extension ABI as the
 runtime container. `VLLM_VERSION_OVERRIDE=0.20.2` is required because the
 manifest loader rejects another public vLLM version.
 
+### Team-distributable wheel
+
+Use `tools/mxfp8/build_custom_wheel.py` when teammates need one installable
+artifact instead of an editable source checkout. The builder deliberately
+repackages the exact official vLLM wheel instead of invoking
+`setup.py bdist_wheel`.
+
+The standard precompiled setup path is designed for Python-only source and
+editable installs. It extracts a selected list of native artifacts into a
+source tree; a local wheel build can also emit a host `linux_aarch64` tag
+unless its platform tag is explicitly rewritten. Neither behavior proves that
+the result retained the complete official native payload and
+`manylinux_2_35_aarch64` compatibility. The custom builder instead:
+
+- requires a clean, exact Git `HEAD` on Linux `aarch64`;
+- verifies that the source commit descends from upstream base
+  `5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1`;
+- requires vLLM's official precompiled-build environment variables;
+- verifies the official base wheel's filename, metadata, WHEEL tag, RECORD,
+  and fixed SHA256;
+- preserves every official payload member, including every native extension,
+  except tracked runtime files intentionally overlaid or deleted by the exact
+  custom source commit; base metadata changes are limited to the WHEEL build
+  header and regenerated RECORD;
+- overlays only tracked `vllm` Python and declared runtime package data, not
+  `tools`, tests, benchmarks, or other developer files;
+- includes every tracked
+  `vllm/model_executor/kernels/linear/mxfp8/tactic_configs/*.json`;
+- keeps package metadata at exactly `Version: 0.20.2` for NeMo's strict
+  version gate;
+- adds a wheel build tag, embeds the full custom commit and base-wheel digest
+  in package and dist-info provenance JSON, and regenerates RECORD;
+- validates the completed wheel before publishing it, then emits deterministic
+  adjacent metadata and SHA256 files without overwriting existing artifacts.
+
+The only accepted base artifact is:
+
+```text
+filename: vllm-0.20.2-cp38-abi3-manylinux_2_35_aarch64.whl
+sha256:   76ccf4c0554556c06f6b0fb1643742d4cf97dcc69f6ef3f04556d0764126035a
+```
+
+The official release asset uses
+`manylinux_2_35_aarch64` in its filename and
+`Tag: cp38-abi3-linux_aarch64` in its internal WHEEL metadata. The builder
+validates and preserves both existing identities exactly; it does not silently
+rewrite one to resemble the other.
+
+Build on the Linux `aarch64` host that will supply the wheel to the NeMo
+container. Use a directory outside the Git checkout for inputs and outputs so
+that the clean-tree gate remains meaningful:
+
+```bash
+set -euo pipefail
+
+VLLM_ROOT=/workspace/vllm
+WHEEL_WORK=/shared/vllm-mxfp8-wheel
+VLLM_BASE_WHEEL="$WHEEL_WORK/vllm-0.20.2-cp38-abi3-manylinux_2_35_aarch64.whl"
+WHEEL_OUT="$WHEEL_WORK/custom"
+VLLM_WHEEL_COMMIT=$(git -C "$VLLM_ROOT" rev-parse HEAD)
+
+test "$(uname -s)" = Linux
+test "$(uname -m)" = aarch64
+test "$(git -C "$VLLM_ROOT" status --porcelain --untracked-files=all)" = ""
+test "$(git -C "$VLLM_ROOT" rev-parse "$VLLM_WHEEL_COMMIT^{commit}")" = \
+  "$VLLM_WHEEL_COMMIT"
+git -C "$VLLM_ROOT" merge-base --is-ancestor \
+  5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1 \
+  "$VLLM_WHEEL_COMMIT"
+
+mkdir -p "$WHEEL_WORK"
+curl --fail --location \
+  --output "$VLLM_BASE_WHEEL" \
+  https://github.com/vllm-project/vllm/releases/download/v0.20.2/vllm-0.20.2-cp38-abi3-manylinux_2_35_aarch64.whl
+printf '%s  %s\n' \
+  76ccf4c0554556c06f6b0fb1643742d4cf97dcc69f6ef3f04556d0764126035a \
+  "$VLLM_BASE_WHEEL" |
+  sha256sum --check
+
+export VLLM_USE_PRECOMPILED=1
+export VLLM_PRECOMPILED_WHEEL_LOCATION="$VLLM_BASE_WHEEL"
+uv run --no-project python "$VLLM_ROOT/tools/mxfp8/build_custom_wheel.py" \
+  --repo-root "$VLLM_ROOT" \
+  --source-commit "$VLLM_WHEEL_COMMIT" \
+  --output-dir "$WHEEL_OUT"
+```
+
+The wheel filename is:
+
+```text
+vllm-0.20.2-1mxfp8g<SHA12>-cp38-abi3-manylinux_2_35_aarch64.whl
+```
+
+The build tag distinguishes the artifact without changing the installed
+version. The complete 40-character commit remains authoritative in both:
+
+```text
+vllm/mxfp8_wheel_provenance.json
+vllm-0.20.2.dist-info/mxfp8-provenance.json
+```
+
+Verify and install exactly that wheel:
+
+```bash
+set -euo pipefail
+
+CUSTOM_WHEEL=$(
+  find "$WHEEL_OUT" -maxdepth 1 -type f \
+    -name 'vllm-0.20.2-1mxfp8g*-cp38-abi3-manylinux_2_35_aarch64.whl' \
+    -print -quit
+)
+test -n "$CUSTOM_WHEEL"
+(
+  cd "$WHEEL_OUT"
+  sha256sum --check "$(basename "$CUSTOM_WHEEL").sha256"
+)
+unzip -p "$CUSTOM_WHEEL" vllm/mxfp8_wheel_provenance.json
+unzip -p "$CUSTOM_WHEEL" vllm-0.20.2.dist-info/METADATA |
+  grep -Fx 'Version: 0.20.2'
+uv pip install --reinstall "$CUSTOM_WHEEL" --torch-backend=auto
+```
+
+Copy the wheel together with its `.metadata.json` and `.sha256` files. A
+teammate installs only the wheel; the adjacent files are the review and
+transfer-integrity record. Record the full embedded `source_commit`, not the
+12-character filename abbreviation, in every experiment.
+
 Record the following in every experiment:
 
 - custom source commit;
