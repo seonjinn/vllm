@@ -10,7 +10,9 @@ import io
 import json
 import subprocess
 import sys
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ WheelBuildRequest = _MODULE.WheelBuildRequest
 build_custom_wheel = _MODULE.build_custom_wheel
 resolve_precompiled_wheel = _MODULE.resolve_precompiled_wheel
 validate_custom_wheel = _MODULE.validate_custom_wheel
+load_source_snapshot = _MODULE._load_source_snapshot
 
 _TAG = "cp38-abi3-manylinux_2_35_aarch64"
 _OFFICIAL_WHEEL_METADATA_TAG = "cp38-abi3-linux_aarch64"
@@ -65,6 +68,10 @@ def _initialize_source_repo(repo: Path) -> tuple[str, str]:
     _write(
         repo / "vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
         'IMPLEMENTATION = "upstream"\n',
+    )
+    _write(
+        repo / "vllm/model_executor/kernels/linear/mxfp8/legacy.py",
+        'IMPLEMENTATION = "legacy"\n',
     )
     _write(repo / "setup.py", "package_data = {}\n")
     _run_git(repo, "add", ".")
@@ -128,8 +135,12 @@ def _base_members(
         "vllm/model_executor/kernels/linear/mxfp8/flashinfer.py": (
             b'IMPLEMENTATION = "upstream"\n'
         ),
+        "vllm/model_executor/kernels/linear/mxfp8/legacy.py": (
+            b'IMPLEMENTATION = "legacy"\n'
+        ),
         "vllm/_C.abi3.so": b"synthetic native _C",
         "vllm/_moe_C.abi3.so": b"synthetic native _moe_C",
+        "vllm/runtime_payload.bin": b"official runtime payload",
         f"{_DIST_INFO}/METADATA": (
             b"Metadata-Version: 2.4\nName: vllm\nVersion: 0.20.2\n"
         ),
@@ -178,6 +189,11 @@ def _read_wheel(path: Path) -> dict[str, bytes]:
         return {name: archive.read(name) for name in archive.namelist()}
 
 
+def _read_wheel_modes(path: Path) -> dict[str, int]:
+    with zipfile.ZipFile(path) as archive:
+        return {info.filename: info.external_attr >> 16 for info in archive.infolist()}
+
+
 def _assert_record_valid(members: dict[str, bytes]) -> None:
     record_path = f"{_DIST_INFO}/RECORD"
     rows = list(csv.reader(io.StringIO(members[record_path].decode())))
@@ -206,6 +222,32 @@ def _rewrite_member_with_valid_record(
     members.pop(f"{_DIST_INFO}/RECORD")
     members[member_name] = content
     _write_wheel(destination, members)
+
+
+def _rewrite_member_metadata(
+    source: Path,
+    destination: Path,
+    member_name: str,
+    *,
+    mode: int | None = None,
+    compression: int | None = None,
+) -> None:
+    with zipfile.ZipFile(source) as source_archive:
+        source_members = tuple(
+            (info, source_archive.read(info.filename))
+            for info in source_archive.infolist()
+        )
+    with zipfile.ZipFile(destination, "w") as destination_archive:
+        for source_info, content in source_members:
+            info = zipfile.ZipInfo(source_info.filename, _FIXED_ZIP_TIME)
+            info.compress_type = source_info.compress_type
+            info.external_attr = source_info.external_attr
+            if source_info.filename == member_name:
+                if mode is not None:
+                    info.external_attr = mode << 16
+                if compression is not None:
+                    info.compress_type = compression
+            destination_archive.writestr(info, content)
 
 
 def test_build_overlays_tracked_runtime_source_and_preserves_native_tag(
@@ -287,6 +329,110 @@ def test_build_is_byte_deterministic(tmp_path: Path) -> None:
     assert first.wheel.read_bytes() == second.wheel.read_bytes()
     assert first.metadata.read_bytes() == second.metadata.read_bytes()
     assert first.sha256.read_bytes() == second.sha256.read_bytes()
+
+
+def test_build_removes_base_runtime_path_renamed_in_source(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, _ = _initialize_source_repo(repo)
+    _run_git(
+        repo,
+        "mv",
+        "vllm/model_executor/kernels/linear/mxfp8/legacy.py",
+        "vllm/model_executor/kernels/linear/mxfp8/renamed.py",
+    )
+    _run_git(repo, "commit", "-m", "rename runtime source")
+    source_commit = _run_git(repo, "rev-parse", "HEAD")
+    base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+
+    artifacts = build_custom_wheel(
+        _make_request(
+            repo,
+            source_commit,
+            base_wheel,
+            tmp_path / "dist",
+            policy,
+        )
+    )
+
+    members = _read_wheel(artifacts.wheel)
+    assert "vllm/model_executor/kernels/linear/mxfp8/legacy.py" not in members
+    assert (
+        members["vllm/model_executor/kernels/linear/mxfp8/renamed.py"]
+        == b'IMPLEMENTATION = "legacy"\n'
+    )
+
+
+def test_build_preserves_executable_git_mode(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, _ = _initialize_source_repo(repo)
+    executable_path = repo / "vllm/model_executor/kernels/linear/mxfp8/executable.py"
+    _write(executable_path, 'IMPLEMENTATION = "executable"\n')
+    executable_path.chmod(0o755)
+    _run_git(repo, "add", ".")
+    _run_git(repo, "commit", "-m", "add executable runtime source")
+    source_commit = _run_git(repo, "rev-parse", "HEAD")
+    base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+
+    artifacts = build_custom_wheel(
+        _make_request(
+            repo,
+            source_commit,
+            base_wheel,
+            tmp_path / "dist",
+            policy,
+        )
+    )
+
+    modes = _read_wheel_modes(artifacts.wheel)
+    assert modes["vllm/model_executor/kernels/linear/mxfp8/executable.py"] == 0o100755
+
+
+def test_source_snapshot_rejects_runtime_symlink(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, _ = _initialize_source_repo(repo)
+    symlink_path = repo / "vllm/model_executor/kernels/linear/mxfp8/linked.py"
+    symlink_path.symlink_to("flashinfer.py")
+    _run_git(repo, "add", ".")
+    _run_git(repo, "commit", "-m", "add runtime symlink")
+    source_commit = _run_git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(BuildError, match="120000"):
+        load_source_snapshot(repo, source_commit, upstream_commit)
+
+
+def test_source_snapshot_rejects_runtime_gitlink(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    gitlink_path = "vllm/model_executor/kernels/linear/mxfp8/gitlink.py"
+    _run_git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{source_commit},{gitlink_path}",
+    )
+    _run_git(repo, "commit", "-m", "add runtime gitlink")
+    source_commit = _run_git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(BuildError, match="160000"):
+        load_source_snapshot(repo, source_commit, upstream_commit)
+
+
+def test_source_snapshot_rejects_control_character_path(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, _ = _initialize_source_repo(repo)
+    control_path = repo / "vllm/model_executor/kernels/linear/mxfp8/control\nname.py"
+    _write(control_path, 'IMPLEMENTATION = "control"\n')
+    _run_git(repo, "add", ".")
+    _run_git(repo, "commit", "-m", "add control path")
+    source_commit = _run_git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(BuildError, match="control"):
+        load_source_snapshot(repo, source_commit, upstream_commit)
 
 
 def test_build_preserves_official_filename_and_internal_wheel_tags(
@@ -400,6 +546,80 @@ def test_build_refuses_source_commit_other_than_clean_head(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.parametrize("contained_path", ["base", "output"])
+def test_build_refuses_base_or_output_inside_checkout(
+    tmp_path: Path,
+    contained_path: str,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    outside_base = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(outside_base, _base_members())
+    base_wheel = outside_base
+    output_dir = tmp_path / "dist"
+    if contained_path == "base":
+        base_wheel = repo / ".git" / outside_base.name
+        base_wheel.write_bytes(outside_base.read_bytes())
+    else:
+        output_dir = repo / ".git" / "custom-wheel-output"
+    policy = _make_policy(base_wheel, upstream_commit)
+
+    with pytest.raises(BuildError, match="outside"):
+        build_custom_wheel(
+            _make_request(
+                repo,
+                source_commit,
+                base_wheel,
+                output_dir,
+                policy,
+            )
+        )
+
+
+@pytest.mark.parametrize("tamper_kind", ["worktree", "HEAD"])
+def test_build_refuses_concurrent_source_tamper_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_kind: str,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+    output_dir = tmp_path / "dist"
+    archive_written = threading.Event()
+    allow_validation = threading.Event()
+    original_write_wheel = _MODULE._write_wheel
+
+    def blocking_write_wheel(path: Path, members: Any) -> None:
+        original_write_wheel(path, members)
+        archive_written.set()
+        if not allow_validation.wait(timeout=10):
+            raise RuntimeError("test timed out waiting for concurrent tamper")
+
+    monkeypatch.setattr(_MODULE, "_write_wheel", blocking_write_wheel)
+    request = _make_request(
+        repo,
+        source_commit,
+        base_wheel,
+        output_dir,
+        policy,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(build_custom_wheel, request)
+        assert archive_written.wait(timeout=10)
+        _write(repo / "vllm/__init__.py", f'TAMPER = "{tamper_kind}"\n')
+        if tamper_kind == "HEAD":
+            _run_git(repo, "add", "vllm/__init__.py")
+            _run_git(repo, "commit", "-m", "concurrent HEAD change")
+        allow_validation.set()
+        with pytest.raises(BuildError, match="dirty|HEAD"):
+            future.result(timeout=10)
+
+    assert not tuple(output_dir.glob("*.whl"))
+
+
 def test_build_refuses_unrelated_upstream_base(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _, source_commit = _initialize_source_repo(repo)
@@ -486,7 +706,7 @@ def test_build_refuses_base_wheel_without_native_extensions(tmp_path: Path) -> N
         )
 
 
-def test_validation_rejects_source_overlay_mismatch(tmp_path: Path) -> None:
+def test_validation_rejects_tampered_wheel_source_member(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     upstream_commit, source_commit = _initialize_source_repo(repo)
     base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
@@ -510,6 +730,118 @@ def test_validation_rejects_source_overlay_mismatch(tmp_path: Path) -> None:
     )
 
     with pytest.raises(BuildError, match="source commit"):
+        validate_custom_wheel(
+            tampered_wheel,
+            repo_root=repo,
+            source_commit=source_commit,
+            base_wheel=base_wheel,
+            policy=policy,
+        )
+
+
+def test_validation_rejects_extra_member_with_valid_record(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+    artifacts = build_custom_wheel(
+        _make_request(
+            repo,
+            source_commit,
+            base_wheel,
+            tmp_path / "dist",
+            policy,
+        )
+    )
+    tampered_wheel = tmp_path / artifacts.wheel.name
+    _rewrite_member_with_valid_record(
+        artifacts.wheel,
+        tampered_wheel,
+        "vllm/arbitrary_developer_payload.py",
+        b"ARBITRARY = True\n",
+    )
+
+    with pytest.raises(BuildError, match="member set"):
+        validate_custom_wheel(
+            tampered_wheel,
+            repo_root=repo,
+            source_commit=source_commit,
+            base_wheel=base_wheel,
+            policy=policy,
+        )
+
+
+def test_validation_rejects_modified_unchanged_base_member(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+    artifacts = build_custom_wheel(
+        _make_request(
+            repo,
+            source_commit,
+            base_wheel,
+            tmp_path / "dist",
+            policy,
+        )
+    )
+    tampered_wheel = tmp_path / artifacts.wheel.name
+    _rewrite_member_with_valid_record(
+        artifacts.wheel,
+        tampered_wheel,
+        "vllm/runtime_payload.bin",
+        b"modified runtime payload",
+    )
+
+    with pytest.raises(BuildError, match="expected transformation"):
+        validate_custom_wheel(
+            tampered_wheel,
+            repo_root=repo,
+            source_commit=source_commit,
+            base_wheel=base_wheel,
+            policy=policy,
+        )
+
+
+@pytest.mark.parametrize(
+    ("metadata_kind", "metadata_value"),
+    [
+        ("mode", 0o100755),
+        ("compression", zipfile.ZIP_STORED),
+    ],
+)
+def test_validation_rejects_modified_unchanged_base_member_metadata(
+    tmp_path: Path,
+    metadata_kind: str,
+    metadata_value: int,
+) -> None:
+    repo = tmp_path / "repo"
+    upstream_commit, source_commit = _initialize_source_repo(repo)
+    base_wheel = tmp_path / f"vllm-0.20.2-{_TAG}.whl"
+    _write_wheel(base_wheel, _base_members())
+    policy = _make_policy(base_wheel, upstream_commit)
+    artifacts = build_custom_wheel(
+        _make_request(
+            repo,
+            source_commit,
+            base_wheel,
+            tmp_path / "dist",
+            policy,
+        )
+    )
+    tampered_wheel = tmp_path / artifacts.wheel.name
+    _rewrite_member_metadata(
+        artifacts.wheel,
+        tampered_wheel,
+        "vllm/runtime_payload.bin",
+        **{metadata_kind: metadata_value},
+    )
+
+    with pytest.raises(BuildError, match="expected transformation"):
         validate_custom_wheel(
             tampered_wheel,
             repo_root=repo,

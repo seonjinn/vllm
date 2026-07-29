@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -117,11 +118,19 @@ class _WheelMember:
 
 @dataclass(frozen=True)
 class _SourceSnapshot:
-    files: Mapping[str, bytes]
+    files: Mapping[str, _WheelMember]
     deleted_runtime_files: tuple[str, ...]
     changed_runtime_files: tuple[str, ...]
     tactic_json_files: tuple[str, ...]
     source_tree_sha256: str
+
+
+@dataclass(frozen=True)
+class _GitTreeEntry:
+    path: str
+    mode: str
+    object_type: str
+    object_id: str
 
 
 def _sha256_bytes(content: bytes) -> str:
@@ -206,6 +215,22 @@ def _validate_source_checkout(
         )
 
 
+def _validate_external_build_paths(
+    repo_root: Path,
+    base_wheel: Path,
+    output_dir: Path,
+) -> None:
+    for label, path in (
+        ("base wheel", base_wheel),
+        ("output directory", output_dir),
+    ):
+        try:
+            path.relative_to(repo_root)
+        except ValueError:
+            continue
+        raise BuildError(f"{label} must be outside the source checkout: {path}")
+
+
 def _is_runtime_source(path: str) -> bool:
     if not path.startswith("vllm/"):
         return False
@@ -214,13 +239,79 @@ def _is_runtime_source(path: str) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in _PACKAGE_DATA_PATTERNS)
 
 
-def _git_paths(
+def _run_git_bytes(
     repo_root: Path,
     *arguments: str,
-) -> tuple[str, ...]:
-    output = _run_git(repo_root, *arguments).stdout
-    paths = {line for line in output.splitlines() if line}
-    return tuple(sorted(paths))
+) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        diagnostic = ""
+        if isinstance(error, subprocess.CalledProcessError):
+            diagnostic = (
+                (error.stderr or error.stdout or b"").decode(errors="replace").strip()
+            )
+        suffix = f": {diagnostic}" if diagnostic else ""
+        raise BuildError(f"git {' '.join(arguments)} failed{suffix}") from error
+
+
+def _read_git_runtime_tree(
+    repo_root: Path,
+    commit: str,
+) -> dict[str, _GitTreeEntry]:
+    raw_tree = _run_git_bytes(
+        repo_root,
+        "ls-tree",
+        "-rz",
+        "--full-tree",
+        commit,
+        "--",
+        "vllm",
+    )
+    entries: dict[str, _GitTreeEntry] = {}
+    for raw_record in raw_tree.split(b"\0"):
+        if not raw_record:
+            continue
+        raw_metadata, separator, raw_path = raw_record.partition(b"\t")
+        metadata_fields = raw_metadata.split(b" ")
+        if not separator or len(metadata_fields) != 3:
+            raise BuildError("git ls-tree returned an invalid NUL record")
+        try:
+            mode, object_type, object_id = (
+                field.decode("ascii") for field in metadata_fields
+            )
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise BuildError("Git tree contains a non-UTF-8 path or field") from error
+        _validate_member_name(path)
+        if not _is_runtime_source(path):
+            continue
+        if object_type != "blob" or mode not in {"100644", "100755"}:
+            raise BuildError(
+                f"unsupported Git mode/type for runtime member {path}: "
+                f"{mode} {object_type}"
+            )
+        if path in entries:
+            raise BuildError(f"Git tree contains duplicate runtime path: {path}")
+        entries[path] = _GitTreeEntry(
+            path=path,
+            mode=mode,
+            object_type=object_type,
+            object_id=object_id,
+        )
+    return entries
+
+
+def _read_git_blob(
+    repo_root: Path,
+    entry: _GitTreeEntry,
+) -> bytes:
+    return _run_git_bytes(repo_root, "cat-file", "blob", entry.object_id)
 
 
 def _load_source_snapshot(
@@ -228,42 +319,25 @@ def _load_source_snapshot(
     source_commit: str,
     upstream_base_commit: str,
 ) -> _SourceSnapshot:
-    tracked_paths = _git_paths(
+    source_tree = _read_git_runtime_tree(
         repo_root,
-        "ls-tree",
-        "-r",
-        "--name-only",
         source_commit,
-        "--",
-        "vllm",
     )
-    runtime_paths = tuple(path for path in tracked_paths if _is_runtime_source(path))
-    files: dict[str, bytes] = {}
-    for path in runtime_paths:
-        result = subprocess.run(
-            ["git", "show", f"{source_commit}:{path}"],
-            cwd=repo_root,
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            diagnostic = result.stderr.decode(errors="replace").strip()
-            raise BuildError(
-                f"cannot read {path} from source commit {source_commit}: {diagnostic}"
-            )
-        files[path] = result.stdout
-
-    changed_paths = _git_paths(
+    base_tree = _read_git_runtime_tree(
         repo_root,
-        "diff",
-        "--name-only",
         upstream_base_commit,
-        source_commit,
-        "--",
-        "vllm",
     )
+    files = {
+        path: _WheelMember(
+            data=_read_git_blob(repo_root, entry),
+            mode=int(entry.mode, 8),
+        )
+        for path, entry in sorted(source_tree.items())
+    }
     changed_runtime_files = tuple(
-        path for path in changed_paths if path in files and _is_runtime_source(path)
+        path
+        for path, entry in sorted(source_tree.items())
+        if base_tree.get(path) != entry
     )
     changed_mxfp8_python = tuple(
         path
@@ -276,19 +350,7 @@ def _load_source_snapshot(
             f"to upstream base {upstream_base_commit}"
         )
 
-    deleted_paths = _git_paths(
-        repo_root,
-        "diff",
-        "--diff-filter=D",
-        "--name-only",
-        upstream_base_commit,
-        source_commit,
-        "--",
-        "vllm",
-    )
-    deleted_runtime_files = tuple(
-        path for path in deleted_paths if _is_runtime_source(path)
-    )
+    deleted_runtime_files = tuple(sorted(set(base_tree) - set(source_tree)))
     tactic_json_files = tuple(
         path
         for path in files
@@ -301,10 +363,12 @@ def _load_source_snapshot(
         raise BuildError("source commit has no tracked MXFP8 tactic JSON package data")
 
     digest = hashlib.sha256()
-    for path, content in sorted(files.items()):
+    for path, member in sorted(files.items()):
         digest.update(path.encode())
         digest.update(b"\0")
-        digest.update(hashlib.sha256(content).digest())
+        digest.update(f"{member.mode:o}".encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(member.data).digest())
         digest.update(b"\0")
     return _SourceSnapshot(
         files=files,
@@ -319,6 +383,8 @@ def _validate_member_name(name: str) -> None:
     pure_path = PurePosixPath(name)
     if not name or name.startswith("/") or "\\" in name or ".." in pure_path.parts:
         raise BuildError(f"wheel contains unsafe member path: {name!r}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise BuildError(f"wheel member path contains a control character: {name!r}")
 
 
 def _read_wheel_members(path: Path) -> dict[str, _WheelMember]:
@@ -466,7 +532,7 @@ def _changed_file_hashes(
     snapshot: _SourceSnapshot,
 ) -> dict[str, str]:
     return {
-        path: _sha256_bytes(snapshot.files[path])
+        path: _sha256_bytes(snapshot.files[path].data)
         for path in snapshot.changed_runtime_files
     }
 
@@ -546,6 +612,29 @@ def _write_wheel(
         raise BuildError(f"cannot write wheel {path}: {error}") from error
 
 
+def _fsync_file(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise BuildError(f"cannot fsync file {path}: {error}") from error
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise BuildError(f"cannot fsync directory {path}: {error}") from error
+
+
 def _expected_wheel_filename(
     source_commit: str,
     policy: BuildPolicy,
@@ -597,7 +686,6 @@ def validate_custom_wheel(
         base_wheel,
         policy,
     )
-    del base_members
     members = _read_wheel_members(wheel)
     dist_info = _dist_info_dir(members)
     if dist_info != base_dist_info:
@@ -623,9 +711,23 @@ def validate_custom_wheel(
         policy=policy,
         build_tag=build_tag,
     )
-    for path, expected_content in snapshot.files.items():
+    expected_members = _assemble_custom_members(
+        base_members=base_members,
+        dist_info=base_dist_info,
+        snapshot=snapshot,
+        provenance=expected_provenance,
+        build_tag=build_tag,
+    )
+    if set(members) != set(expected_members):
+        missing = sorted(set(expected_members) - set(members))
+        extra = sorted(set(members) - set(expected_members))
+        raise BuildError(
+            f"custom wheel member set mismatch: missing={missing}, extra={extra}"
+        )
+
+    for path, expected_member in snapshot.files.items():
         member = members.get(path)
-        if member is None or member.data != expected_content:
+        if member != expected_member:
             raise BuildError(
                 f"custom wheel member {path} does not match source commit "
                 f"{source_commit}"
@@ -655,6 +757,15 @@ def validate_custom_wheel(
         member = members.get(path)
         if member is None or member.data != expected_provenance_bytes:
             raise BuildError(f"custom wheel provenance mismatch at {path}")
+
+    record_path = f"{dist_info}/RECORD"
+    comparison_order = sorted(name for name in members if name != record_path)
+    comparison_order.append(record_path)
+    for path in comparison_order:
+        if members[path] != expected_members[path]:
+            raise BuildError(
+                f"custom wheel member {path} differs from expected transformation"
+            )
     _validate_record(members, dist_info)
 
 
@@ -672,8 +783,8 @@ def _assemble_custom_members(
         for name, member in base_members.items()
         if name != record_path and name not in snapshot.deleted_runtime_files
     }
-    for path, content in snapshot.files.items():
-        members[path] = _WheelMember(content)
+    for path, member in snapshot.files.items():
+        members[path] = member
     provenance_member = _WheelMember(_json_bytes(provenance))
     members[_PACKAGE_PROVENANCE_PATH] = provenance_member
     members[f"{dist_info}/mxfp8-provenance.json"] = provenance_member
@@ -694,14 +805,23 @@ def _publish_create_only(
     existing = [str(path) for path in target_paths if path.exists()]
     if existing:
         raise BuildError(f"refusing to overwrite existing artifact: {existing}")
+    target_parents = {path.parent.resolve() for path in target_paths}
+    if len(target_parents) != 1:
+        raise BuildError("all custom wheel artifacts must share one directory")
+    target_parent = next(iter(target_parents))
     published: list[Path] = []
     try:
         for temporary, target in zip(temporary_paths, target_paths, strict=True):
             os.link(temporary, target)
             published.append(target)
-    except OSError as error:
+        _fsync_directory(target_parent)
+    except (OSError, BuildError) as error:
         for path in published:
             path.unlink(missing_ok=True)
+        with suppress(BuildError):
+            _fsync_directory(target_parent)
+        if isinstance(error, BuildError):
+            raise
         raise BuildError(f"cannot publish custom wheel artifacts: {error}") from error
 
 
@@ -711,6 +831,7 @@ def build_custom_wheel(request: WheelBuildRequest) -> BuildArtifacts:
     base_wheel = request.base_wheel.resolve()
     output_dir = request.output_dir.resolve()
     _validate_host(request.host)
+    _validate_external_build_paths(repo_root, base_wheel, output_dir)
     _validate_source_checkout(
         repo_root,
         request.source_commit,
@@ -772,6 +893,18 @@ def build_custom_wheel(request: WheelBuildRequest) -> BuildArtifacts:
         temporary_sha256.write_text(
             f"{wheel_sha256}  {wheel_filename}\n",
             encoding="utf-8",
+        )
+        for path in (
+            temporary_wheel,
+            temporary_metadata,
+            temporary_sha256,
+        ):
+            _fsync_file(path)
+        _fsync_directory(temporary_root)
+        _validate_source_checkout(
+            repo_root,
+            request.source_commit,
+            request.policy.upstream_base_commit,
         )
         _publish_create_only(
             (temporary_wheel, temporary_metadata, temporary_sha256),
