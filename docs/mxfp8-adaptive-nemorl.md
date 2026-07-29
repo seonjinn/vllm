@@ -23,7 +23,7 @@ fork:                          https://github.com/seonjinn/vllm.git
 branch:                        sna/mxfp8-adaptive-v0.20.2-nemorl
 source-install runtime pin:    bc5881924556fcf830f8158815d5a62cef0fbcba
 wheel builder introduced:      9070391094c14af61dad0a3872113b09fe0619eb
-approved wheel source pin:     e8bb60a254c7d823b3e1b2d30bdc90e43d0e770d
+approved wheel source pin:     b6b5feed40bbfcfdef5a4963f574a69546368eb6
 functional implementation:    e32ce4fdd30ef313e10bf3a328352ead2a4c0054
 upstream vLLM base:            5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1
 vLLM public version:           0.20.2
@@ -141,7 +141,7 @@ VLLM_ROOT=/workspace/vllm
 WHEEL_WORK=/shared/vllm-mxfp8-wheel
 VLLM_BASE_WHEEL="$WHEEL_WORK/vllm-0.20.2-cp38-abi3-manylinux_2_35_aarch64.whl"
 WHEEL_OUT="$WHEEL_WORK/custom"
-VLLM_WHEEL_COMMIT=e8bb60a254c7d823b3e1b2d30bdc90e43d0e770d
+VLLM_WHEEL_COMMIT=b6b5feed40bbfcfdef5a4963f574a69546368eb6
 
 test "$(uname -s)" = Linux
 test "$(uname -m)" = aarch64
