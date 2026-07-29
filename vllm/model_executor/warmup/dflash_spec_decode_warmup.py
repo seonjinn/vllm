@@ -145,6 +145,9 @@ def _warmup_prepare_dflash_inputs_kernel(
                 next_prefill_tokens = _alloc(
                     max_num_reqs, dtype=torch.int32, device=device
                 )
+                num_cached_tokens = _alloc(
+                    max_num_reqs, dtype=torch.int32, device=device
+                )
                 num_sampled = _alloc(n, dtype=torch.int32, device=device, fill_value=1)
                 num_rejected = _alloc(n, dtype=torch.int32, device=device)
                 block_table = _alloc(
@@ -201,6 +204,7 @@ def _warmup_prepare_dflash_inputs_kernel(
                     num_rejected,
                     block_table,
                     block_table_stride,
+                    num_cached_tokens,
                     parallel_drafting_token_id,
                     block_size,
                     num_query_per_req,
