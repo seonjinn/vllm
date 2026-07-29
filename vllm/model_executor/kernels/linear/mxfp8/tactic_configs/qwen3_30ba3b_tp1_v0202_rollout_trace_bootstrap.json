@@ -1,0 +1,37 @@
+{
+  "compatibility": {
+    "compute_capability": "10.0",
+    "flashinfer_version": "0.6.8.post1",
+    "gpu_family": "GB200",
+    "model": "Qwen/Qwen3-30B-A3B",
+    "tensor_parallel_size": 1,
+    "vllm_base_commit": "5246e3c5df5fb8266b50ceaa6eca2836fb2d13b1",
+    "vllm_version": "0.20.2"
+  },
+  "mode": "adaptive",
+  "policy": {
+    "default_tactic": -1,
+    "direct_trtllm": true,
+    "gemm_backend": "trtllm",
+    "layout": "adaptive",
+    "pad_to_128": false,
+    "quant_backend": "cuda",
+    "require_8x4_quant": true,
+    "require_direct_trtllm": true,
+    "switch_m": 256
+  },
+  "provenance": {
+    "container_sha256": "32f07be22293d9a3979e8ba04772ad48a8157dad04fd92577063ed4e07ab1493",
+    "minimum_cosine_similarity": 0.999,
+    "minimum_speedup_vs_default": 1.02,
+    "qualification_repeat_count": 3,
+    "qualification_scope": "nemo_rl_qwen3_30ba3b_mxfp8_rollout_trace_bootstrap",
+    "source_hint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_manifest_sha256": "439ab42af0bf2ba56a777e8939dc69167871bd6ac2454bce0f3292db84c70064"
+  },
+  "schema_version": 1,
+  "tactics": {
+    "128x4": [],
+    "8x4": []
+  }
+}

@@ -26,6 +26,29 @@ _SPEC.loader.exec_module(_MODULE)
 load_mxfp8_dense_runtime_config = _MODULE.load_mxfp8_dense_runtime_config
 
 
+def test_packaged_qwen_baseline_uses_trtllm_default_tactic() -> None:
+    config_dir = _MODULE_PATH.parent / "tactic_configs"
+    config = load_mxfp8_dense_runtime_config(
+        "qwen3_30ba3b_tp1_v0202_rollout_trace_bootstrap.json",
+        actual_vllm_version="0.20.2",
+        actual_flashinfer_version="0.6.8.post1",
+        actual_compute_capability=(10, 0),
+        actual_model="Qwen/Qwen3-30B-A3B",
+        actual_tensor_parallel_size=1,
+        package_config_dir=config_dir,
+    )
+
+    assert config.gemm_backend == "trtllm"
+    assert config.layout == "adaptive"
+    assert config.switch_m == 256
+    assert config.default_tactic == -1
+    assert config.tactics_8x4 == ()
+    assert config.tactics_128x4 == ()
+    assert config.source_sha256 == (
+        "3c9f2be89e9053df62d07b937bbbf6f1d4bce39867825cda940271762708a447"
+    )
+
+
 def _manifest() -> dict[str, Any]:
     return {
         "schema_version": 1,
