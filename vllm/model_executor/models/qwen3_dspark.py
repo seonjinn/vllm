@@ -172,9 +172,10 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             if logits is not None:
                 logits = logits[..., : self.logits_processor.org_vocab_size]
                 if self.logits_processor.soft_cap is not None:
-                    logits = torch.tanh(
-                        logits / self.logits_processor.soft_cap
-                    ) * self.logits_processor.soft_cap
+                    logits = (
+                        torch.tanh(logits / self.logits_processor.soft_cap)
+                        * self.logits_processor.soft_cap
+                    )
                 if self.logits_processor.scale != 1.0:
                     logits *= self.logits_processor.scale
             return logits

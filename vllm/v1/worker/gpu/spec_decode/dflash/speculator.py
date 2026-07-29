@@ -193,8 +193,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # lengths (see _prepare_dflash_inputs_kernel), which only works if all
         # draft groups shift by the same number of slots per cached block.
         draft_block_sizes = {
-            self.block_tables.block_sizes[gid]
-            for gid in self.draft_kv_cache_group_ids
+            self.block_tables.block_sizes[gid] for gid in self.draft_kv_cache_group_ids
         }
         assert len(draft_block_sizes) == 1, (
             "DFlash requires a uniform block size across draft KV cache "
