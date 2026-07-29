@@ -193,6 +193,8 @@ def _mxfp8_dense_pad_to_128() -> bool:
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
 
+    preserves_checkpoint_weight_scale_for_refit = True
+
     def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
         super().__init__(c)
         layout_mode = _mxfp8_dense_a_sf_layout()

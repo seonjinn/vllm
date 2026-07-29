@@ -16,11 +16,16 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.quantization import modelopt
+from vllm.model_executor.model_loader.reload.layerwise import (
+    _copy_and_restore_kernel_tensors,
+)
 from vllm.model_executor.model_loader.reload.meta import (
     capture_layer_to_meta,
+    materialize_layer,
     restore_layer_on_meta,
 )
 from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+from vllm.model_executor.model_loader.reload.utils import get_layer_params_buffers
 
 
 class FakeActivationType(Enum):
@@ -101,6 +106,7 @@ def test_flashinfer_mxfp8_linear_keeps_checkpoint_scale_for_refit():
     )
 
     kernel = object.__new__(FlashInferCutlassMxfp8LinearKernel)
+    assert kernel.preserves_checkpoint_weight_scale_for_refit
     kernel.process_weights_after_loading(layer)
 
     checkpoint_scale = layer.weight_scale
@@ -131,6 +137,32 @@ def test_flashinfer_mxfp8_linear_refit_preserves_derived_apply_scale():
     apply_scale = layer.weight_scale_for_apply
 
     restore_layer_on_meta(layer, reload_info)
+
+    assert layer.weight_scale_for_apply is apply_scale
+
+
+def test_flashinfer_mxfp8_linear_first_refit_preserves_new_apply_scale():
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 128), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = Parameter(
+        torch.ones((128, 4), dtype=torch.uint8), requires_grad=False
+    )
+    reload_info = LayerReloadingInfo(
+        restore_metadata=capture_layer_to_meta(layer),
+        restore_device=torch.device("cpu"),
+        kernel_tensors=get_layer_params_buffers(layer),
+    )
+    restore_layer_on_meta(layer, reload_info)
+    materialize_layer(layer, reload_info)
+    layer.weight_scale.data.fill_(1)
+
+    kernel = object.__new__(FlashInferCutlassMxfp8LinearKernel)
+    kernel.process_weights_after_loading(layer)
+    apply_scale = layer.weight_scale_for_apply
+
+    _copy_and_restore_kernel_tensors(layer, reload_info)
 
     assert layer.weight_scale_for_apply is apply_scale
 

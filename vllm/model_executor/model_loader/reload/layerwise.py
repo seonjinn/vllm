@@ -356,12 +356,28 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
 
 
 def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
+    assert info.kernel_tensors is not None
+    parameters, buffers = info.kernel_tensors
+    current_parameters, current_buffers = get_layer_params_buffers(layer)
+    new_skip_parameters = {
+        name: param
+        for name, param in current_parameters.items()
+        if name in SKIP_TENSORS and name not in parameters and name not in buffers
+    }
+    new_skip_buffers = {
+        name: buffer
+        for name, buffer in current_buffers.items()
+        if name in SKIP_TENSORS and name not in parameters and name not in buffers
+    }
+
     for name in get_layer_tensors(layer):
         delattr(layer, name)
 
-    assert info.kernel_tensors is not None
-    parameters, buffers = info.kernel_tensors
     for name, param in parameters.items():
         layer.register_parameter(name, param)
     for name, buffer in buffers.items():
+        layer.register_buffer(name, buffer)
+    for name, param in new_skip_parameters.items():
+        layer.register_parameter(name, param)
+    for name, buffer in new_skip_buffers.items():
         layer.register_buffer(name, buffer)
