@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     configure_mxfp8_trtllm_adaptive_compilation,
@@ -27,6 +28,7 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 _MXFP8_DENSE_TRACE_SEEN: set[tuple[str, str, int, int, int, int, str]] = set()
 _MXFP8_DENSE_TRACE_WRITTEN = 0
+logger = init_logger(__name__)
 
 
 def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
@@ -264,6 +266,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
         super().__init__(c)
         configure_mxfp8_trtllm_adaptive_compilation()
+        self._cutedsl_fallback: FlashInferCutedslMxfp8LinearKernel | None = None
 
     @classmethod
     def is_supported(
@@ -282,15 +285,44 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
-
         weight = layer.weight.data  # [N, K]
         n, k = weight.shape
         if k % 256 != 0:
+            allow_fallback = os.environ.get(
+                "VLLM_MXFP8_DENSE_TRTLLM_ALLOW_CUTEDSL_FALLBACK", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if allow_fallback:
+                supported, reason = FlashInferCutedslMxfp8LinearKernel.is_supported()
+                if not supported:
+                    raise ValueError(
+                        "TRTLLM MXFP8 dense K is not divisible by 256 and "
+                        f"CuTeDSL fallback is unavailable: {reason}"
+                    )
+                if n < 128 or k < 128 or k % MXFP8_BLOCK_SIZE:
+                    raise ValueError(
+                        "TRTLLM MXFP8 dense K is not divisible by 256 and "
+                        "the layer does not satisfy CuTeDSL constraints: "
+                        f"N={n}, K={k}."
+                    )
+                if self._cutedsl_fallback is None:
+                    self._cutedsl_fallback = FlashInferCutedslMxfp8LinearKernel(
+                        self.config
+                    )
+                self._cutedsl_fallback.process_weights_after_loading(layer)
+                layer._mxfp8_dense_backend = "cute-dsl"
+                logger.info(
+                    "Using CuTeDSL MXFP8 dense fallback for %s (N=%d, K=%d)",
+                    getattr(layer, "prefix", "unknown"),
+                    n,
+                    k,
+                )
+                return
             raise ValueError(
                 "TRTLLM MXFP8 dense weights require K to be divisible by 256, "
                 f"got N={n}, K={k}."
             )
+
+        from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
         scale_k = k // MXFP8_BLOCK_SIZE
         weight_scale = layer.weight_scale.data[:n, :scale_k].contiguous()
@@ -321,6 +353,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         layer.weight = Parameter(shuffled_weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(shuffled_scale.contiguous(), requires_grad=False)
         layer._mxfp8_trtllm_output_features = n
+        layer._mxfp8_dense_backend = "trtllm"
         prepare_mxfp8_trtllm_exact_tactic_state(layer.weight.device)
         prepare_mxfp8_trtllm_high_m_tactic_state(layer.weight.device)
 
@@ -330,6 +363,10 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_mxfp8_dense_backend", "trtllm") == "cute-dsl":
+            if self._cutedsl_fallback is None:
+                raise RuntimeError("CuTeDSL fallback was not initialized")
+            return self._cutedsl_fallback.apply_weights(layer, x, bias)
         if x.dtype != torch.bfloat16:
             raise ValueError(
                 "FlashInfer TRTLLM MXFP8 dense GEMM requires BF16 activations, "

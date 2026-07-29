@@ -462,6 +462,81 @@ def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:
         kernel.apply_weights(torch.nn.Module(), torch.empty(1, 32, dtype=torch.float16))
 
 
+def test_mxfp8_trtllm_unsupported_k_requires_explicit_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_MXFP8_DENSE_TRTLLM_ALLOW_CUTEDSL_FALLBACK", raising=False)
+    kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 1344), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+
+    with pytest.raises(ValueError, match="K to be divisible by 256"):
+        kernel.process_weights_after_loading(layer)
+
+
+def test_mxfp8_trtllm_unsupported_k_uses_cutedsl_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRTLLM_ALLOW_CUTEDSL_FALLBACK", "1")
+    processed: list[torch.nn.Module] = []
+
+    class Fallback:
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            processed.append(layer)
+
+        def apply_weights(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            bias: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            return x + 1
+
+    kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
+    kernel._cutedsl_fallback = Fallback()
+    monkeypatch.setattr(
+        flashinfer_module.FlashInferCutedslMxfp8LinearKernel,
+        "is_supported",
+        lambda: (True, None),
+    )
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 1344), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+
+    kernel.process_weights_after_loading(layer)
+    output = kernel.apply_weights(
+        layer,
+        torch.zeros((2, 1344), dtype=torch.bfloat16),
+    )
+
+    assert processed == [layer]
+    assert layer._mxfp8_dense_backend == "cute-dsl"
+    assert torch.equal(output, torch.ones_like(output))
+
+
+def test_mxfp8_trtllm_unsupported_k_rejects_unavailable_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRTLLM_ALLOW_CUTEDSL_FALLBACK", "1")
+    monkeypatch.setattr(
+        flashinfer_module.FlashInferCutedslMxfp8LinearKernel,
+        "is_supported",
+        lambda: (False, "missing test backend"),
+    )
+    kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
+    kernel._cutedsl_fallback = None
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 1344), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+
+    with pytest.raises(ValueError, match="CuTeDSL fallback is unavailable"):
+        kernel.process_weights_after_loading(layer)
+
+
 def test_mxfp8_shape_trace_policy_is_not_evaluated_during_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
