@@ -30,6 +30,40 @@ _MXFP8_DENSE_TRACE_SEEN: set[tuple[int, int, int, int, str]] = set()
 _MXFP8_DENSE_TRACE_WRITTEN = 0
 logger = init_logger(__name__)
 
+_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST"
+
+
+def _parse_mxfp8_trtllm_layer_allowlist(value: str) -> set[tuple[int, int]]:
+    entries: set[tuple[int, int]] = set()
+    for raw_entry in value.split(";"):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        fields = [field.strip() for field in entry.split(",")]
+        if len(fields) != 2:
+            raise ValueError(
+                f"{_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV} entries must use N,K"
+            )
+        try:
+            n, k = (int(field) for field in fields)
+        except ValueError as error:
+            raise ValueError(
+                f"{_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV} entries must use N,K"
+            ) from error
+        if n <= 0 or k <= 0:
+            raise ValueError(
+                f"{_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV} entries must be positive N,K"
+            )
+        entries.add((n, k))
+    return entries
+
+
+def _mxfp8_trtllm_layer_is_qualified(n: int, k: int) -> bool:
+    value = os.environ.get(_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV)
+    if value is None:
+        return True
+    return (n, k) in _parse_mxfp8_trtllm_layer_allowlist(value)
+
 
 def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
     prefix = str(getattr(layer, "prefix", "")).lower()
@@ -287,34 +321,19 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data  # [N, K]
         n, k = weight.shape
+        if not _mxfp8_trtllm_layer_is_qualified(n, k):
+            self._prepare_cutedsl_fallback(layer, n, k, "not allowlisted")
+            return
         if k % 256 != 0:
             allow_fallback = os.environ.get(
                 "VLLM_MXFP8_DENSE_TRTLLM_ALLOW_CUTEDSL_FALLBACK", ""
             ).strip().lower() in {"1", "true", "yes", "on"}
             if allow_fallback:
-                supported, reason = FlashInferCutedslMxfp8LinearKernel.is_supported()
-                if not supported:
-                    raise ValueError(
-                        "TRTLLM MXFP8 dense K is not divisible by 256 and "
-                        f"CuTeDSL fallback is unavailable: {reason}"
-                    )
-                if n < 128 or k < 128 or k % MXFP8_BLOCK_SIZE:
-                    raise ValueError(
-                        "TRTLLM MXFP8 dense K is not divisible by 256 and "
-                        "the layer does not satisfy CuTeDSL constraints: "
-                        f"N={n}, K={k}."
-                    )
-                if self._cutedsl_fallback is None:
-                    self._cutedsl_fallback = FlashInferCutedslMxfp8LinearKernel(
-                        self.config
-                    )
-                self._cutedsl_fallback.process_weights_after_loading(layer)
-                layer._mxfp8_dense_backend = "cute-dsl"
-                logger.info(
-                    "Using CuTeDSL MXFP8 dense fallback for %s (N=%d, K=%d)",
-                    getattr(layer, "prefix", "unknown"),
+                self._prepare_cutedsl_fallback(
+                    layer,
                     n,
                     k,
+                    "TRTLLM K is not divisible by 256",
                 )
                 return
             raise ValueError(
@@ -356,6 +375,35 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         layer._mxfp8_dense_backend = "trtllm"
         prepare_mxfp8_trtllm_exact_tactic_state(layer.weight.device)
         prepare_mxfp8_trtllm_high_m_tactic_state(layer.weight.device)
+
+    def _prepare_cutedsl_fallback(
+        self,
+        layer: torch.nn.Module,
+        n: int,
+        k: int,
+        reason: str,
+    ) -> None:
+        supported, failure_reason = FlashInferCutedslMxfp8LinearKernel.is_supported()
+        if not supported:
+            raise ValueError(
+                f"{reason} and CuTeDSL fallback is unavailable: {failure_reason}"
+            )
+        if n < 128 or k < 128 or k % MXFP8_BLOCK_SIZE:
+            raise ValueError(
+                f"{reason} and the layer does not satisfy CuTeDSL constraints: "
+                f"N={n}, K={k}."
+            )
+        if self._cutedsl_fallback is None:
+            self._cutedsl_fallback = FlashInferCutedslMxfp8LinearKernel(self.config)
+        self._cutedsl_fallback.process_weights_after_loading(layer)
+        layer._mxfp8_dense_backend = "cute-dsl"
+        logger.info(
+            "Using CuTeDSL MXFP8 dense fallback for %s (N=%d, K=%d): %s",
+            getattr(layer, "prefix", "unknown"),
+            n,
+            k,
+            reason,
+        )
 
     def apply_weights(
         self,

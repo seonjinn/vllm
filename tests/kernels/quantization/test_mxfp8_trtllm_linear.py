@@ -537,6 +537,48 @@ def test_mxfp8_trtllm_unsupported_k_rejects_unavailable_fallback(
         kernel.process_weights_after_loading(layer)
 
 
+def test_mxfp8_trtllm_layer_allowlist_parses_exact_nk_pairs() -> None:
+    assert flashinfer_module._parse_mxfp8_trtllm_layer_allowlist(
+        "5120,5120;8192,4096"
+    ) == {(5120, 5120), (8192, 4096)}
+
+
+def test_mxfp8_trtllm_layer_allowlist_rejects_malformed_entry() -> None:
+    with pytest.raises(ValueError, match="N,K"):
+        flashinfer_module._parse_mxfp8_trtllm_layer_allowlist("5120")
+
+
+def test_mxfp8_trtllm_unqualified_layer_uses_cutedsl_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST",
+        "256,1280",
+    )
+    processed: list[torch.nn.Module] = []
+
+    class Fallback:
+        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+            processed.append(layer)
+
+    kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
+    kernel._cutedsl_fallback = Fallback()
+    monkeypatch.setattr(
+        flashinfer_module.FlashInferCutedslMxfp8LinearKernel,
+        "is_supported",
+        lambda: (True, None),
+    )
+    layer = torch.nn.Module()
+    layer.weight = Parameter(
+        torch.empty((128, 1280), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+
+    kernel.process_weights_after_loading(layer)
+
+    assert processed == [layer]
+    assert layer._mxfp8_dense_backend == "cute-dsl"
+
+
 def test_mxfp8_shape_trace_policy_is_not_evaluated_during_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
