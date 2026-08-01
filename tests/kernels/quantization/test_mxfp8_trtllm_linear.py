@@ -548,6 +548,38 @@ def test_mxfp8_trtllm_layer_allowlist_rejects_malformed_entry() -> None:
         flashinfer_module._parse_mxfp8_trtllm_layer_allowlist("5120")
 
 
+def test_mxfp8_trtllm_layer_allowlist_decodes_base64_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST_B64",
+        "NTEyMCw1MTIwOzgyMTIsNDA5Ng==",
+    )
+
+    assert flashinfer_module._mxfp8_trtllm_layer_is_qualified(5120, 5120)
+    assert not flashinfer_module._mxfp8_trtllm_layer_is_qualified(4096, 4096)
+
+
+def test_mxfp8_trtllm_layer_allowlist_rejects_two_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST",
+        "5120,5120",
+    )
+    monkeypatch.setenv(
+        "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST_B64",
+        "NTEyMCw1MTIw",
+    )
+
+    with pytest.raises(ValueError, match="only one"):
+        flashinfer_module._mxfp8_trtllm_layer_is_qualified(5120, 5120)
+
+
 def test_mxfp8_trtllm_unqualified_layer_uses_cutedsl_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import base64
 import json
 import os
 import socket
@@ -31,6 +32,7 @@ _MXFP8_DENSE_TRACE_WRITTEN = 0
 logger = init_logger(__name__)
 
 _MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST"
+_MXFP8_TRTLLM_LAYER_ALLOWLIST_B64_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST_B64"
 
 
 def _parse_mxfp8_trtllm_layer_allowlist(value: str) -> set[tuple[int, int]]:
@@ -60,6 +62,20 @@ def _parse_mxfp8_trtllm_layer_allowlist(value: str) -> set[tuple[int, int]]:
 
 def _mxfp8_trtllm_layer_is_qualified(n: int, k: int) -> bool:
     value = os.environ.get(_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV)
+    encoded_value = os.environ.get(_MXFP8_TRTLLM_LAYER_ALLOWLIST_B64_ENV)
+    if value is not None and encoded_value is not None:
+        raise ValueError(
+            f"Set only one of {_MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV} and "
+            f"{_MXFP8_TRTLLM_LAYER_ALLOWLIST_B64_ENV}"
+        )
+    if encoded_value is not None:
+        try:
+            value = base64.b64decode(encoded_value, validate=True).decode("ascii")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError(
+                f"{_MXFP8_TRTLLM_LAYER_ALLOWLIST_B64_ENV} must contain "
+                "base64-encoded ASCII N,K pairs"
+            ) from error
     if value is None:
         return True
     return (n, k) in _parse_mxfp8_trtllm_layer_allowlist(value)
