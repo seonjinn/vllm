@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import re
 import socket
 from pathlib import Path
 
@@ -37,7 +38,7 @@ _MXFP8_TRTLLM_LAYER_ALLOWLIST_B64_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST
 
 def _parse_mxfp8_trtllm_layer_allowlist(value: str) -> set[tuple[int, int]]:
     entries: set[tuple[int, int]] = set()
-    for raw_entry in value.split(";"):
+    for raw_entry in re.split(r"[;\r\n]+", value):
         entry = raw_entry.strip()
         if not entry:
             continue

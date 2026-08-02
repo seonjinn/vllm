@@ -543,6 +543,12 @@ def test_mxfp8_trtllm_layer_allowlist_parses_exact_nk_pairs() -> None:
     ) == {(5120, 5120), (8192, 4096)}
 
 
+def test_mxfp8_trtllm_layer_allowlist_accepts_line_delimited_artifact() -> None:
+    assert flashinfer_module._parse_mxfp8_trtllm_layer_allowlist(
+        "1280,8192\n2048,8192\n8192,1024\n"
+    ) == {(1280, 8192), (2048, 8192), (8192, 1024)}
+
+
 def test_mxfp8_trtllm_layer_allowlist_rejects_malformed_entry() -> None:
     with pytest.raises(ValueError, match="N,K"):
         flashinfer_module._parse_mxfp8_trtllm_layer_allowlist("5120")
