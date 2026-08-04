@@ -4,7 +4,6 @@
 #SBATCH --partition=36x2-a01r
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
 #SBATCH --segment=1
 #SBATCH --time=00:30:00
 #SBATCH --mem=0
