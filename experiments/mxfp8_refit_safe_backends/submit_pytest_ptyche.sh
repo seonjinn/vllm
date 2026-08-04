@@ -29,7 +29,5 @@ srun \
   bash -lc '
     set -euo pipefail
     export PYTHONPATH=/workspace/vllm
-    /usr/local/bin/python-VllmGenerationWorker -m pytest \
-      "$CONTAINER_TEST_FILE" \
-      -q -k refit
+    /usr/local/bin/python-VllmGenerationWorker "$CONTAINER_TEST_FILE"
   '
