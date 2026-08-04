@@ -1,18 +1,42 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
+import os
 import sys
 import types
 from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
 
 import torch
 from torch.nn.parameter import Parameter
 
-import vllm.model_executor.kernels.linear.mxfp8.flashinfer as flashinfer_module
-from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
-    FlashInferCutedslMxfp8LinearKernel,
-    FlashInferCutlassMxfp8LinearKernel,
-    FlashInferTrtllmMxfp8LinearKernel,
+
+def _load_flashinfer_module() -> ModuleType:
+    module_name = "vllm.model_executor.kernels.linear.mxfp8.flashinfer"
+    module_path = os.environ.get("MXFP8_FLASHINFER_MODULE_FILE")
+    if module_path is None:
+        return importlib.import_module(module_name)
+
+    importlib.import_module("vllm.model_executor.kernels.linear.mxfp8")
+    spec = importlib.util.spec_from_file_location(module_name, Path(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load MXFP8 kernel module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+flashinfer_module = _load_flashinfer_module()
+FlashInferCutedslMxfp8LinearKernel = (
+    flashinfer_module.FlashInferCutedslMxfp8LinearKernel
 )
+FlashInferCutlassMxfp8LinearKernel = (
+    flashinfer_module.FlashInferCutlassMxfp8LinearKernel
+)
+FlashInferTrtllmMxfp8LinearKernel = flashinfer_module.FlashInferTrtllmMxfp8LinearKernel
 
 
 def _make_layer(n: int, k: int) -> torch.nn.Module:
