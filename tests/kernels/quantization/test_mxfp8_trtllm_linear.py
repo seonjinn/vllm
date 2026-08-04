@@ -3,6 +3,8 @@
 
 import hashlib
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,8 @@ from torch.nn.parameter import Parameter
 import vllm.model_executor.kernels.linear.mxfp8.flashinfer as flashinfer_module
 from vllm.model_executor.kernels.linear.mxfp8 import Mxfp8LinearLayerConfig
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    FlashInferCutedslMxfp8LinearKernel,
+    FlashInferCutlassMxfp8LinearKernel,
     FlashInferTrtllmMxfp8LinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -460,6 +464,115 @@ def test_mxfp8_trtllm_linear_rejects_fp16_activations() -> None:
     kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
     with pytest.raises(ValueError, match="requires BF16 activations"):
         kernel.apply_weights(torch.nn.Module(), torch.empty(1, 32, dtype=torch.float16))
+
+
+@pytest.mark.parametrize(
+    "kernel_type",
+    [
+        FlashInferCutlassMxfp8LinearKernel,
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferTrtllmMxfp8LinearKernel,
+    ],
+)
+def test_mxfp8_linear_kernels_declare_refit_safe_capability(kernel_type: type) -> None:
+    assert kernel_type.preserves_checkpoint_weight_scale_for_refit is True
+
+
+def test_mxfp8_cutlass_refit_preserves_checkpoint_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        flashinfer_module,
+        "swizzle_mxfp8_scale",
+        lambda scale, *, M, K: scale + M + K,
+    )
+    layer = torch.nn.Module()
+    layer.weight = Parameter(torch.arange(256).reshape(4, 64), requires_grad=False)
+    layer.weight_scale = Parameter(torch.ones((4, 2)), requires_grad=False)
+    weight = layer.weight
+    weight_scale = layer.weight_scale
+    kernel = object.__new__(FlashInferCutlassMxfp8LinearKernel)
+
+    kernel.process_weights_after_loading(layer)
+    prepared_scale = layer.weight_scale_for_apply
+    layer.weight.data.add_(1)
+    layer.weight_scale.data.mul_(2)
+    kernel.process_weights_after_loading(layer)
+
+    assert layer.weight is weight
+    assert layer.weight_scale is weight_scale
+    assert layer.weight_scale_for_apply is prepared_scale
+    assert torch.equal(layer.weight_scale_for_apply, torch.full((4, 2), 70.0))
+
+
+def test_mxfp8_cutedsl_refit_refreshes_stable_prepared_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        flashinfer_module,
+        "swizzle_mxfp8_scale",
+        lambda scale, *, M, K: scale + M + K,
+    )
+    layer = torch.nn.Module()
+    layer.weight = Parameter(torch.arange(256).reshape(4, 64), requires_grad=False)
+    layer.weight_scale = Parameter(torch.ones((4, 2)), requires_grad=False)
+    weight = layer.weight
+    weight_scale = layer.weight_scale
+    kernel = object.__new__(FlashInferCutedslMxfp8LinearKernel)
+
+    kernel.process_weights_after_loading(layer)
+    prepared_weight = layer.weight_for_apply
+    prepared_scale = layer.weight_scale_for_apply
+    layer.weight.data.add_(1)
+    layer.weight_scale.data.mul_(2)
+    kernel.process_weights_after_loading(layer)
+
+    assert layer.weight is weight
+    assert layer.weight_scale is weight_scale
+    assert layer.weight_for_apply is prepared_weight
+    assert layer.weight_scale_for_apply is prepared_scale
+    assert torch.equal(layer.weight_for_apply, layer.weight.t())
+    assert torch.equal(layer.weight_scale_for_apply, torch.full((4, 2), 70.0))
+
+
+def test_mxfp8_trtllm_refit_refreshes_stable_prepared_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        types.SimpleNamespace(
+            shuffle_matrix_a=lambda weight, _: weight + 3,
+            shuffle_matrix_sf_a=lambda scale, *_args, **_kwargs: scale + 5,
+        ),
+    )
+    monkeypatch.setattr(
+        flashinfer_module, "prepare_mxfp8_trtllm_exact_tactic_state", lambda _: None
+    )
+    monkeypatch.setattr(
+        flashinfer_module, "prepare_mxfp8_trtllm_high_m_tactic_state", lambda _: None
+    )
+    layer = torch.nn.Module()
+    layer.weight = Parameter(torch.arange(1024).reshape(4, 256), requires_grad=False)
+    layer.weight_scale = Parameter(torch.ones((4, 8)), requires_grad=False)
+    weight = layer.weight
+    weight_scale = layer.weight_scale
+    kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
+    kernel._cutedsl_fallback = None
+
+    kernel.process_weights_after_loading(layer)
+    prepared_weight = layer.weight_for_apply
+    prepared_scale = layer.weight_scale_for_apply
+    layer.weight.data.add_(1)
+    layer.weight_scale.data.mul_(2)
+    kernel.process_weights_after_loading(layer)
+
+    assert layer.weight is weight
+    assert layer.weight_scale is weight_scale
+    assert layer.weight_for_apply is prepared_weight
+    assert layer.weight_scale_for_apply is prepared_scale
+    assert torch.equal(layer.weight_for_apply[:4], layer.weight + 3)
+    assert torch.equal(layer.weight_scale_for_apply[:32], torch.full((32,), 7.0))
 
 
 def test_mxfp8_trtllm_unsupported_k_requires_explicit_fallback(
