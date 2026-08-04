@@ -36,6 +36,28 @@ _MXFP8_TRTLLM_LAYER_ALLOWLIST_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST"
 _MXFP8_TRTLLM_LAYER_ALLOWLIST_B64_ENV = "VLLM_MXFP8_DENSE_TRTLLM_LAYER_ALLOWLIST_B64"
 
 
+def _refresh_prepared_parameter(
+    layer: torch.nn.Module,
+    name: str,
+    value: torch.Tensor,
+) -> Parameter:
+    prepared = getattr(layer, name, None)
+    if (
+        isinstance(prepared, Parameter)
+        and prepared.shape == value.shape
+        and prepared.dtype == value.dtype
+        and prepared.device == value.device
+        and prepared.stride() == value.stride()
+    ):
+        with torch.no_grad():
+            prepared.copy_(value)
+        return prepared
+
+    prepared = Parameter(value.detach(), requires_grad=False)
+    setattr(layer, name, prepared)
+    return prepared
+
+
 def _parse_mxfp8_trtllm_layer_allowlist(value: str) -> set[tuple[int, int]]:
     entries: set[tuple[int, int]] = set()
     for raw_entry in re.split(r"[;\r\n]+", value):
@@ -155,6 +177,8 @@ def _trace_mxfp8_dense_shape(
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
 
+    preserves_checkpoint_weight_scale_for_refit = True
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -175,9 +199,10 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         weight_scale_2d = layer.weight_scale.data[:N, :scale_k].contiguous()
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
 
-        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
-        layer.weight_scale = Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
+        _refresh_prepared_parameter(
+            layer,
+            "weight_scale_for_apply",
+            weight_scale_swizzled.contiguous(),
         )
 
     def apply_weights(
@@ -187,7 +212,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weight = layer.weight
-        weight_scale = layer.weight_scale
+        weight_scale = layer.weight_scale_for_apply
         out_dtype = x.dtype
         N, K = weight.shape
 
@@ -233,6 +258,8 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
 class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CuTe-DSL (SM100/SM103)."""
 
+    preserves_checkpoint_weight_scale_for_refit = True
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -259,9 +286,15 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
 
         # Store weight column-major [K, N] as mm_mxfp8 expects for operand B.
-        layer.weight = Parameter(weight.contiguous().t(), requires_grad=False)
-        layer.weight_scale = Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
+        _refresh_prepared_parameter(
+            layer,
+            "weight_for_apply",
+            weight.contiguous().t(),
+        )
+        _refresh_prepared_parameter(
+            layer,
+            "weight_scale_for_apply",
+            weight_scale_swizzled.contiguous(),
         )
 
     def apply_weights(
@@ -270,8 +303,8 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        weight = layer.weight  # [K, N], column-major
-        weight_scale = layer.weight_scale
+        weight = layer.weight_for_apply  # [K, N], column-major
+        weight_scale = layer.weight_scale_for_apply
         out_dtype = x.dtype
         K, N = weight.shape
 
@@ -313,6 +346,8 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
 
 class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer's TensorRT-LLM runner."""
+
+    preserves_checkpoint_weight_scale_for_refit = True
 
     def __init__(self, c: Mxfp8LinearLayerConfig) -> None:
         super().__init__(c)
@@ -386,12 +421,20 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
             num_elts_per_sf=MXFP8_BLOCK_SIZE,
         ).reshape(-1)
 
-        layer.weight = Parameter(shuffled_weight.contiguous(), requires_grad=False)
-        layer.weight_scale = Parameter(shuffled_scale.contiguous(), requires_grad=False)
+        weight_for_apply = _refresh_prepared_parameter(
+            layer,
+            "weight_for_apply",
+            shuffled_weight.contiguous(),
+        )
+        _refresh_prepared_parameter(
+            layer,
+            "weight_scale_for_apply",
+            shuffled_scale.contiguous(),
+        )
         layer._mxfp8_trtllm_output_features = n
         layer._mxfp8_dense_backend = "trtllm"
-        prepare_mxfp8_trtllm_exact_tactic_state(layer.weight.device)
-        prepare_mxfp8_trtllm_high_m_tactic_state(layer.weight.device)
+        prepare_mxfp8_trtllm_exact_tactic_state(weight_for_apply.device)
+        prepare_mxfp8_trtllm_high_m_tactic_state(weight_for_apply.device)
 
     def _prepare_cutedsl_fallback(
         self,
@@ -437,8 +480,8 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
                 "FlashInfer TRTLLM MXFP8 dense GEMM requires BF16 activations, "
                 f"got {x.dtype}."
             )
-        weight = layer.weight  # shuffled [N_padded, K]
-        weight_scale = layer.weight_scale
+        weight = layer.weight_for_apply  # shuffled [N_padded, K]
+        weight_scale = layer.weight_scale_for_apply
         n_padded, k = weight.shape
         output_features = layer._mxfp8_trtllm_output_features
 
