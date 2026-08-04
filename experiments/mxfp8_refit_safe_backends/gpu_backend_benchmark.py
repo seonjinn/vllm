@@ -102,6 +102,8 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         raise RuntimeError("SM100 or SM103 is required")
+    if args.backend == "flashinfer_trtllm":
+        os.environ.setdefault("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1")
 
     flashinfer = importlib.import_module("flashinfer")
     kernel_module = _load_flashinfer_module()
@@ -123,6 +125,7 @@ def main() -> None:
     torch.manual_seed(17)
     rows: list[dict[str, object]] = []
     for m, n, k in shapes:
+        torch._dynamo.reset()
         weight_bf16 = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.02
         weight, weight_scale = _quantize_weight(flashinfer, weight_bf16)
         layer = torch.nn.Module()
