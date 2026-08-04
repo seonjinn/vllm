@@ -16,6 +16,7 @@ TEST_FILE=${TEST_FILE:-$SOURCE_DIR/tests/kernels/quantization/test_mxfp8_trtllm_
 TEST_DIR=$(dirname "$TEST_FILE")
 CONTAINER_TEST_FILE=/workspace/test-artifacts/$(basename "$TEST_FILE")
 export CONTAINER_TEST_FILE
+export TEST_ARGS=${TEST_ARGS:-}
 if [[ -n "${PRODUCTION_FILE:-}" ]]; then
   export MXFP8_FLASHINFER_MODULE_FILE=/workspace/test-artifacts/$(basename "$PRODUCTION_FILE")
 fi
@@ -32,5 +33,7 @@ srun \
   bash -lc '
     set -euo pipefail
     export PYTHONPATH=/workspace/vllm
-    /usr/local/bin/python-VllmGenerationWorker "$CONTAINER_TEST_FILE"
+    export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor-$SLURM_JOB_ID
+    export VLLM_CACHE_ROOT=/tmp/vllm-cache-$SLURM_JOB_ID
+    /usr/local/bin/python-VllmGenerationWorker "$CONTAINER_TEST_FILE" $TEST_ARGS
   '
