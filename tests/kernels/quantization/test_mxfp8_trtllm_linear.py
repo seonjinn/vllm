@@ -741,6 +741,12 @@ def test_mxfp8_shape_trace_policy_is_not_evaluated_during_compile(
     layer.weight_scale = Parameter(
         torch.empty(1024, dtype=torch.uint8), requires_grad=False
     )
+    layer.weight_for_apply = Parameter(
+        torch.empty((128, 256), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale_for_apply = Parameter(
+        torch.empty(1024, dtype=torch.uint8), requires_grad=False
+    )
     layer._mxfp8_trtllm_output_features = 120
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
