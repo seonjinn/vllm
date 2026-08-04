@@ -16,7 +16,7 @@ SOURCE_DIR=${SOURCE_DIR:?Set SOURCE_DIR to the vLLM worktree under test}
 TEST_FILE=${TEST_FILE:-$SOURCE_DIR/tests/kernels/quantization/test_mxfp8_trtllm_linear.py}
 export TEST_FILE
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/nemo_rl_nightly_20260711_vllm025_ffmpeg_20260713_1218.sqsh}
-RESULT_DIR=/lustre/fsw/coreai_dlalgo_llm/users/sna/results/vllm-v0251-refit-safe-linear-backends/tests
+RESULT_DIR=${RESULT_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/results/vllm-v0251-refit-safe-linear-backends/tests}
 
 mkdir -p "$RESULT_DIR"
 
