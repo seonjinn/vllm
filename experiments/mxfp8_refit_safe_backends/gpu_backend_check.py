@@ -81,6 +81,7 @@ def main() -> None:
         "flashinfer_cutedsl": kernel_module.FlashInferCutedslMxfp8LinearKernel,
         "flashinfer_trtllm": kernel_module.FlashInferTrtllmMxfp8LinearKernel,
     }
+    config_api = importlib.import_module("vllm.config")
 
     torch.manual_seed(7)
     x = torch.randn((args.m, args.k), device="cuda", dtype=torch.bfloat16) * 0.1
@@ -92,7 +93,8 @@ def main() -> None:
     layer = torch.nn.Module()
     layer.weight = Parameter(weight, requires_grad=False)
     layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-    kernel = kernel_types[args.backend](config_module.Mxfp8LinearLayerConfig())
+    with config_api.set_current_vllm_config(config_api.VllmConfig()):
+        kernel = kernel_types[args.backend](config_module.Mxfp8LinearLayerConfig())
     kernel.process_weights_after_loading(layer)
 
     prepared_names = tuple(
