@@ -4,7 +4,6 @@ import torch.nn as nn
 
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
-from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.reload.layerwise import (
@@ -43,8 +42,6 @@ class DummyModelLoader(BaseModelLoader):
                 # NOTE(woosuk): For accurate performance evaluation, we assign
                 # random values to the weights.
                 initialize_dummy_weights(layer, model_config)
-                if isinstance(layer, RoutedExperts):
-                    layer.quant_method.process_weights_after_loading(layer)
 
     def _process_online_quant_layer(
         self,
