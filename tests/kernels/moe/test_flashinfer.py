@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from time import sleep
+from types import ModuleType
 
 import pytest
 import torch
@@ -26,6 +30,9 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    FlashInferTrtllmLayoutPlanKey,
+    _clear_flashinfer_trtllm_layout_plan_cache_for_testing,
+    _get_flashinfer_trtllm_layout_plan_cache,
     convert_moe_weights_to_flashinfer_trtllm_block_layout,
     rotate_weights_for_fi_trtllm_fp8_per_tensor_moe,
     swap_w13_to_w31,
@@ -40,17 +47,15 @@ try:
     from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 except ImportError:
     if current_platform.is_rocm():
-        pytest.skip(
-            "flashinfer not supported for vLLM on ROCm", allow_module_level=True
-        )
+        has_flashinfer_cutlass_fused_moe = lambda: False
+    else:
+        raise
 
-if not has_flashinfer_cutlass_fused_moe() or not current_platform.has_device_capability(
-    90
-):
-    pytest.skip(
-        "Supported for sm >= 90",
-        allow_module_level=True,
-    )
+_requires_flashinfer_sm90 = pytest.mark.skipif(
+    not has_flashinfer_cutlass_fused_moe()
+    or not current_platform.has_device_capability(90),
+    reason="Supported for sm >= 90",
+)
 
 NUM_EXPERTS = [16]
 TOP_KS = [1]
@@ -265,6 +270,7 @@ class TestData:
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
 @pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
+@_requires_flashinfer_sm90
 def test_flashinfer_per_tensor_moe_fp8_no_graph(
     m: int,
     n: int,
@@ -349,6 +355,7 @@ def test_flashinfer_per_tensor_moe_fp8_no_graph(
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
 @pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
+@_requires_flashinfer_sm90
 def test_flashinfer_cutlass_moe_fp8_no_graph(
     m: int,
     n: int,
@@ -462,6 +469,7 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
         (64, 4096, 4096),
     ],
 )
+@_requires_flashinfer_sm90
 def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
     num_experts, intermediate, hidden
 ):
@@ -472,7 +480,7 @@ def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
         (num_experts, hidden, intermediate), dtype=torch.bfloat16, device="cuda"
     )
 
-    cache: dict[torch.Size, torch.Tensor] = {}
+    cache: dict[FlashInferTrtllmLayoutPlanKey, torch.Tensor] = {}
     w13_converted, w2_converted = convert_moe_weights_to_flashinfer_trtllm_block_layout(
         cache, w13, w2
     )
@@ -492,6 +500,7 @@ def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
     assert w2_converted.shape[0] == num_experts
 
 
+@_requires_flashinfer_sm90
 @pytest.mark.parametrize("is_gated_act_gemm", [True, False])
 def test_convert_moe_weights_to_flashinfer_trtllm_block_layout_batched(
     is_gated_act_gemm: bool, monkeypatch
@@ -525,3 +534,177 @@ def test_convert_moe_weights_to_flashinfer_trtllm_block_layout_batched(
     assert torch.equal(actual_w13, expected_w13)
     assert torch.equal(actual_w2, expected_w2)
     assert index_select_dims == [2, 2]
+
+
+@pytest.fixture
+def trtllm_layout_plan_cache():
+    _clear_flashinfer_trtllm_layout_plan_cache_for_testing()
+    try:
+        yield _get_flashinfer_trtllm_layout_plan_cache()
+    finally:
+        _clear_flashinfer_trtllm_layout_plan_cache_for_testing()
+
+
+def _install_fake_flashinfer_row_map_builders(monkeypatch, delay: float = 0.0):
+    generated_row_maps: list[torch.Tensor] = []
+    flashinfer = ModuleType("flashinfer")
+    flashinfer.__path__ = []
+    fused_moe = ModuleType("flashinfer.fused_moe")
+    fused_moe.__path__ = []
+    core = ModuleType("flashinfer.fused_moe.core")
+
+    def get_w13_row_map(
+        cache: dict[torch.Size, torch.Tensor],
+        source: torch.Tensor,
+        epilogue_tile_m: int,
+        *,
+        is_gated_act_gemm: bool,
+    ) -> torch.Tensor:
+        del cache, epilogue_tile_m, is_gated_act_gemm
+        sleep(delay)
+        row_map = torch.arange(source.shape[0], device=source.device)
+        generated_row_maps.append(row_map)
+        return row_map
+
+    def get_w2_row_map(
+        cache: dict[torch.Size, torch.Tensor],
+        source: torch.Tensor,
+        epilogue_tile_m: int,
+    ) -> torch.Tensor:
+        del cache, epilogue_tile_m
+        sleep(delay)
+        row_map = torch.arange(source.shape[0], device=source.device)
+        generated_row_maps.append(row_map)
+        return row_map
+
+    core._maybe_get_cached_w3_w1_permute_indices = get_w13_row_map  # type: ignore[attr-defined]
+    core.get_w2_permute_indices_with_cache = get_w2_row_map  # type: ignore[attr-defined]
+    fused_moe.core = core  # type: ignore[attr-defined]
+    flashinfer.fused_moe = fused_moe  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.fused_moe", fused_moe)
+    monkeypatch.setitem(sys.modules, "flashinfer.fused_moe.core", core)
+    return generated_row_maps
+
+
+def _make_bf16_trtllm_weights(
+    *,
+    intermediate: int = 128,
+    device: str = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty((2, 2 * intermediate, 64), dtype=torch.bfloat16, device=device),
+        torch.empty((2, 64, intermediate), dtype=torch.bfloat16, device=device),
+    )
+
+
+def test_trtllm_layout_plan_cache_reuses_and_isolates_row_maps(
+    monkeypatch, trtllm_layout_plan_cache
+):
+    """Cache misses for distinct layouts must not reuse incompatible row maps."""
+    generated_row_maps = _install_fake_flashinfer_row_map_builders(monkeypatch)
+    cache = trtllm_layout_plan_cache
+    index_select_indices: list[torch.Tensor] = []
+    original_index_select = torch.index_select
+
+    def record_index_select(*args, **kwargs):
+        index_select_indices.append(args[2])
+        return original_index_select(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "index_select", record_index_select)
+    w13, w2 = _make_bf16_trtllm_weights()
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, w13, w2)
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, w13, w2)
+
+    assert len(generated_row_maps) == 2
+    assert index_select_indices[0] is index_select_indices[2]
+    assert index_select_indices[1] is index_select_indices[3]
+
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        cache, w13, w2, is_gated_act_gemm=False
+    )
+    wide_w13, wide_w2 = _make_bf16_trtllm_weights(intermediate=256)
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, wide_w13, wide_w2)
+    meta_w13, meta_w2 = _make_bf16_trtllm_weights(device="meta")
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, meta_w13, meta_w2)
+
+    assert len(generated_row_maps) == 8
+    assert len(cache) == 8
+
+
+def test_trtllm_layout_plan_cache_reuses_single_row_map_under_concurrency(
+    monkeypatch, trtllm_layout_plan_cache
+):
+    """Concurrent conversions must share one row-map build for each projection."""
+    generated_row_maps = _install_fake_flashinfer_row_map_builders(
+        monkeypatch, delay=0.01
+    )
+    w13, w2 = _make_bf16_trtllm_weights()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                convert_moe_weights_to_flashinfer_trtllm_block_layout,
+                trtllm_layout_plan_cache,
+                w13,
+                w2,
+            )
+            for _ in range(4)
+        ]
+        for future in futures:
+            future.result()
+
+    assert len(generated_row_maps) == 2
+    assert len(trtllm_layout_plan_cache) == 2
+
+
+def test_trtllm_layout_plan_cache_promotes_hits_before_exact_eviction(
+    monkeypatch, trtllm_layout_plan_cache
+):
+    """An LRU hit must survive while the next-oldest two row maps are evicted."""
+    generated_row_maps = _install_fake_flashinfer_row_map_builders(monkeypatch)
+    cache = trtllm_layout_plan_cache
+    layouts = []
+
+    for multiple in range(1, 65):
+        layout = _make_bf16_trtllm_weights(
+            intermediate=128 * multiple,
+            device="meta",
+        )
+        layouts.append(layout)
+        convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, *layout)
+
+    assert len(generated_row_maps) == 128
+    assert len(cache) == 128
+
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, *layouts[0])
+    assert len(generated_row_maps) == 128
+
+    newest_layout = _make_bf16_trtllm_weights(intermediate=128 * 65, device="meta")
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, *newest_layout)
+    assert len(generated_row_maps) == 130
+    assert len(cache) == 128
+
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, *layouts[0])
+    assert len(generated_row_maps) == 130
+
+    convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, *layouts[1])
+    assert len(generated_row_maps) == 132
+    assert len(cache) == 128
+
+
+def test_trtllm_layout_plan_cache_evicts_oldest_row_maps(
+    monkeypatch, trtllm_layout_plan_cache
+):
+    """The shared layout-plan cache must remain bounded across model shapes."""
+    _install_fake_flashinfer_row_map_builders(monkeypatch)
+    cache = trtllm_layout_plan_cache
+
+    for multiple in range(1, 66):
+        w13, w2 = _make_bf16_trtllm_weights(
+            intermediate=128 * multiple,
+            device="meta",
+        )
+        convert_moe_weights_to_flashinfer_trtllm_block_layout(cache, w13, w2)
+
+    assert len(cache) == 128

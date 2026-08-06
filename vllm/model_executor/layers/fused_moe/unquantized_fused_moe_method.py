@@ -31,6 +31,10 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    _FlashInferTrtllmLayoutPlanCache,
+    _get_flashinfer_trtllm_layout_plan_cache,
+)
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
@@ -52,6 +56,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         super().__init__(moe)
         self.unquantized_backend, self.experts_cls = select_unquantized_moe_backend(
             moe_config=self.moe,
+        )
+        self._trtllm_layout_plan_cache: _FlashInferTrtllmLayoutPlanCache | None = (
+            _get_flashinfer_trtllm_layout_plan_cache()
+            if self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM
+            else None
         )
 
     @property
@@ -159,12 +168,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w2: torch.Tensor,
     ) -> None:
         # Shuffle weights to runtime format.
-        w13_new, w2_new = convert_to_unquantized_kernel_format(
-            self.unquantized_backend,
-            moe_config=layer.moe_config,
-            w13_weight=w13,
-            w2_weight=w2,
-        )
+        if self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+            assert self._trtllm_layout_plan_cache is not None
+            w13_new, w2_new = convert_to_unquantized_kernel_format(
+                self.unquantized_backend,
+                moe_config=layer.moe_config,
+                w13_weight=w13,
+                w2_weight=w2,
+                layout_plan_cache=self._trtllm_layout_plan_cache,
+            )
+        else:
+            w13_new, w2_new = convert_to_unquantized_kernel_format(
+                self.unquantized_backend,
+                moe_config=layer.moe_config,
+                w13_weight=w13,
+                w2_weight=w2,
+            )
         # `moe_kernel` is initialized to None in FusedMoEMethodBase.__init__;
         # On the first call we replace the parameter normally. On subsequent
         # calls (e.g. RL weight updates that re-trigger

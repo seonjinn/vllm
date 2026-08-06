@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import MutableMapping
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.base import MoEKernelOracle
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    FlashInferTrtllmLayoutPlanKey,
+    _FlashInferTrtllmLayoutPlanCache,
+    _get_flashinfer_trtllm_layout_plan_cache,
     align_moe_weights_for_fi,
     convert_moe_weights_to_flashinfer_trtllm_block_layout,
     swap_w13_to_w31,
@@ -274,6 +278,11 @@ def convert_to_unquantized_kernel_format(
     moe_config: FusedMoEConfig,
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
+    layout_plan_cache: MutableMapping[
+        FlashInferTrtllmLayoutPlanKey, torch.Tensor
+    ]
+    | _FlashInferTrtllmLayoutPlanCache
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if unquantized_backend == UnquantizedMoeBackend.AITER:
         w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
@@ -295,9 +304,10 @@ def convert_to_unquantized_kernel_format(
             )
             moe_config.intermediate_size_per_partition = padded_intermediate
 
-        _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+        if layout_plan_cache is None:
+            layout_plan_cache = _get_flashinfer_trtllm_layout_plan_cache()
         w13_weight, w2_weight = convert_moe_weights_to_flashinfer_trtllm_block_layout(
-            _cache_permute_indices,
+            layout_plan_cache,
             w13_weight,
             w2_weight,
             is_gated_act_gemm=is_act_and_mul,

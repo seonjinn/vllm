@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from collections import OrderedDict
+from collections.abc import Callable, MutableMapping
+from dataclasses import dataclass
+from threading import Lock
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -12,6 +16,137 @@ if TYPE_CHECKING:
     from flashinfer.fused_moe.core import ActivationType
 
 logger = init_logger(__name__)
+
+_FLASHINFER_TRTLLM_LAYOUT_PLAN_CACHE_MAX_SIZE = 128
+
+
+@dataclass(frozen=True)
+class FlashInferTrtllmLayoutPlanKey:
+    projection_kind: Literal["w13", "w2"]
+    device_type: str
+    device_index: int | None
+    source_shape: tuple[int, ...]
+    epilogue_tile_m: int
+    block_k: int
+    is_gated_act_gemm: bool
+
+
+class _FlashInferTrtllmLayoutPlanCache:
+    """Thread-safe bounded cache for immutable TRTLLM row maps."""
+
+    def __init__(self, max_size: int):
+        self._max_size = max_size
+        self._row_maps: OrderedDict[FlashInferTrtllmLayoutPlanKey, torch.Tensor] = (
+            OrderedDict()
+        )
+        self._lock = Lock()
+
+    def get_or_create(
+        self,
+        key: FlashInferTrtllmLayoutPlanKey,
+        create_row_map: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        with self._lock:
+            row_map = self._row_maps.get(key)
+            if row_map is not None:
+                self._row_maps.move_to_end(key)
+                return row_map
+
+            row_map = create_row_map()
+            self._row_maps[key] = row_map
+            if len(self._row_maps) > self._max_size:
+                self._row_maps.popitem(last=False)
+            return row_map
+
+    def clear(self) -> None:
+        with self._lock:
+            self._row_maps.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._row_maps)
+
+
+_flashinfer_trtllm_layout_plan_cache = _FlashInferTrtllmLayoutPlanCache(
+    _FLASHINFER_TRTLLM_LAYOUT_PLAN_CACHE_MAX_SIZE
+)
+
+
+def _get_flashinfer_trtllm_layout_plan_cache() -> _FlashInferTrtllmLayoutPlanCache:
+    """Return the process-local row-map cache used by BF16 TRTLLM MoE."""
+    return _flashinfer_trtllm_layout_plan_cache
+
+
+def _clear_flashinfer_trtllm_layout_plan_cache_for_testing() -> None:
+    """Clear the process-local BF16 TRTLLM row-map cache in tests."""
+    _flashinfer_trtllm_layout_plan_cache.clear()
+
+
+def _get_flashinfer_trtllm_layout_plan_key(
+    projection_kind: Literal["w13", "w2"],
+    source: torch.Tensor,
+    epilogue_tile_m: int,
+    block_k: int,
+    is_gated_act_gemm: bool,
+) -> FlashInferTrtllmLayoutPlanKey:
+    return FlashInferTrtllmLayoutPlanKey(
+        projection_kind=projection_kind,
+        device_type=source.device.type,
+        device_index=source.device.index,
+        source_shape=tuple(source.shape),
+        epilogue_tile_m=epilogue_tile_m,
+        block_k=block_k,
+        is_gated_act_gemm=is_gated_act_gemm,
+    )
+
+
+def _get_or_create_flashinfer_trtllm_row_map(
+    layout_plan_cache: MutableMapping[FlashInferTrtllmLayoutPlanKey, torch.Tensor]
+    | _FlashInferTrtllmLayoutPlanCache,
+    projection_kind: Literal["w13", "w2"],
+    source: torch.Tensor,
+    epilogue_tile_m: int,
+    block_k: int,
+    is_gated_act_gemm: bool,
+) -> torch.Tensor:
+    key = _get_flashinfer_trtllm_layout_plan_key(
+        projection_kind,
+        source,
+        epilogue_tile_m,
+        block_k,
+        is_gated_act_gemm,
+    )
+    def create_row_map() -> torch.Tensor:
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
+        flashinfer_cache: dict[torch.Size, torch.Tensor] = {}
+        if projection_kind == "w13":
+            row_map = _maybe_get_cached_w3_w1_permute_indices(
+                flashinfer_cache,
+                source[0],
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated_act_gemm,
+            )
+            if is_gated_act_gemm:
+                row_map = (row_map + source.shape[1] // 2) % source.shape[1]
+            return row_map
+        return get_w2_permute_indices_with_cache(
+            flashinfer_cache,
+            source[0],
+            epilogue_tile_m,
+        )
+
+    if isinstance(layout_plan_cache, _FlashInferTrtllmLayoutPlanCache):
+        return layout_plan_cache.get_or_create(key, create_row_map)
+
+    row_map = layout_plan_cache.get(key)
+    if row_map is None:
+        row_map = create_row_map()
+        layout_plan_cache[key] = row_map
+    return row_map
 
 
 def activation_to_flashinfer_int(activation: MoEActivation) -> int:
@@ -91,7 +226,10 @@ def rotate_weights_for_fi_trtllm_fp8_per_tensor_moe(
 
 
 def convert_moe_weights_to_flashinfer_trtllm_block_layout(
-    cache_permute_indices: dict[torch.Size, torch.Tensor],
+    cache_permute_indices: MutableMapping[
+        FlashInferTrtllmLayoutPlanKey, torch.Tensor
+    ]
+    | _FlashInferTrtllmLayoutPlanCache,
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
     is_gated_act_gemm: bool = True,
@@ -105,11 +243,6 @@ def convert_moe_weights_to_flashinfer_trtllm_block_layout(
         raise ValueError(
             "Unquantized Moe Backend FlashInfer TRTLLM requires bfloat16 weights"
         )
-
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
 
     epilogue_tile_m = 128
     block_k = 128
@@ -150,24 +283,27 @@ def convert_moe_weights_to_flashinfer_trtllm_block_layout(
         device=w2_weight.device,
     )
 
-    w13_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+    w13_permute_indices = _get_or_create_flashinfer_trtllm_row_map(
         cache_permute_indices,
-        w13_uint8[0],
+        "w13",
+        w13_uint8,
         epilogue_tile_m,
-        is_gated_act_gemm=is_gated_act_gemm,
+        block_k,
+        is_gated_act_gemm,
     )
-    if is_gated_act_gemm:
-        w13_permute_indices = (w13_permute_indices + w13_rows // 2) % w13_rows
     _copy_permuted_weights_to_block_layout(
         w13_weights_shuffled_tensor,
         w13_uint8,
         w13_permute_indices,
     )
 
-    w2_permute_indices = get_w2_permute_indices_with_cache(
+    w2_permute_indices = _get_or_create_flashinfer_trtllm_row_map(
         cache_permute_indices,
-        w2_uint8[0],
+        "w2",
+        w2_uint8,
         epilogue_tile_m,
+        block_k,
+        is_gated_act_gemm,
     )
     _copy_permuted_weights_to_block_layout(
         w2_weights_shuffled_tensor,

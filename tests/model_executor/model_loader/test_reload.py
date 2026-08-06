@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import importlib
 import inspect
 from weakref import WeakKeyDictionary, ref
 
@@ -9,6 +10,18 @@ import torch
 from torch.nn.parameter import UninitializedParameter
 
 import vllm.model_executor.model_loader.reload.meta as reload_meta
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+    UnquantizedMoeBackend,
+)
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
@@ -30,6 +43,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
 )
 from vllm.platforms import current_platform
+
+unquantized_method = importlib.import_module(
+    "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+)
 
 
 def _fp8_reload_unsupported() -> bool:
@@ -78,6 +95,107 @@ class _AliasedBufferWithUninitializedChildLayer(_AliasedBufferLayer):
         self.child.register_parameter(
             "lazy_weight", UninitializedParameter(requires_grad=False)
         )
+
+
+class _TrtLlmRefitLayer(torch.nn.Module):
+    def __init__(self, moe_config: FusedMoEConfig, quant_method):
+        super().__init__()
+        self.moe_config = moe_config
+        self.quant_method = quant_method
+        self.w13_weight = torch.nn.Parameter(
+            torch.zeros((2, 4, 4), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.w2_weight = torch.nn.Parameter(
+            torch.zeros((2, 4, 2), dtype=torch.bfloat16), requires_grad=False
+        )
+
+    def _expert_routing_tables(self):
+        return None
+
+
+def _make_trtllm_refit_method(monkeypatch) -> UnquantizedFusedMoEMethod:
+    moe_config = FusedMoEConfig(
+        num_experts=2,
+        experts_per_token=1,
+        hidden_dim=4,
+        intermediate_size=2,
+        num_local_experts=2,
+        num_logical_experts=2,
+        activation=MoEActivation.SILU,
+        device="cpu",
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        in_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(
+        unquantized_method,
+        "select_unquantized_moe_backend",
+        lambda moe_config: (UnquantizedMoeBackend.FLASHINFER_TRTLLM, object),
+    )
+    return UnquantizedFusedMoEMethod(moe_config)
+
+
+def test_layerwise_trtllm_refit_preserves_kernel_and_parameter_identity(monkeypatch):
+    """A TRTLLM refit must update data without invalidating captured references."""
+    method = _make_trtllm_refit_method(monkeypatch)
+    layer = _TrtLlmRefitLayer(method.moe, method)
+    model = torch.nn.Sequential(layer)
+    created_kernels: list[object] = []
+
+    def convert_weights(
+        backend, moe_config, w13_weight, w2_weight, layout_plan_cache=None
+    ):
+        del backend, moe_config, layout_plan_cache
+        return w13_weight.add(1), w2_weight.add(2)
+
+    monkeypatch.setattr(
+        unquantized_method,
+        "convert_to_unquantized_kernel_format",
+        convert_weights,
+    )
+    def make_kernel(**kwargs):
+        del kwargs
+        kernel = object()
+        created_kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(unquantized_method, "make_unquantized_moe_kernel", make_kernel)
+
+    method.process_weights_after_loading(layer)
+    first_kernel = method.moe_kernel
+    w13_parameter = layer.w13_weight
+    w2_parameter = layer.w2_weight
+    w13_storage = w13_parameter.untyped_storage().data_ptr()
+    w2_storage = w2_parameter.untyped_storage().data_ptr()
+
+    record_metadata_for_reloading(model)
+
+    for value in (3.0, 7.0):
+        initialize_layerwise_reload(model)
+        params = dict(layer.named_parameters())
+        params["w13_weight"].weight_loader(
+            params["w13_weight"], torch.full((2, 4, 4), value)
+        )
+        params["w2_weight"].weight_loader(
+            params["w2_weight"], torch.full((2, 4, 2), value)
+        )
+        finalize_layerwise_reload(model, model_config=None)
+
+        assert torch.equal(
+            layer.w13_weight,
+            torch.full((2, 4, 4), value + 1, dtype=torch.bfloat16),
+        )
+        assert torch.equal(
+            layer.w2_weight,
+            torch.full((2, 4, 2), value + 2, dtype=torch.bfloat16),
+        )
+        assert layer.w13_weight is w13_parameter
+        assert layer.w2_weight is w2_parameter
+        assert layer.w13_weight.untyped_storage().data_ptr() == w13_storage
+        assert layer.w2_weight.untyped_storage().data_ptr() == w2_storage
+        assert method.moe_kernel is first_kernel
+
+    assert len(created_kernels) == 1
 
 
 def test_move_metatensors():
