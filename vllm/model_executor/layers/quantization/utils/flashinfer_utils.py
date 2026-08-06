@@ -114,27 +114,31 @@ def convert_moe_weights_to_flashinfer_trtllm_block_layout(
     epilogue_tile_m = 128
     block_k = 128
 
-    # Reorder rows of W13 and W2 for fused gated activation and convert to the
-    # block layout expected by the FlashInfer kernel.
     num_experts = w13_weight.shape[0]
 
-    def _copy_permuted_expert_to_block_layout(
+    def _copy_permuted_weights_to_block_layout(
         out: torch.Tensor,
-        expert_uint8: torch.Tensor,
+        source_uint8: torch.Tensor,
         source_indices: torch.Tensor,
     ) -> None:
-        expert_blocks = expert_uint8.view(
-            expert_uint8.shape[0], out.shape[0], block_k
-        ).permute(1, 0, 2)
+        rows, columns_bytes = source_uint8.shape[1:]
+        source_blocks = source_uint8.view(
+            num_experts,
+            rows,
+            columns_bytes // block_k,
+            block_k,
+        ).permute(0, 2, 1, 3)
         torch.index_select(
-            expert_blocks,
-            1,
-            source_indices.to(expert_uint8.device),
+            source_blocks,
+            2,
+            source_indices.to(source_uint8.device),
             out=out,
         )
 
-    w13_rows, w13_cols = w13_weight[0].view(torch.uint8).shape
-    w2_rows, w2_cols = w2_weight[0].view(torch.uint8).shape
+    w13_uint8 = w13_weight.view(torch.uint8)
+    w2_uint8 = w2_weight.view(torch.uint8)
+    w13_rows, w13_cols = w13_uint8.shape[1:]
+    w2_rows, w2_cols = w2_uint8.shape[1:]
     w13_weights_shuffled_tensor = torch.empty(
         (num_experts, w13_cols // block_k, w13_rows, block_k),
         dtype=torch.uint8,
@@ -146,34 +150,30 @@ def convert_moe_weights_to_flashinfer_trtllm_block_layout(
         device=w2_weight.device,
     )
 
-    for i in range(num_experts):
-        w13_expert_uint8 = w13_weight[i].view(torch.uint8)
+    w13_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+        cache_permute_indices,
+        w13_uint8[0],
+        epilogue_tile_m,
+        is_gated_act_gemm=is_gated_act_gemm,
+    )
+    if is_gated_act_gemm:
+        w13_permute_indices = (w13_permute_indices + w13_rows // 2) % w13_rows
+    _copy_permuted_weights_to_block_layout(
+        w13_weights_shuffled_tensor,
+        w13_uint8,
+        w13_permute_indices,
+    )
 
-        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-            cache_permute_indices,
-            w13_expert_uint8,
-            epilogue_tile_m,
-            is_gated_act_gemm=is_gated_act_gemm,
-        )
-        if is_gated_act_gemm:
-            rows = w13_expert_uint8.shape[0]
-            permute_indices = (permute_indices + rows // 2) % rows
-        _copy_permuted_expert_to_block_layout(
-            w13_weights_shuffled_tensor[i],
-            w13_expert_uint8,
-            permute_indices,
-        )
-
-        permute_indices = get_w2_permute_indices_with_cache(
-            cache_permute_indices,
-            w2_weight[i].view(torch.uint8),
-            epilogue_tile_m,
-        )
-        _copy_permuted_expert_to_block_layout(
-            w2_weights_shuffled_tensor[i],
-            w2_weight[i].view(torch.uint8),
-            permute_indices,
-        )
+    w2_permute_indices = get_w2_permute_indices_with_cache(
+        cache_permute_indices,
+        w2_uint8[0],
+        epilogue_tile_m,
+    )
+    _copy_permuted_weights_to_block_layout(
+        w2_weights_shuffled_tensor,
+        w2_uint8,
+        w2_permute_indices,
+    )
 
     return (
         w13_weights_shuffled_tensor.view(torch.bfloat16),

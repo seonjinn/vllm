@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    convert_moe_weights_to_flashinfer_trtllm_block_layout,
     rotate_weights_for_fi_trtllm_fp8_per_tensor_moe,
     swap_w13_to_w31,
 )
@@ -64,6 +65,77 @@ MNK_FACTORS = [
 ]
 
 vllm_config = VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+
+
+def _convert_moe_weights_to_trtllm_block_layout_reference(
+    cache_permute_indices: dict[torch.Size, torch.Tensor],
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    is_gated_act_gemm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mirror the v0.25.1 expert-by-expert BF16 conversion."""
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    epilogue_tile_m = 128
+    block_k = 128
+    num_experts = w13_weight.shape[0]
+
+    def copy_permuted_expert_to_block_layout(
+        out: torch.Tensor,
+        expert_uint8: torch.Tensor,
+        source_indices: torch.Tensor,
+    ) -> None:
+        expert_blocks = expert_uint8.view(
+            expert_uint8.shape[0], out.shape[0], block_k
+        ).permute(1, 0, 2)
+        torch.index_select(
+            expert_blocks,
+            1,
+            source_indices.to(expert_uint8.device),
+            out=out,
+        )
+
+    w13_rows, w13_cols = w13_weight[0].view(torch.uint8).shape
+    w2_rows, w2_cols = w2_weight[0].view(torch.uint8).shape
+    w13_out = torch.empty(
+        (num_experts, w13_cols // block_k, w13_rows, block_k),
+        dtype=torch.uint8,
+        device=w13_weight.device,
+    )
+    w2_out = torch.empty(
+        (num_experts, w2_cols // block_k, w2_rows, block_k),
+        dtype=torch.uint8,
+        device=w2_weight.device,
+    )
+
+    for expert_idx in range(num_experts):
+        w13_expert = w13_weight[expert_idx].view(torch.uint8)
+        w13_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            w13_expert,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated_act_gemm,
+        )
+        if is_gated_act_gemm:
+            w13_indices = (w13_indices + w13_rows // 2) % w13_rows
+        copy_permuted_expert_to_block_layout(
+            w13_out[expert_idx], w13_expert, w13_indices
+        )
+
+        w2_expert = w2_weight[expert_idx].view(torch.uint8)
+        w2_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            w2_expert,
+            epilogue_tile_m,
+        )
+        copy_permuted_expert_to_block_layout(
+            w2_out[expert_idx], w2_expert, w2_indices
+        )
+
+    return w13_out.view(torch.bfloat16), w2_out.view(torch.bfloat16)
 
 
 def quant_fp8_per_tensor_batches(a):
@@ -393,10 +465,6 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
 def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
     num_experts, intermediate, hidden
 ):
-    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-        convert_moe_weights_to_flashinfer_trtllm_block_layout,
-    )
-
     w13 = torch.randn(
         (num_experts, 2 * intermediate, hidden), dtype=torch.bfloat16, device="cuda"
     )
@@ -422,3 +490,38 @@ def test_convert_moe_weights_to_flashinfer_trtllm_block_layout(
 
     assert w13_converted.shape[0] == num_experts
     assert w2_converted.shape[0] == num_experts
+
+
+@pytest.mark.parametrize("is_gated_act_gemm", [True, False])
+def test_convert_moe_weights_to_flashinfer_trtllm_block_layout_batched(
+    is_gated_act_gemm: bool, monkeypatch
+):
+    num_experts = 4
+    intermediate = 128
+    hidden = 128
+    w13 = torch.randn(
+        (num_experts, 2 * intermediate, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    w2 = torch.randn(
+        (num_experts, hidden, intermediate), dtype=torch.bfloat16, device="cuda"
+    )
+
+    expected_w13, expected_w2 = _convert_moe_weights_to_trtllm_block_layout_reference(
+        {}, w13, w2, is_gated_act_gemm
+    )
+
+    original_index_select = torch.index_select
+    index_select_dims = []
+
+    def record_index_select(*args, **kwargs):
+        index_select_dims.append(args[1])
+        return original_index_select(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "index_select", record_index_select)
+    actual_w13, actual_w2 = convert_moe_weights_to_flashinfer_trtllm_block_layout(
+        {}, w13, w2, is_gated_act_gemm
+    )
+
+    assert torch.equal(actual_w13, expected_w13)
+    assert torch.equal(actual_w2, expected_w2)
+    assert index_select_dims == [2, 2]
