@@ -79,6 +79,21 @@ def test_record_accepts_unsigned_integer_tensor(tmp_path, monkeypatch) -> None:
     assert row["expert_counts"][:2] == [1, 1]
 
 
+def test_record_does_not_call_item_for_bounds_check(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+
+    def fail_item(*args, **kwargs):
+        raise AssertionError("record_routing_signature must not call Tensor.item()")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+    record_routing_signature(
+        torch.tensor([[0, 1]], dtype=torch.int16),
+        BASE,
+        sampled_gpu_time_us=1.0,
+    )
+
+
 @pytest.mark.parametrize(
     "topk_ids",
     [
@@ -105,7 +120,7 @@ def test_record_rejects_invalid_gpu_time(
         record_routing_signature(topk_ids, BASE, sampled_gpu_time_us)
 
 
-@pytest.mark.parametrize("expert_id", [-1, 128])
+@pytest.mark.parametrize("expert_id", [-2, -1, 128, 129])
 def test_record_rejects_out_of_range_expert_id(
     expert_id, tmp_path, monkeypatch
 ) -> None:

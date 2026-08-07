@@ -65,20 +65,18 @@ def record_routing_signature(
     if metadata.global_num_experts <= 0:
         raise ValueError("global_num_experts must be positive")
     flattened_ids = topk_ids.flatten().to(torch.int64)
-    if torch.any(flattened_ids < 0).item() or torch.any(
-        flattened_ids >= metadata.global_num_experts
-    ).item():
-        raise ValueError("topk_ids contain an expert ID outside the valid range")
-
-    expert_counts = torch.bincount(
-        flattened_ids,
-        minlength=metadata.global_num_experts,
+    histogram = torch.bincount(
+        flattened_ids.clamp(-1, metadata.global_num_experts) + 1,
+        minlength=metadata.global_num_experts + 2,
     )
+    histogram_on_cpu = histogram.cpu().tolist()
+    if histogram_on_cpu[0] or histogram_on_cpu[-1]:
+        raise ValueError("topk_ids contain an expert ID outside the valid range")
     row = {
         **asdict(metadata),
         "num_tokens": topk_ids.shape[0],
         "sampled_gpu_time_us": sampled_gpu_time_us,
-        "expert_counts": expert_counts.cpu().tolist(),
+        "expert_counts": histogram_on_cpu[1:-1],
     }
     trace_dir = Path(os.environ[_TRACE_DIR_ENV_VAR])
     trace_dir.mkdir(parents=True, exist_ok=True)
