@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
+import math
+import os
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+
+_TRACE_DIR_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_DIR"
+
+
+@dataclass(frozen=True)
+class MoeTraceMetadata:
+    schema_version: int
+    model_revision: str
+    layer_family: str
+    global_num_experts: int
+    local_num_experts: int
+    top_k: int
+    hidden_size: int
+    intermediate_size: int
+    tp_size: int
+    ep_size: int
+    dp_size: int
+    cuda_graph_state: str
+    weight_layout: str
+    quantization: str
+    runtime_fingerprint: str
+
+
+def trace_enabled() -> bool:
+    return bool(os.getenv(_TRACE_DIR_ENV_VAR))
+
+
+def allocate_routing_replay(
+    num_tokens: int, top_k: int, device: torch.device
+) -> torch.Tensor | None:
+    if not trace_enabled():
+        return None
+    return torch.full(
+        (num_tokens, top_k), -1, dtype=torch.int16, device=device
+    )
+
+
+def record_routing_signature(
+    topk_ids: torch.Tensor,
+    metadata: MoeTraceMetadata,
+    sampled_gpu_time_us: float,
+) -> None:
+    if not trace_enabled():
+        return
+    if topk_ids.ndim != 2 or not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be a contiguous rank-2 tensor")
+    if (
+        topk_ids.dtype is torch.bool
+        or topk_ids.is_floating_point()
+        or topk_ids.is_complex()
+    ):
+        raise ValueError("topk_ids must have an integer dtype")
+    if not math.isfinite(sampled_gpu_time_us) or sampled_gpu_time_us <= 0:
+        raise ValueError("sampled_gpu_time_us must be finite and positive")
+    if metadata.global_num_experts <= 0:
+        raise ValueError("global_num_experts must be positive")
+    flattened_ids = topk_ids.flatten().to(torch.int64)
+    if torch.any(flattened_ids < 0).item() or torch.any(
+        flattened_ids >= metadata.global_num_experts
+    ).item():
+        raise ValueError("topk_ids contain an expert ID outside the valid range")
+
+    expert_counts = torch.bincount(
+        flattened_ids,
+        minlength=metadata.global_num_experts,
+    )
+    row = {
+        **asdict(metadata),
+        "num_tokens": topk_ids.shape[0],
+        "sampled_gpu_time_us": sampled_gpu_time_us,
+        "expert_counts": expert_counts.cpu().tolist(),
+    }
+    trace_dir = Path(os.environ[_TRACE_DIR_ENV_VAR])
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    trace_path = trace_dir / f"moe-routing-rank{rank}-pid{os.getpid()}.jsonl"
+    with trace_path.open("a", encoding="ascii") as trace_file:
+        trace_file.write(json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n")
