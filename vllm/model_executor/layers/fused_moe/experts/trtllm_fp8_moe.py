@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -11,6 +13,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.experts.trtllm_moe_trace import (
+    MoeTraceMetadata,
+    allocate_routing_replay,
+    record_routing_signature,
+    trace_enabled,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -55,6 +63,15 @@ class TrtLlmFp8ExpertsBase:
 
         self.moe_config = moe_config
         self.quant_config = quant_config
+        self._trace_model_revision = os.getenv(
+            "VLLM_MXFP8_MOE_MODEL_REVISION", "unknown"
+        )
+        self._trace_runtime_fingerprint = os.getenv(
+            "VLLM_MXFP8_MOE_RUNTIME_FINGERPRINT", "unknown"
+        )
+        self._trace_dp_size = os.getenv(
+            "VLLM_MXFP8_MOE_DP_SIZE", str(moe_config.moe_parallel_config.dp_size)
+        )
 
         # Per-expert SwiGLU parameters from quant_config (MXFP8 + Swiglu only).
         device = torch.accelerator.current_device_index()
@@ -84,6 +101,26 @@ class TrtLlmFp8ExpertsBase:
             )
         else:
             self.gemm1_clamp_limit = None
+
+    def _trace_metadata(self, global_num_experts: int) -> MoeTraceMetadata:
+        parallel_config = self.moe_config.moe_parallel_config
+        return MoeTraceMetadata(
+            schema_version=1,
+            model_revision=self._trace_model_revision,
+            layer_family="routed_experts",
+            global_num_experts=global_num_experts,
+            local_num_experts=self.local_num_experts,
+            top_k=self.topk,
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.intermediate_size_per_partition,
+            tp_size=parallel_config.tp_size,
+            ep_size=parallel_config.ep_size,
+            dp_size=int(self._trace_dp_size),
+            cuda_graph_state="trace-eager",
+            weight_layout="MajorK",
+            quantization="MXFP8",
+            runtime_fingerprint=self._trace_runtime_fingerprint,
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -226,6 +263,12 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
+        trace_active = is_mxfp8 and trace_enabled()
+        if trace_active:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+
         flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
             topk_ids=packed_topk_ids,
             routing_bias=None,
@@ -252,6 +295,14 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             fp8_quantization_type=fp8_quant_type,
             output=output,
         )
+        if trace_active:
+            end_event.record()
+            end_event.synchronize()
+            record_routing_signature(
+                topk_ids,
+                self._trace_metadata(global_num_experts),
+                start_event.elapsed_time(end_event) * 1000.0,
+            )
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
@@ -424,7 +475,27 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
-        return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        trace_active = is_mxfp8 and trace_enabled()
+        if trace_active:
+            routing_replay_out = allocate_routing_replay(
+                hidden_states.shape[0], self.topk, hidden_states.device
+            )
+            assert routing_replay_out is not None
+            kwargs["routing_replay_out"] = routing_replay_out
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+
+        out = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        if trace_active:
+            end_event.record()
+            end_event.synchronize()
+            record_routing_signature(
+                routing_replay_out,
+                self._trace_metadata(global_num_experts),
+                start_event.elapsed_time(end_event) * 1000.0,
+            )
+        return out
 
     def _apply_per_tensor(
         self,

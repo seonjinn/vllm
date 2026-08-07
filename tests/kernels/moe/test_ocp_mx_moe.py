@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib.metadata
+import json
 import types
 from dataclasses import dataclass
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 import torch
@@ -12,6 +14,11 @@ from packaging import version
 
 from tests.kernels.moe.utils import check_accuracy
 from vllm._aiter_ops import is_aiter_found, rocm_aiter_ops
+from vllm.model_executor.layers.fused_moe.experts.trtllm_moe_trace import (
+    MoeTraceMetadata,
+    allocate_routing_replay,
+    record_routing_signature,
+)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -1036,14 +1043,16 @@ def test_flashinfer_cutlass_mxfp4_mxfp8_fused_moe(
     not TRTLLM_GEN_MXFP8_AVAILABLE,
     reason="nvidia gpu and compute capability sm100 is required for this test",
 )
-def test_trtllm_gen_mxfp8_block_scale_moe(
+def test_trtllm_gen_mxfp8_block_scale_moe_trace(
     topk: int,
     num_experts: int,
     num_tokens: int,
     intermediate_size: int,
     hidden_size: int,
     is_gated: bool,
-):
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(42)
     device = "cuda:0"
 
@@ -1167,7 +1176,7 @@ def test_trtllm_gen_mxfp8_block_scale_moe(
             .view(w2_scale.dtype)
         )
 
-    out = trtllm_fp8_block_scale_moe(
+    kwargs = dict(
         routing_logits=router_logits_kernel,
         routing_bias=None,
         hidden_states=hidden_states_q,
@@ -1189,9 +1198,46 @@ def test_trtllm_gen_mxfp8_block_scale_moe(
         weight_layout=0,  # MajorK
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
     )
+    baseline_output = trtllm_fp8_block_scale_moe(**kwargs)
+
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+    routing_replay_out = allocate_routing_replay(num_tokens, topk, torch.device(device))
+    assert routing_replay_out is not None
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    kwargs["routing_replay_out"] = routing_replay_out
+    start_event.record()
+    traced_output = trtllm_fp8_block_scale_moe(**kwargs)
+    end_event.record()
+    end_event.synchronize()
+    record_routing_signature(
+        routing_replay_out,
+        MoeTraceMetadata(
+            schema_version=1,
+            model_revision="kernel-test",
+            layer_family="routed_experts",
+            global_num_experts=num_experts,
+            local_num_experts=num_experts,
+            top_k=topk,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            tp_size=1,
+            ep_size=1,
+            dp_size=1,
+            cuda_graph_state="trace-eager",
+            weight_layout="MajorK",
+            quantization="MXFP8",
+            runtime_fingerprint="kernel-test",
+        ),
+        start_event.elapsed_time(end_event) * 1000.0,
+    )
+    trace_row = json.loads(next(tmp_path.glob("*.jsonl")).read_text().strip())
 
     # Block-scale MXFP8 kernels are approximate; require majority close.
-    check_accuracy(ref, out, atol=0.1, rtol=0.85, percent=0.8)
+    check_accuracy(ref, baseline_output, atol=0.1, rtol=0.85, percent=0.8)
+    torch.testing.assert_close(traced_output, baseline_output, rtol=0, atol=0)
+    assert traced_output.isfinite().all()
+    assert sum(trace_row["expert_counts"]) == num_tokens * topk
 
 
 # -----------------------------------------------------------------------------
