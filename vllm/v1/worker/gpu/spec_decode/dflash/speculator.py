@@ -137,7 +137,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
-            causal=self.dflash_causal,
+            causal=self._group_causal,
         )
 
     def capture(self, attn_states: dict | None = None) -> None:
@@ -484,7 +484,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             num_tokens_padded=num_tokens_padded,
-            causal=self.dflash_causal,
+            causal=self._group_causal,
         )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],

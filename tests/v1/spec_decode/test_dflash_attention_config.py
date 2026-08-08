@@ -2,10 +2,62 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.worker.gpu import cudagraph_utils
 from vllm.v1.worker.gpu.spec_decode import speculator as speculator_base
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+
+@pytest.mark.parametrize(
+    ("speculator_cls", "group_causal"),
+    [
+        (dflash_speculator.DFlashSpeculator, False),
+        (DSparkSpeculator, {0: True, 1: False}),
+    ],
+)
+def test_init_cudagraph_manager_uses_group_causal(
+    monkeypatch, speculator_cls, group_causal
+):
+    speculator = object.__new__(speculator_cls)
+    speculator.attn_cg_support = SimpleNamespace(
+        min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+        min_cg_attn_backend="test",
+    )
+    speculator.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+        ),
+        speculative_config=None,
+    )
+    speculator.device = torch.device("cpu")
+    speculator.num_query_per_req = 3
+    speculator._group_causal = group_causal
+
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "is_breakable_cudagraph_enabled",
+        lambda: False,
+    )
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.NONE)
+
+    manager = speculator.query_cudagraph_manager
+    assert isinstance(manager, DFlashCudaGraphManager)
+    assert manager.causal == group_causal
 
 
 def test_attn_vllm_config_only_replaces_attention_config(monkeypatch):
