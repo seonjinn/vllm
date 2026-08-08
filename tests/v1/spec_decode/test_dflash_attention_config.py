@@ -8,10 +8,50 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils
+from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.spec_decode import speculator as speculator_base
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+
+def test_build_attn_metadata_resolves_causality_per_kv_group():
+    observed_causality = []
+
+    class MetadataBuilder:
+        def build(self, *, common_prefix_len, common_attn_metadata):
+            assert common_prefix_len == 0
+            observed_causality.append(common_attn_metadata.causal)
+            return object()
+
+    class AttentionGroup:
+        def __init__(self, layer_name):
+            self.layer_names = [layer_name]
+            self.builder = MetadataBuilder()
+
+        def get_metadata_builder(self, index):
+            assert index == 0
+            return self.builder
+
+    build_attn_metadata(
+        attn_groups=[
+            [AttentionGroup("causal_layer")],
+            [AttentionGroup("non_causal_layer")],
+        ],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1]),
+        query_start_loc_cpu=torch.tensor([0, 1]),
+        max_query_len=1,
+        seq_lens=torch.tensor([1]),
+        max_seq_len=1,
+        block_tables=[torch.tensor([[0]]), torch.tensor([[0]])],
+        slot_mappings=torch.tensor([[0], [0]]),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
+        causal={0: True, 1: False},
+    )
+
+    assert observed_causality == [True, False]
 
 
 @pytest.mark.parametrize(
@@ -21,7 +61,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
         (DSparkSpeculator, {0: True, 1: False}),
     ],
 )
-def test_init_cudagraph_manager_uses_group_causal(
+def test_init_cudagraph_manager_does_not_store_group_causal(
     monkeypatch, speculator_cls, group_causal
 ):
     speculator = object.__new__(speculator_cls)
@@ -57,7 +97,37 @@ def test_init_cudagraph_manager_uses_group_causal(
 
     manager = speculator.query_cudagraph_manager
     assert isinstance(manager, DFlashCudaGraphManager)
-    assert manager.causal == group_causal
+    assert not hasattr(manager, "causal")
+
+
+@pytest.mark.parametrize(
+    ("speculator_cls", "group_causal"),
+    [
+        (dflash_speculator.DFlashSpeculator, False),
+        (DSparkSpeculator, {0: True, 1: False}),
+    ],
+)
+def test_capture_uses_group_causal(speculator_cls, group_causal):
+    capture_kwargs = {}
+
+    def capture(*args, **kwargs):
+        capture_kwargs.update(kwargs)
+
+    speculator = object.__new__(speculator_cls)
+    speculator.sample_indices = torch.zeros(1)
+    speculator.sample_pos = torch.zeros(1)
+    speculator.sample_idx_mapping = torch.zeros(1)
+    speculator.query_cudagraph_manager = SimpleNamespace(capture=capture)
+    speculator.input_buffers = object()
+    speculator.block_tables = object()
+    speculator.attn_groups = []
+    speculator.kv_cache_config = object()
+    speculator.max_model_len = 1
+    speculator._group_causal = group_causal
+
+    speculator.capture()
+
+    assert capture_kwargs["causal"] == group_causal
 
 
 def test_attn_vllm_config_only_replaces_attention_config(monkeypatch):

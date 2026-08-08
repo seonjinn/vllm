@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -137,7 +138,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
-            causal=self._group_causal,
         )
 
     def capture(self, attn_states: dict | None = None) -> None:
@@ -155,6 +155,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.attn_groups,
             self.kv_cache_config,
             self.max_model_len,
+            causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
@@ -305,7 +306,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs_padded: int,
         num_tokens_padded: int,
         num_query_per_req: int | None = None,
-        causal: bool = False,
+        causal: bool | Mapping[int, bool] = False,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None

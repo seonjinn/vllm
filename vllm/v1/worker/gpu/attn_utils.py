@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
@@ -573,7 +573,7 @@ def build_attn_metadata(
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
-    causal: bool = True,
+    causal: bool | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
@@ -584,12 +584,17 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
-    for i in range(num_kv_cache_groups):
-        block_table = block_tables[i]
-        slot_mapping = slot_mappings[i]
+    for group_id in range(num_kv_cache_groups):
+        block_table = block_tables[group_id]
+        slot_mapping = slot_mappings[group_id]
+        group_causal = (
+            causal if isinstance(causal, bool) else causal.get(group_id, True)
+        )
 
         common_attn_metadata_extra_kwargs = (
-            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
+            model_specific_attn_metadata.get_extra_common_attn_kwargs(
+                group_id, num_reqs
+            )
             if model_specific_attn_metadata is not None
             else {}
         )
@@ -604,7 +609,7 @@ def build_attn_metadata(
             max_query_len=max_query_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
-            causal=causal,
+            causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
             mm_req_doc_ranges=mm_req_doc_ranges,
@@ -612,7 +617,7 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
+        for attn_group in attn_groups[group_id]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
