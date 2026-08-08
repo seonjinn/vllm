@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from typing import Any
 
 import torch
@@ -105,14 +106,12 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
-        return replace(
-            self.vllm_config,
-            attention_config=replace(
-                self.vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
+        cfg = copy.copy(self.vllm_config)
+        cfg.attention_config = replace(
+            self.vllm_config.attention_config,
+            use_non_causal=self.requires_non_causal,
         )
+        return cfg
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -180,6 +179,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         block_tables: BlockTables,
     ) -> None:
         super().set_attn(model_state, kv_cache_config, block_tables)
+
+        parallel_config = self.vllm_config.parallel_config
+        draft_heads_q = self.draft_model_config.get_num_attention_heads(
+            parallel_config,
+        )
+        draft_heads_kv = self.draft_model_config.get_num_kv_heads(parallel_config)
+        draft_headdim = self.draft_model_config.get_head_size()
+        for groups in self.attn_groups:
+            for group in groups:
+                builder: Any = group.get_metadata_builder(0)
+                if hasattr(builder, "num_heads_q"):
+                    builder.num_heads_q = draft_heads_q
+                    builder.num_heads_kv = draft_heads_kv
+                    builder.headdim = draft_headdim
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
