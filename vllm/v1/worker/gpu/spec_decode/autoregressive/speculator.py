@@ -156,6 +156,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -239,6 +240,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 mm_inputs=mm_inputs,
             )
 
+        # DSD K=0: prefill has been run to keep draft KV cache in sync with
+        # the target, but no speculative decode steps are needed.
+        if num_speculative_tokens is not None and num_speculative_tokens == 0:
+            return self.draft_tokens[:num_reqs, :0]
         if self.num_speculative_steps == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
