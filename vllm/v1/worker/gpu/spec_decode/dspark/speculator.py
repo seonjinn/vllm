@@ -30,6 +30,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.cudagraph_metrics import CUDAGraphDispatchMetrics
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -114,6 +115,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self.cudagraph_dispatch_metrics = CUDAGraphDispatchMetrics()
 
         # Whether to sample from the anchor position. When True, uses anchor-as-first
         # (N slots, each position predicts the next token). When False, uses 1+N
@@ -156,6 +158,30 @@ class DSparkSpeculator(DFlashSpeculator):
         # acceptance heavily on repetition-rich outputs (e.g. TTS speech
         # tokens). Set via set_penalties_state().
         self._penalties_state = None
+
+    def _observe_cudagraph_dispatch(
+        self,
+        mode: CUDAGraphMode,
+        *,
+        num_requests: int,
+        num_tokens: int,
+    ) -> None:
+        self.cudagraph_dispatch_metrics.observe(
+            mode,
+            num_requests=num_requests,
+            num_tokens=num_tokens,
+        )
+
+    def snapshot_cudagraph_dispatch_metrics(self) -> dict[str, object]:
+        return self.cudagraph_dispatch_metrics.snapshot()
+
+    def reset_cudagraph_dispatch_metrics(self) -> None:
+        self.cudagraph_dispatch_metrics.reset()
+
+    def configured_cudagraph_mode(self) -> str | None:
+        if self.query_cudagraph_manager is None:
+            return None
+        return self.query_cudagraph_manager.cudagraph_mode.name
 
     def set_penalties_state(self, penalties_state) -> None:
         if self.draft_logits is None:

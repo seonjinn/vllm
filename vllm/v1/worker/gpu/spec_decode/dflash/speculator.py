@@ -173,6 +173,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         """
         self.num_cached_tokens = num_cached_tokens
 
+    def _observe_cudagraph_dispatch(
+        self,
+        mode: CUDAGraphMode,
+        *,
+        num_requests: int,
+        num_tokens: int,
+    ) -> None:
+        return
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -475,6 +484,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             dp_rank=self.dp_rank,
             need_eager=is_profile,
         )
+
+        if not dummy_run and not is_profile and num_query_tokens > 0:
+            self._observe_cudagraph_dispatch(
+                batch_desc.cg_mode,
+                num_requests=num_reqs,
+                num_tokens=num_query_tokens,
+            )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens

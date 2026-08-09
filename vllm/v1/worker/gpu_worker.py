@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -916,6 +916,19 @@ class Worker(WorkerBase):
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
+
+    def snapshot_cudagraph_dispatch_metrics(self) -> dict[str, object]:
+        """Snapshot target and DSpark-draft CUDA graph dispatch metrics."""
+        model_runner = cast(Any, self.model_runner)
+        return {
+            "rank": self.rank,
+            **model_runner.snapshot_cudagraph_dispatch_metrics(),
+        }
+
+    def reset_cudagraph_dispatch_metrics(self) -> None:
+        """Reset target and DSpark-draft CUDA graph dispatch metrics."""
+        model_runner = cast(Any, self.model_runner)
+        model_runner.reset_cudagraph_dispatch_metrics()
 
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish

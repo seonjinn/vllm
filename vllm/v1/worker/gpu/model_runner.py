@@ -65,6 +65,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
     set_default_max_concurrency,
 )
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.cudagraph_metrics import CUDAGraphDispatchMetrics
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
@@ -123,6 +124,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.compilation_config = vllm_config.compilation_config
+        self.cudagraph_dispatch_metrics = CUDAGraphDispatchMetrics()
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
@@ -269,6 +271,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # on the last PP rank.
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
+
+    def snapshot_cudagraph_dispatch_metrics(self) -> dict[str, object]:
+        target_mode = (
+            self.cudagraph_manager.cudagraph_mode.name
+            if self.cudagraph_manager is not None
+            else None
+        )
+        draft_snapshot = getattr(
+            self.speculator,
+            "snapshot_cudagraph_dispatch_metrics",
+            None,
+        )
+        draft_mode = getattr(
+            self.speculator,
+            "configured_cudagraph_mode",
+            None,
+        )
+        return {
+            "configured_modes": {
+                "target": target_mode,
+                "dspark_draft": draft_mode() if callable(draft_mode) else None,
+            },
+            "target": self.cudagraph_dispatch_metrics.snapshot(),
+            "dspark_draft": (
+                draft_snapshot()
+                if callable(draft_snapshot)
+                else CUDAGraphDispatchMetrics().snapshot()
+            ),
+        }
+
+    def reset_cudagraph_dispatch_metrics(self) -> None:
+        self.cudagraph_dispatch_metrics.reset()
+        draft_reset = getattr(
+            self.speculator,
+            "reset_cudagraph_dispatch_metrics",
+            None,
+        )
+        if callable(draft_reset):
+            draft_reset()
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -1177,6 +1218,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
+
+        if not dummy_run and not is_profile and num_toks > 0:
+            self.cudagraph_dispatch_metrics.observe(
+                batch_desc.cg_mode,
+                num_requests=num_reqs,
+                num_tokens=num_toks,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
