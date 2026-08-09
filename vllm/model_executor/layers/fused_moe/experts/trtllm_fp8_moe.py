@@ -18,7 +18,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_moe_trace import (
     MoeTraceMetadata,
     allocate_routing_replay,
     record_routing_signature,
-    trace_enabled,
+    should_sample_routing_signature,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -263,7 +263,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
-        trace_active = is_mxfp8 and trace_enabled()
+        trace_active = is_mxfp8 and should_sample_routing_signature()
         if trace_active:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
@@ -475,7 +475,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
-        trace_active = is_mxfp8 and trace_enabled()
+        trace_active = is_mxfp8 and should_sample_routing_signature()
         if trace_active:
             routing_replay_out = allocate_routing_replay(
                 hidden_states.shape[0], self.topk, hidden_states.device

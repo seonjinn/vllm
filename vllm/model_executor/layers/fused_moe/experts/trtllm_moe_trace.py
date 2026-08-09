@@ -4,12 +4,18 @@
 import json
 import math
 import os
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 
 _TRACE_DIR_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_DIR"
+_TRACE_INTERVAL_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_INTERVAL"
+_TRACE_MAX_SAMPLES_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_MAX_SAMPLES"
+_TRACE_SAMPLING_LOCK = threading.Lock()
+_TRACE_CALL_COUNT = 0
+_TRACE_SAMPLE_COUNT = 0
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,37 @@ class MoeTraceMetadata:
 
 def trace_enabled() -> bool:
     return bool(os.getenv(_TRACE_DIR_ENV_VAR))
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def should_sample_routing_signature() -> bool:
+    """Return whether this process should trace the current MoE call."""
+    if not trace_enabled():
+        return False
+
+    interval = _positive_env_int(_TRACE_INTERVAL_ENV_VAR, 1)
+    max_samples = _positive_env_int(_TRACE_MAX_SAMPLES_ENV_VAR, 2048)
+    global _TRACE_CALL_COUNT, _TRACE_SAMPLE_COUNT
+    with _TRACE_SAMPLING_LOCK:
+        call_index = _TRACE_CALL_COUNT
+        _TRACE_CALL_COUNT += 1
+        if _TRACE_SAMPLE_COUNT >= max_samples or call_index % interval != 0:
+            return False
+        _TRACE_SAMPLE_COUNT += 1
+        return True
+
+
+def _reset_trace_sampling_for_testing() -> None:
+    global _TRACE_CALL_COUNT, _TRACE_SAMPLE_COUNT
+    with _TRACE_SAMPLING_LOCK:
+        _TRACE_CALL_COUNT = 0
+        _TRACE_SAMPLE_COUNT = 0
 
 
 def _trace_process_rank() -> int:

@@ -21,8 +21,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts import trtllm_fp8_moe
 from vllm.model_executor.layers.fused_moe.experts.trtllm_moe_trace import (
     MoeTraceMetadata,
+    _reset_trace_sampling_for_testing,
     allocate_routing_replay,
     record_routing_signature,
+    should_sample_routing_signature,
     trace_enabled,
 )
 
@@ -43,6 +45,11 @@ BASE = MoeTraceMetadata(
     quantization="MXFP8",
     runtime_fingerprint="runtime-sha256",
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_trace_sampling() -> None:
+    _reset_trace_sampling_for_testing()
 
 
 @dataclass(frozen=True)
@@ -301,6 +308,20 @@ def test_monolithic_trace_enabled_passes_int16_replay_buffer(
     assert result.created_cuda_events == 2
 
 
+def test_monolithic_unsampled_call_avoids_replay_and_events(
+    monolithic_call: Callable[[Path | None], CallObservation],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_INTERVAL", "2")
+
+    assert monolithic_call(trace_dir=tmp_path).created_cuda_events == 2
+    result = monolithic_call(trace_dir=tmp_path)
+
+    assert result.flashinfer_kwargs.get("routing_replay_out") is None
+    assert result.created_cuda_events == 0
+
+
 def test_modular_trace_uses_existing_topk_without_replay_allocation(
     modular_call: Callable[[Path | None], CallObservation], tmp_path: Path
 ) -> None:
@@ -312,11 +333,56 @@ def test_modular_trace_uses_existing_topk_without_replay_allocation(
     assert "routing_replay_out" not in result.flashinfer_kwargs
 
 
+def test_modular_unsampled_call_avoids_events(
+    modular_call: Callable[[Path | None], CallObservation],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_INTERVAL", "2")
+
+    assert modular_call(trace_dir=tmp_path).created_cuda_events == 2
+    result = modular_call(trace_dir=tmp_path)
+
+    assert result.recorded_topk is None
+    assert result.created_cuda_events == 0
+
+
 def test_trace_is_disabled_without_directory(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_MXFP8_MOE_TRACE_DIR", raising=False)
 
     assert not trace_enabled()
     assert allocate_routing_replay(4, 2, torch.device("cpu")) is None
+
+
+def test_trace_sampling_honors_interval_and_limit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_INTERVAL", "3")
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_MAX_SAMPLES", "2")
+
+    sampled = [should_sample_routing_signature() for _ in range(10)]
+
+    assert sampled == [
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_trace_sampling_rejects_nonpositive_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_INTERVAL", "0")
+
+    with pytest.raises(ValueError, match="VLLM_MXFP8_MOE_TRACE_INTERVAL"):
+        should_sample_routing_signature()
 
 
 def test_allocate_routing_replay_uses_int16_sentinel(tmp_path, monkeypatch) -> None:
