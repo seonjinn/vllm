@@ -35,6 +35,15 @@ def trace_enabled() -> bool:
     return bool(os.getenv(_TRACE_DIR_ENV_VAR))
 
 
+def _trace_process_rank() -> int:
+    replica_rank = os.getenv("RANK")
+    if replica_rank is not None:
+        return int(replica_rank)
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
 def allocate_routing_replay(
     num_tokens: int, top_k: int, device: torch.device
 ) -> torch.Tensor | None:
@@ -80,7 +89,7 @@ def record_routing_signature(
     }
     trace_dir = Path(os.environ[_TRACE_DIR_ENV_VAR])
     trace_dir.mkdir(parents=True, exist_ok=True)
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    rank = _trace_process_rank()
     trace_path = trace_dir / f"moe-routing-rank{rank}-pid{os.getpid()}.jsonl"
     with trace_path.open("a", encoding="ascii") as trace_file:
         trace_file.write(json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n")

@@ -348,6 +348,19 @@ def test_record_writes_histogram_without_payload(tmp_path, monkeypatch) -> None:
     assert "hidden_states" not in row
 
 
+def test_record_uses_replica_rank_from_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("RANK", "14")
+
+    record_routing_signature(
+        torch.tensor([[0, 1]], dtype=torch.int16),
+        BASE,
+        sampled_gpu_time_us=1.0,
+    )
+
+    assert next(tmp_path.glob("*.jsonl")).name.startswith("moe-routing-rank14-")
+
+
 def test_record_accepts_unsigned_integer_tensor(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
     topk_ids = torch.tensor([[0, 1]], dtype=torch.uint16)
