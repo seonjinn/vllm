@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 _TRACE_DIR_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_DIR"
+_TRACE_WARMUP_CALLS_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_WARMUP_CALLS"
 _TRACE_INTERVAL_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_INTERVAL"
 _TRACE_MAX_SAMPLES_ENV_VAR = "VLLM_MXFP8_MOE_TRACE_MAX_SAMPLES"
 _TRACE_SAMPLING_LOCK = threading.Lock()
@@ -48,18 +49,37 @@ def _positive_env_int(name: str, default: int) -> int:
     return value
 
 
-def should_sample_routing_signature() -> bool:
-    """Return whether this process should trace the current MoE call."""
-    if not trace_enabled():
+def _nonnegative_env_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return value
+
+
+def _is_capturing() -> bool:
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except RuntimeError:
         return False
 
+
+def should_sample_routing_signature() -> bool:
+    """Return whether this process should trace the current MoE call."""
+    if not trace_enabled() or torch.compiler.is_compiling() or _is_capturing():
+        return False
+
+    warmup_calls = _nonnegative_env_int(_TRACE_WARMUP_CALLS_ENV_VAR, 0)
     interval = _positive_env_int(_TRACE_INTERVAL_ENV_VAR, 1)
     max_samples = _positive_env_int(_TRACE_MAX_SAMPLES_ENV_VAR, 2048)
     global _TRACE_CALL_COUNT, _TRACE_SAMPLE_COUNT
     with _TRACE_SAMPLING_LOCK:
         call_index = _TRACE_CALL_COUNT
         _TRACE_CALL_COUNT += 1
-        if _TRACE_SAMPLE_COUNT >= max_samples or call_index % interval != 0:
+        if (
+            call_index < warmup_calls
+            or _TRACE_SAMPLE_COUNT >= max_samples
+            or (call_index - warmup_calls) % interval != 0
+        ):
             return False
         _TRACE_SAMPLE_COUNT += 1
         return True

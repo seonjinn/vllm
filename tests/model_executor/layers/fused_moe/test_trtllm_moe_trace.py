@@ -375,6 +375,35 @@ def test_trace_sampling_honors_interval_and_limit(tmp_path, monkeypatch) -> None
     ]
 
 
+def test_trace_sampling_skips_configured_warmup_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_WARMUP_CALLS", "3")
+
+    sampled = [should_sample_routing_signature() for _ in range(5)]
+
+    assert sampled == [False, False, False, True, True]
+
+
+def test_trace_sampling_skips_compile_and_capture_without_consuming_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_MXFP8_MOE_TRACE_INTERVAL", "2")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert not should_sample_routing_signature()
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert not should_sample_routing_signature()
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert should_sample_routing_signature()
+    assert not should_sample_routing_signature()
+
+
 def test_trace_sampling_rejects_nonpositive_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
