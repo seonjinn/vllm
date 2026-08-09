@@ -17,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.trtllm_moe_trace import (
     MoeTraceMetadata,
     allocate_routing_replay,
+    capture_mxfp8_moe_prepacked_weights,
     record_routing_signature,
     should_sample_routing_signature,
 )
@@ -120,6 +121,35 @@ class TrtLlmFp8ExpertsBase:
             weight_layout="MajorK",
             quantization="MXFP8",
             runtime_fingerprint=self._trace_runtime_fingerprint,
+        )
+
+    def _capture_mxfp8_prepacked_weights(
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+    ) -> None:
+        if activation not in (
+            MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        ):
+            return
+        w1_scale = self.quant_config.w1_scale
+        w2_scale = self.quant_config.w2_scale
+        assert w1_scale is not None
+        assert w2_scale is not None
+        capture_mxfp8_moe_prepacked_weights(
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            model_revision=self._trace_model_revision,
+            global_num_experts=global_num_experts,
+            local_num_experts=self.local_num_experts,
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=self.ep_rank * self.local_num_experts,
         )
 
     @staticmethod
@@ -265,6 +295,9 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
 
         trace_active = is_mxfp8 and should_sample_routing_signature()
         if trace_active:
+            self._capture_mxfp8_prepacked_weights(
+                w1, w2, activation, global_num_experts
+            )
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
@@ -477,6 +510,9 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             kwargs["activation_type"] = activation_type
         trace_active = is_mxfp8 and should_sample_routing_signature()
         if trace_active:
+            self._capture_mxfp8_prepacked_weights(
+                w1, w2, activation, global_num_experts
+            )
             routing_replay_out = allocate_routing_replay(
                 hidden_states.shape[0], self.topk, hidden_states.device
             )

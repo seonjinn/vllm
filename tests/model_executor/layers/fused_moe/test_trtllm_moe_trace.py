@@ -18,7 +18,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
-from vllm.model_executor.layers.fused_moe.experts import trtllm_fp8_moe
+from vllm.model_executor.layers.fused_moe.experts import (
+    trtllm_fp8_moe,
+    trtllm_moe_trace,
+)
 from vllm.model_executor.layers.fused_moe.experts.trtllm_moe_trace import (
     MoeTraceMetadata,
     _reset_trace_sampling_for_testing,
@@ -96,6 +99,8 @@ def _quant_config() -> FusedMoEQuantConfig:
     return FusedMoEQuantConfig.make(
         quant_dtype="mxfp8",
         block_shape=[1, 32],
+        w1_scale=torch.full((4, 2, 1), 2.0, dtype=torch.float8_e8m0fnu),
+        w2_scale=torch.full((4, 1, 1), 4.0, dtype=torch.float8_e8m0fnu),
     )
 
 
@@ -188,8 +193,8 @@ def monolithic_call(
         hidden_states = torch.zeros((2, 32), dtype=torch.float8_e4m3fn)
         experts.apply(
             hidden_states,
-            torch.zeros((4, 2, 32, 32), dtype=torch.float8_e4m3fn),
-            torch.zeros((4, 32, 1, 32), dtype=torch.float8_e4m3fn),
+            torch.full((4, 2, 32, 32), 3.0, dtype=torch.float8_e4m3fn),
+            torch.full((4, 32, 1, 32), 5.0, dtype=torch.float8_e4m3fn),
             torch.zeros((2, 4), dtype=torch.bfloat16),
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             global_num_experts=4,
@@ -255,14 +260,12 @@ def modular_call(
             "trtllm_moe_pack_topk_ids_weights",
             lambda topk_ids, topk_weights: topk_ids,
         )
-        experts = trtllm_fp8_moe.TrtLlmFp8ExpertsModular(
-            _moe_config(), _quant_config()
-        )
+        experts = trtllm_fp8_moe.TrtLlmFp8ExpertsModular(_moe_config(), _quant_config())
         experts.apply(
             torch.zeros((2, 32), dtype=torch.bfloat16),
             torch.zeros((2, 32), dtype=torch.float8_e4m3fn),
-            torch.zeros((4, 2, 32, 32), dtype=torch.float8_e4m3fn),
-            torch.zeros((4, 32, 1, 32), dtype=torch.float8_e4m3fn),
+            torch.full((4, 2, 32, 32), 3.0, dtype=torch.float8_e4m3fn),
+            torch.full((4, 32, 1, 32), 5.0, dtype=torch.float8_e4m3fn),
             torch.ones((2, 2), dtype=torch.float32),
             input_topk,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
@@ -345,6 +348,145 @@ def test_modular_unsampled_call_avoids_events(
 
     assert result.recorded_topk is None
     assert result.created_cuda_events == 0
+
+
+@pytest.mark.parametrize("call_fixture", ["modular_call", "monolithic_call"])
+def test_mxfp8_trace_captures_actual_prepacked_weights(
+    call_fixture: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepacked_dir = tmp_path / "prepacked"
+    monkeypatch.setenv("VLLM_MXFP8_MOE_PREPACKED_WEIGHT_DIR", str(prepacked_dir))
+    monkeypatch.setenv("VLLM_MXFP8_MOE_MODEL_REVISION", "revision-under-test")
+    call = request.getfixturevalue(call_fixture)
+
+    call(tmp_path / "trace")
+
+    artifact = torch.load(
+        prepacked_dir / "flashinfer_mxfp8_moe_prepacked_v1.pt",
+        weights_only=True,
+    )
+    assert set(artifact) == {
+        "metadata",
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+    }
+    assert artifact["metadata"] == {
+        "format": "flashinfer_mxfp8_moe_prepacked_v1",
+        "flashinfer_version": "0.6.13",
+        "model_revision": "revision-under-test",
+        "quantization": "MXFP8",
+        "weight_layout": "MajorK",
+        "use_shuffled_weight": True,
+        "activation": "SwiGLU",
+        "gated_rows_reordered": True,
+        "matrix_a_shuffled": True,
+        "matrix_sf_a_shuffled": True,
+        "global_num_experts": 4,
+        "local_num_experts": 4,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "local_expert_offset": 0,
+    }
+    assert artifact["gemm1_weights"].device.type == "cpu"
+    assert artifact["gemm1_weights"].dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        artifact["gemm1_weights"],
+        torch.full((4, 2, 32, 32), 3.0, dtype=torch.float8_e4m3fn),
+    )
+    assert artifact["gemm2_weights"].device.type == "cpu"
+    assert artifact["gemm2_weights"].dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        artifact["gemm2_weights"],
+        torch.full((4, 32, 1, 32), 5.0, dtype=torch.float8_e4m3fn),
+    )
+    assert torch.equal(
+        artifact["gemm1_weights_scale"],
+        torch.full((4, 2, 1), 2.0, dtype=torch.float8_e8m0fnu),
+    )
+    assert torch.equal(
+        artifact["gemm2_weights_scale"],
+        torch.full((4, 1, 1), 4.0, dtype=torch.float8_e8m0fnu),
+    )
+
+
+def _capture_prepacked_weights(
+    output_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    w1_value: float = 1.0,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_MOE_PREPACKED_WEIGHT_DIR", str(output_dir))
+    trtllm_moe_trace.capture_mxfp8_moe_prepacked_weights(
+        w1=torch.full((2, 4), w1_value, dtype=torch.float8_e4m3fn),
+        w2=torch.full((2, 4), 2.0, dtype=torch.float8_e4m3fn),
+        w1_scale=torch.full((2, 1), 4.0, dtype=torch.float8_e8m0fnu),
+        w2_scale=torch.full((2, 1), 8.0, dtype=torch.float8_e8m0fnu),
+        model_revision="model-revision",
+        global_num_experts=16,
+        local_num_experts=2,
+        hidden_size=4,
+        intermediate_size=2,
+        local_expert_offset=12,
+    )
+
+
+def test_prepacked_weight_capture_is_atomic_and_only_writes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replaced_paths: list[tuple[Path, Path]] = []
+    real_replace = trtllm_moe_trace.os.replace
+
+    def observe_replace(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        assert source_path.exists()
+        assert source_path.parent == destination_path.parent
+        replaced_paths.append((source_path, destination_path))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(trtllm_moe_trace.os, "replace", observe_replace)
+
+    _capture_prepacked_weights(tmp_path, monkeypatch, w1_value=1.0)
+    _capture_prepacked_weights(tmp_path, monkeypatch, w1_value=3.0)
+
+    artifact_path = tmp_path / "flashinfer_mxfp8_moe_prepacked_v1.pt"
+    artifact = torch.load(artifact_path, weights_only=True)
+    assert torch.equal(
+        artifact["gemm1_weights"],
+        torch.ones((2, 4), dtype=torch.float8_e4m3fn),
+    )
+    assert replaced_paths == [(replaced_paths[0][0], artifact_path)]
+    assert not replaced_paths[0][0].exists()
+
+
+@pytest.mark.parametrize("guard", ["rank", "compile", "cuda_capture"])
+def test_prepacked_weight_capture_guards_do_not_consume_one_shot(
+    guard: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: guard == "compile")
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: guard == "cuda_capture",
+    )
+    if guard == "rank":
+        monkeypatch.setenv("RANK", "1")
+
+    _capture_prepacked_weights(tmp_path, monkeypatch)
+
+    assert not list(tmp_path.glob("*.pt"))
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setenv("RANK", "0")
+    _capture_prepacked_weights(tmp_path, monkeypatch)
+
+    assert (tmp_path / "flashinfer_mxfp8_moe_prepacked_v1.pt").is_file()
 
 
 def test_trace_is_disabled_without_directory(monkeypatch) -> None:
