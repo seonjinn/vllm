@@ -109,6 +109,7 @@ from vllm.model_executor.kernels.linear.mxfp8.emulation import (
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferCutedslMxfp8LinearKernel,
     FlashInferCutlassMxfp8LinearKernel,
+    FlashInferTrtllmMxfp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.humming import (
     HummingMxfp8LinearKernel,
@@ -246,6 +247,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         FlashInferCutedslMxfp8LinearKernel,
     },
     "flashinfer_trtllm": {
+        FlashInferTrtllmMxfp8LinearKernel,
         FlashInferTrtllmNvFp4LinearKernel,
     },
     "flashinfer_cudnn": {
@@ -795,7 +797,14 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
     config = Mxfp8LinearLayerConfig()
 
     platform = current_platform._enum
-    possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
+    possible = [
+        kernel
+        for kernel in _POSSIBLE_MXFP8_KERNELS.get(platform, [])
+        if kernel is not FlashInferTrtllmMxfp8LinearKernel
+    ]
+
+    if _get_linear_backend() == "flashinfer_trtllm":
+        possible.append(FlashInferTrtllmMxfp8LinearKernel)
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
@@ -1192,6 +1201,7 @@ __all__ = [
     "MarlinMxFp4LinearKernel",
     "FlashInferCutedslMxfp8LinearKernel",
     "FlashInferCutlassMxfp8LinearKernel",
+    "FlashInferTrtllmMxfp8LinearKernel",
     "MarlinMxfp8LinearKernel",
     "XPUMxFp8LinearKernel",
     "EmulationMxfp8LinearKernel",
