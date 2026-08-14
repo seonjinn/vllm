@@ -22,6 +22,7 @@ MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.95}
 SWITCH_M=${SWITCH_M:-256}
+LINEAR_BACKEND=${LINEAR_BACKEND:-flashinfer_trtllm}
 PORT=${PORT:-$((18000 + SLURM_JOB_ID % 20000))}
 RUN_DIR="${RESULT_ROOT}/${LAYOUT}/${SLURM_JOB_ID}"
 mkdir -p "${RUN_DIR}"
@@ -37,6 +38,7 @@ CONTAINER_MOUNTS="/lustre:/lustre,$(IFS=,; echo "${PATCH_MOUNTS[*]}")"
 export RUN_DIR TP WORKLOADS BATCH_SIZES PROMPT_MULTIPLIER
 export MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS
 export GPU_MEMORY_UTILIZATION PORT SOURCE_ROOT SOURCE_COMMIT LAYOUT SWITCH_M
+export LINEAR_BACKEND
 
 # shellcheck disable=SC2016
 srun \
@@ -66,7 +68,7 @@ SERVER_CMD=(
   --disable-custom-all-reduce
   --enable-expert-parallel
   --moe-backend flashinfer_trtllm
-  --linear-backend flashinfer_trtllm
+  --linear-backend "${LINEAR_BACKEND}"
   --attention-backend FLASHINFER
   --dtype auto
   --load-format auto
@@ -89,7 +91,7 @@ SERVER_CMD=(
   echo "source_root=${SOURCE_ROOT}"
   echo "source_commit=${SOURCE_COMMIT}"
   echo "model=${MODEL_PATH}"
-  echo "linear_backend=flashinfer_trtllm"
+  echo "linear_backend=${LINEAR_BACKEND}"
   echo "moe_backend=flashinfer_trtllm"
   echo "layout=${LAYOUT}"
   echo "switch_m=${SWITCH_M}"
@@ -168,7 +170,7 @@ for workload in ${WORKLOADS}; do
         source_commit="${SOURCE_COMMIT}" \
         gpu=GB200 \
         model=nemotron3_ultra_mxfp8 \
-        linear_backend=flashinfer_trtllm \
+        linear_backend="${LINEAR_BACKEND}" \
         moe_backend=flashinfer_trtllm \
         trtllm_layout="${LAYOUT}" \
         trtllm_switch_m="${SWITCH_M}" \

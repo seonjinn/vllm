@@ -19,6 +19,11 @@ The default row uses the TRTLLM backend's fixed 8x4 layout. The adaptive row
 changes only `VLLM_MXFP8_TRTLLM_LAYOUT=adaptive`; all serving and workload
 settings remain identical.
 
+A contextual run uses `LINEAR_BACKEND=auto`. On GB200, vLLM v0.27.1 resolves
+that setting to FlashInfer CuteDSL for MXFP8 dense linear layers. This row
+answers whether adaptive TRTLLM beats the released v0.27.1 default; it is not
+part of the fixed-versus-adaptive TRTLLM A/B.
+
 ## Submit on Lyris
 
 The remote source checkout must match `SOURCE_COMMIT`. Validate scheduling

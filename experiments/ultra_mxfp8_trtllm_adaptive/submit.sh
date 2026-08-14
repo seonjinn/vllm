@@ -13,6 +13,7 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/conta
 MODEL_PATH=${MODEL_PATH:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8}
 SOURCE_ROOT=${SOURCE_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-trtllm-adaptive-ultra}
 SOURCE_COMMIT=${SOURCE_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
+LINEAR_BACKEND=${LINEAR_BACKEND:-flashinfer_trtllm}
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_trtllm_adaptive_${STAMP}}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
@@ -31,7 +32,7 @@ for layout in ${LAYOUTS}; do
     --segment="${SEGMENT}"
     --job-name="${job_name}"
     --output="${RESULT_ROOT}/slurm/${layout}_%j.out"
-    --export="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},MODEL_PATH=${MODEL_PATH},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},LAYOUT=${layout},RESULT_ROOT=${RESULT_ROOT}"
+    --export="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},MODEL_PATH=${MODEL_PATH},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},LINEAR_BACKEND=${LINEAR_BACKEND},LAYOUT=${layout},RESULT_ROOT=${RESULT_ROOT}"
   )
   if [[ "${SBATCH_TEST_ONLY}" == "1" ]]; then
     cmd+=(--test-only)
