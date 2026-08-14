@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gres=gpu:1
 #SBATCH --mem=0
 #SBATCH --time=04:00:00
 #SBATCH --job-name=stage_vllm_0271
