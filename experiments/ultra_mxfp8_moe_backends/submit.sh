@@ -18,7 +18,7 @@ SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
 mkdir -p "${RESULT_ROOT}/slurm"
 
 for backend in ${BACKENDS}; do
-  job_name="sna-v0271-ultra-mxfp8-${backend}"
+  job_name="${ACCOUNT}-mxfp8.v0271-${backend}"
   cmd=(
     sbatch
     --parsable
