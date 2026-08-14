@@ -55,7 +55,7 @@ for precision in ${PRECISIONS}; do
       ;;
   esac
 
-  job_name="${ACCOUNT}-ultra-${precision}-tp4"
+  job_name="${ACCOUNT}-${USER:-sna}.ultra-${precision}-tp4"
   cmd=(
     sbatch
     --parsable
