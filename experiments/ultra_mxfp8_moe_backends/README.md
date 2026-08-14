@@ -17,12 +17,16 @@ Only `--moe-backend` changes between runs.
 
 ## Backend matrix
 
-The native GB200 W8A8 candidates are `flashinfer_trtllm` and `humming`. `auto`
-is included to identify the default selection. `marlin` is measured separately
-because it is a W8A16 fallback. `deep_gemm` and `triton` are submitted as
-capability checks: Ultra's non-gated MoE is expected to reject DeepGEMM, and the
-v0.27.1 native Triton MXFP8 implementation is expected to reject GB200. Startup
-failures are preserved as results instead of being silently omitted.
+`flashinfer_trtllm` is the native MXFP8 W8A8 candidate on GB200. `auto` is
+included to identify the default selection. Humming supports the checkpoint,
+but without `VLLM_HUMMING_INPUT_QUANT_CONFIG` it keeps activations unquantized;
+that row is not an equivalent native MXFP8 W8A8 path. `marlin` is measured
+separately because it is a W8A16 fallback. `deep_gemm` and `triton` are submitted
+as capability checks: Ultra's non-gated MoE rejects DeepGEMM, and the v0.27.1
+native Triton MXFP8 implementation rejects GB200. Startup failures are preserved
+as results instead of being silently omitted.
+
+The validated results are in [RESULTS_20260813.md](RESULTS_20260813.md).
 
 ## Submit
 
