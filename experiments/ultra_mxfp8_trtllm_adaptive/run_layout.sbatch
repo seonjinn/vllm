@@ -105,15 +105,7 @@ SERVER_CMD=(
   printf "%q " "${SERVER_CMD[@]}"
   printf "\n"
   vllm --version
-  python - <<'PY'
-from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
-    FlashInferTrtllmMxfp8LinearKernel,
-    _mxfp8_trtllm_layout_config,
-)
-
-print(f"kernel={FlashInferTrtllmMxfp8LinearKernel.__name__}")
-print(f"layout_config={_mxfp8_trtllm_layout_config()}")
-PY
+  python3 -c "from vllm.model_executor.kernels.linear.mxfp8.flashinfer import FlashInferTrtllmMxfp8LinearKernel, _mxfp8_trtllm_layout_config; print(f\"kernel={FlashInferTrtllmMxfp8LinearKernel.__name__}\"); print(f\"layout_config={_mxfp8_trtllm_layout_config()}\")"
   nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 } >"${RUN_DIR}/metadata.txt"
 
