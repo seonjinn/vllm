@@ -80,6 +80,7 @@ SERVER_CMD=(
   echo "osl=${OSL}"
   echo "batch_sizes=${BATCH_SIZES}"
   echo "container=${CONTAINER_IMAGE}"
+  echo "humming_input_quant_config=${VLLM_HUMMING_INPUT_QUANT_CONFIG:-}"
   printf "server_command="
   printf "%q " "${SERVER_CMD[@]}"
   printf "\n"
