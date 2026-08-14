@@ -40,6 +40,9 @@ sbatch --test-only \
 After the image passes its smoke check:
 
 ```bash
+CONTAINER_IMAGE=/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh \
+  sbatch --test-only experiments/ultra_mxfp8_moe_backends/smoke_container.sbatch
+
 SBATCH_TEST_ONLY=1 experiments/ultra_mxfp8_moe_backends/submit.sh
 experiments/ultra_mxfp8_moe_backends/submit.sh
 ```
