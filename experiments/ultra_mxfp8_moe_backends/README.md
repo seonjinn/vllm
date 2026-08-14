@@ -33,7 +33,7 @@ sbatch --test-only \
   --account=coreai_dlalgo_llm \
   --partition=gb200 \
   --qos=user-restrictions \
-  --export=ALL,SOURCE_IMAGE=docker.io/vllm/vllm-openai:v0.27.1,OUTPUT_PREFIX=vllm_openai_v0271_aarch64,CONTAINER_DIR=/lustre/fsw/coreai_dlalgo_llm/users/sna/containers,SOURCE_COMMIT=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac \
+  --export=ALL,SOURCE_IMAGE=docker.io/vllm/vllm-openai@sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c,OUTPUT_PREFIX=vllm_openai_v0271_aarch64,CONTAINER_DIR=/lustre/fsw/coreai_dlalgo_llm/users/sna/containers,SOURCE_COMMIT=6e448d0ea9bf3d88d898b65449ca6dc2aec170ac \
   experiments/ultra_mxfp8_moe_backends/stage_enroot_image.sbatch
 ```
 
