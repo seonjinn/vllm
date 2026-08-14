@@ -50,6 +50,7 @@ SERVER_CMD=(
   --served-model-name nemotron3-ultra-mxfp8
   --trust-remote-code
   --tensor-parallel-size "${TP}"
+  --disable-custom-all-reduce
   --enable-expert-parallel
   --moe-backend "${MOE_BACKEND}"
   --linear-backend auto
