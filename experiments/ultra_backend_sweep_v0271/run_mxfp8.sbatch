@@ -12,10 +12,12 @@ set -euo pipefail
 : "${SOURCE_COMMIT:?Set SOURCE_COMMIT}"
 : "${SWEEP_KIND:?Set SWEEP_KIND to dense or moe}"
 : "${BACKEND:?Set BACKEND}"
-: "${LINEAR_BACKEND:?Set LINEAR_BACKEND}"
 : "${MOE_BACKEND:?Set MOE_BACKEND}"
 : "${RESULT_ROOT:?Set RESULT_ROOT}"
 
+PRECISION=${PRECISION:-mxfp8}
+LINEAR_BACKEND=${LINEAR_BACKEND:-}
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-nemotron3-ultra-mxfp8}
 TP=${TP:-4}
 WORKLOADS=${WORKLOADS:-"1000:1000"}
 BATCH_SIZES=${BATCH_SIZES:-"8"}
@@ -41,6 +43,7 @@ export RUN_DIR TP WORKLOADS BATCH_SIZES PROMPT_MULTIPLIER
 export MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS
 export GPU_MEMORY_UTILIZATION BENCH_TIMEOUT_S PORT SOURCE_ROOT SOURCE_COMMIT
 export SWEEP_KIND BACKEND LINEAR_BACKEND MOE_BACKEND
+export PRECISION SERVED_MODEL_NAME
 
 # shellcheck disable=SC2016
 srun \
@@ -62,13 +65,12 @@ SERVER_CMD=(
   vllm serve "${MODEL_PATH}"
   --host 127.0.0.1
   --port "${PORT}"
-  --served-model-name nemotron3-ultra-mxfp8
+  --served-model-name "${SERVED_MODEL_NAME}"
   --trust-remote-code
   --tensor-parallel-size "${TP}"
   --disable-custom-all-reduce
   --enable-expert-parallel
   --moe-backend "${MOE_BACKEND}"
-  --linear-backend "${LINEAR_BACKEND}"
   --attention-backend FLASHINFER
   --dtype auto
   --load-format auto
@@ -84,6 +86,9 @@ SERVER_CMD=(
   --seed 0
   --compilation-config "{\"cudagraph_capture_sizes\":[1,8,32],\"pass_config\":{\"fuse_allreduce_rms\":false}}"
 )
+if [[ -n "${LINEAR_BACKEND}" ]]; then
+  SERVER_CMD+=(--linear-backend "${LINEAR_BACKEND}")
+fi
 
 {
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -91,6 +96,7 @@ SERVER_CMD=(
   echo "source_root=${SOURCE_ROOT}"
   echo "source_commit=${SOURCE_COMMIT}"
   echo "model=${MODEL_PATH}"
+  echo "precision=${PRECISION}"
   echo "sweep_kind=${SWEEP_KIND}"
   echo "backend=${BACKEND}"
   echo "linear_backend=${LINEAR_BACKEND}"
@@ -145,7 +151,7 @@ for workload in ${WORKLOADS}; do
       --backend vllm \
       --base-url "http://127.0.0.1:${PORT}" \
       --endpoint /v1/completions \
-      --model nemotron3-ultra-mxfp8 \
+      --model "${SERVED_MODEL_NAME}" \
       --tokenizer "${MODEL_PATH}" \
       --trust-remote-code \
       --dataset-name random \
@@ -166,7 +172,8 @@ for workload in ${WORKLOADS}; do
         vllm_version=0.27.1 \
         source_commit="${SOURCE_COMMIT}" \
         gpu=GB200 \
-        model=nemotron3_ultra_mxfp8 \
+        model="nemotron3_ultra_${PRECISION}" \
+        precision="${PRECISION}" \
         sweep_kind="${SWEEP_KIND}" \
         backend="${BACKEND}" \
         linear_backend="${LINEAR_BACKEND}" \

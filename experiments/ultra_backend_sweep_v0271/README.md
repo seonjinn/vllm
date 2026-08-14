@@ -15,3 +15,14 @@ for failed requests and exact input/output token counts.
 SBATCH_TEST_ONLY=1 PROFILE=smoke ./experiments/ultra_backend_sweep_v0271/submit_mxfp8.sh
 PROFILE=smoke ./experiments/ultra_backend_sweep_v0271/submit_mxfp8.sh
 ```
+
+For an apples-to-apples BF16 versus MXFP8 comparison, run both models through
+the same one-node TP4 harness. This keeps ISL/OSL, concurrency, request waves,
+parallelism, GPU count, Mamba cache settings, and vLLM source fixed.
+
+```bash
+SBATCH_TEST_ONLY=1 PROFILE=smoke \
+  ./experiments/ultra_backend_sweep_v0271/submit_precision_compare.sh
+PROFILE=smoke \
+  ./experiments/ultra_backend_sweep_v0271/submit_precision_compare.sh
+```
