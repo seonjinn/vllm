@@ -63,7 +63,9 @@ def _mxfp8_trtllm_tactics() -> dict[tuple[int, int, int], int]:
             continue
         shape_text, separator, tactic_text = entry.partition(":")
         try:
-            shape = tuple(int(value) for value in shape_text.split(","))
+            shape = tuple(
+                int(value) for value in shape_text.replace("x", ",").split(",")
+            )
             tactic = int(tactic_text)
         except ValueError as exc:
             raise ValueError(
