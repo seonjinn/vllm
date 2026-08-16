@@ -22,6 +22,7 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_TRTLLM_LAYOUT"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_TRTLLM_SWITCH_M"
+MXFP8_TRTLLM_TACTICS_ENV = "VLLM_MXFP8_TRTLLM_TACTICS"
 
 
 class _Mxfp8TrtllmLayoutConfig(NamedTuple):
@@ -51,6 +52,101 @@ def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
         return False
     assert config.switch_m is not None
     return m <= config.switch_m
+
+
+@cache
+def _mxfp8_trtllm_tactics() -> dict[tuple[int, int, int], int]:
+    tactics: dict[tuple[int, int, int], int] = {}
+    for raw_entry in envs.VLLM_MXFP8_TRTLLM_TACTICS.split(";"):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        shape_text, separator, tactic_text = entry.partition(":")
+        try:
+            shape = tuple(int(value) for value in shape_text.split(","))
+            tactic = int(tactic_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {MXFP8_TRTLLM_TACTICS_ENV} entry: {entry!r}."
+            ) from exc
+        if separator != ":" or len(shape) != 3 or tactic < -1:
+            raise ValueError(f"Invalid {MXFP8_TRTLLM_TACTICS_ENV} entry: {entry!r}.")
+        key = (shape[0], shape[1], shape[2])
+        if key in tactics:
+            raise ValueError(
+                f"Duplicate {MXFP8_TRTLLM_TACTICS_ENV} shape: {shape_text!r}."
+            )
+        tactics[key] = tactic
+    return tactics
+
+
+def mxfp8_trtllm_tactic(m: int, n: int, k: int) -> int | None:
+    return _mxfp8_trtllm_tactics().get((m, n, k))
+
+
+@cache
+def _mxfp8_trtllm_runtime(
+    device_type: str,
+    device_index: int,
+    use_8x4_sf_layout: bool,
+) -> tuple[object, torch.Tensor]:
+    from flashinfer.gemm.gemm_base import (
+        DEFAULT_WORKSPACE_SIZE,
+        _get_cache_buf,
+        get_trtllm_gemm_module,
+    )
+
+    device = torch.device(device_type, device_index)
+    suffix = "8x4" if use_8x4_sf_layout else "128x4"
+    workspace = _get_cache_buf(
+        f"vllm_mxfp8_trtllm_tactic_workspace_{suffix}",
+        DEFAULT_WORKSPACE_SIZE,
+        device,
+    )
+    runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+        use_8x4_sf_layout=use_8x4_sf_layout
+    )
+    return runner, workspace
+
+
+def _mxfp8_trtllm_tactic_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+    use_8x4_sf_layout: bool,
+    tactic: int,
+) -> torch.Tensor:
+    quantize = (
+        vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+        if use_8x4_sf_layout
+        else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
+    )
+    input_mxfp8, input_scale = quantize(x)
+    physical_output_features = int(weight.shape[0])
+    output = torch.empty(
+        (x.shape[0], physical_output_features),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    runner, workspace = _mxfp8_trtllm_runtime(
+        x.device.type,
+        x.device.index if x.device.index is not None else torch.cuda.current_device(),
+        use_8x4_sf_layout,
+    )
+    result = runner.forward(
+        [
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            x.dtype,
+            output,
+            workspace,
+        ],
+        tactic=tactic,
+    )
+    return result[:, :output_features].contiguous()
 
 
 def _mxfp8_trtllm_linear_fixed_impl(
@@ -101,6 +197,17 @@ def mxfp8_trtllm_linear(
     output_features: int,
 ) -> torch.Tensor:
     config = _mxfp8_trtllm_layout_config()
+    use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
+    tactic = mxfp8_trtllm_tactic(int(x.shape[0]), output_features, int(x.shape[1]))
+    if tactic is not None:
+        return torch.ops.vllm.mxfp8_trtllm_tactic_linear(
+            x,
+            weight,
+            weight_scale,
+            output_features,
+            use_8x4_sf_layout,
+            tactic,
+        )
     if config.policy == "adaptive":
         return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
             x, weight, weight_scale, output_features
@@ -123,10 +230,26 @@ def _mxfp8_trtllm_linear_fake(
     return torch.empty((x.shape[0], output_features), dtype=x.dtype, device=x.device)
 
 
+def _mxfp8_trtllm_tactic_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+    use_8x4_sf_layout: bool,
+    tactic: int,
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], output_features), dtype=x.dtype, device=x.device)
+
+
 direct_register_custom_op(
     op_name="mxfp8_trtllm_adaptive_linear",
     op_func=_mxfp8_trtllm_adaptive_linear_impl,
     fake_impl=_mxfp8_trtllm_linear_fake,
+)
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_tactic_linear",
+    op_func=_mxfp8_trtllm_tactic_linear_impl,
+    fake_impl=_mxfp8_trtllm_tactic_linear_fake,
 )
 
 

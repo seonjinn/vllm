@@ -19,9 +19,12 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
+    MXFP8_TRTLLM_TACTICS_ENV,
     _mxfp8_trtllm_layout_config,
     _mxfp8_trtllm_linear_fixed_impl,
+    _mxfp8_trtllm_tactics,
     mxfp8_trtllm_linear,
+    mxfp8_trtllm_tactic,
     mxfp8_trtllm_use_8x4_sf_layout,
 )
 from vllm.platforms import PlatformEnum
@@ -38,8 +41,10 @@ def _kernel() -> FlashInferTrtllmMxfp8LinearKernel:
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_tactics.cache_clear()
     yield
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_tactics.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -79,6 +84,29 @@ def test_mxfp8_trtllm_layout_policy_rejects_invalid_value(monkeypatch) -> None:
 def test_mxfp8_trtllm_environment_variables_are_registered() -> None:
     assert MXFP8_TRTLLM_LAYOUT_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_SWITCH_M_ENV in envs.environment_variables
+    assert MXFP8_TRTLLM_TACTICS_ENV in envs.environment_variables
+
+
+def test_mxfp8_trtllm_tactic_uses_exact_shape(monkeypatch) -> None:
+    monkeypatch.setenv(
+        MXFP8_TRTLLM_TACTICS_ENV,
+        "1,1280,8192:67;8,1280,8192:78",
+    )
+
+    assert mxfp8_trtllm_tactic(1, 1280, 8192) == 67
+    assert mxfp8_trtllm_tactic(8, 1280, 8192) == 78
+    assert mxfp8_trtllm_tactic(2, 1280, 8192) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["1,1280:67", "1,1280,8192", "1,1280,8192:-2", "1,1280,8192:x"],
+)
+def test_mxfp8_trtllm_tactics_reject_malformed_entries(monkeypatch, value: str) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_TACTICS_ENV, value)
+
+    with pytest.raises(ValueError, match=MXFP8_TRTLLM_TACTICS_ENV):
+        mxfp8_trtllm_tactic(1, 1280, 8192)
 
 
 @pytest.mark.parametrize("switch_m", ["0", "-1"])

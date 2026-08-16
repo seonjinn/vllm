@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_MXFP8_TRTLLM_LAYOUT: Literal["8x4", "128x4", "adaptive"] = "8x4"
     VLLM_MXFP8_TRTLLM_SWITCH_M: int = 256
+    VLLM_MXFP8_TRTLLM_TACTICS: str = ""
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1250,6 +1251,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP8_TRTLLM_SWITCH_M": lambda: int(
         os.getenv("VLLM_MXFP8_TRTLLM_SWITCH_M", "256")
     ),
+    "VLLM_MXFP8_TRTLLM_TACTICS": lambda: os.getenv("VLLM_MXFP8_TRTLLM_TACTICS", ""),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
     ),
