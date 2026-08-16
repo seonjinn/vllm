@@ -90,7 +90,7 @@ def test_mxfp8_trtllm_environment_variables_are_registered() -> None:
 def test_mxfp8_trtllm_tactic_uses_exact_shape(monkeypatch) -> None:
     monkeypatch.setenv(
         MXFP8_TRTLLM_TACTICS_ENV,
-        "1,1280,8192:67;8,1280,8192:78",
+        "1x1280x8192:67;8,1280,8192:78",
     )
 
     assert mxfp8_trtllm_tactic(1, 1280, 8192) == 67
