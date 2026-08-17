@@ -216,6 +216,33 @@ def test_mxfp8_trtllm_adaptive_op_uses_runtime_shape(monkeypatch) -> None:
     assert calls == [True, False]
 
 
+def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(
+        MXFP8_TRTLLM_TACTICS_ENV,
+        "3x256x512:7;3x130x512:8",
+    )
+    calls: list[int] = []
+
+    def tactic_impl(*args, tactic: int, **kwargs) -> torch.Tensor:
+        calls.append(tactic)
+        return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_tactic_linear_impl",
+        tactic_impl,
+    )
+
+    mxfp8_trtllm_linear(
+        torch.empty((3, 512), dtype=torch.bfloat16),
+        torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((4096,), dtype=torch.uint8),
+        130,
+    )
+
+    assert calls == [7]
+
+
 def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
     monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
     monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "2")
