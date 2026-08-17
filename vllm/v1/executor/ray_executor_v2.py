@@ -245,9 +245,17 @@ class RayExecutorV2(MultiprocExecutor):
         env_vars.update({v: "1" for v in current_platform.ray_noset_device_env_vars})
         if self.parallel_config.ray_workers_use_nsight:
             runtime_env["nsight"] = {
-                "t": "cuda,cudnn,cublas",
+                "t": "cuda,nvtx,osrt",
                 "o": "'worker_process_%p'",
                 "cuda-graph-trace": "node",
+                "trace-fork-before-exec": "true",
+                "wait": "all",
+                "capture-range": "cudaProfilerApi",
+                "capture-range-end": "stop",
+                "sample": "none",
+                "cpuctxsw": "none",
+                "cuda-memory-usage": "false",
+                "export": "sqlite",
             }
         return runtime_env
 
