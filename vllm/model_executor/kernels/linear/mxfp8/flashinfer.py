@@ -185,7 +185,10 @@ def _mxfp8_trtllm_dispatch_linear_impl(
 ) -> torch.Tensor:
     config = _mxfp8_trtllm_layout_config()
     use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
-    tactic = mxfp8_trtllm_tactic(int(x.shape[0]), output_features, int(x.shape[1]))
+    physical_output_features = int(weight.shape[0])
+    tactic = mxfp8_trtllm_tactic(
+        int(x.shape[0]), physical_output_features, int(x.shape[1])
+    )
     if tactic is not None:
         return _mxfp8_trtllm_tactic_linear_impl(
             x,
