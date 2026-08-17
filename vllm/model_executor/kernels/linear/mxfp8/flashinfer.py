@@ -177,22 +177,7 @@ def _mxfp8_trtllm_linear_fixed_impl(
     return output[:, :output_features].contiguous()
 
 
-def _mxfp8_trtllm_adaptive_linear_impl(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    output_features: int,
-) -> torch.Tensor:
-    return _mxfp8_trtllm_linear_fixed_impl(
-        x,
-        weight,
-        weight_scale,
-        output_features,
-        use_8x4_sf_layout=mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0])),
-    )
-
-
-def mxfp8_trtllm_linear(
+def _mxfp8_trtllm_dispatch_linear_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -202,7 +187,7 @@ def mxfp8_trtllm_linear(
     use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
     tactic = mxfp8_trtllm_tactic(int(x.shape[0]), output_features, int(x.shape[1]))
     if tactic is not None:
-        return torch.ops.vllm.mxfp8_trtllm_tactic_linear(
+        return _mxfp8_trtllm_tactic_linear_impl(
             x,
             weight,
             weight_scale,
@@ -210,16 +195,25 @@ def mxfp8_trtllm_linear(
             use_8x4_sf_layout,
             tactic,
         )
-    if config.policy == "adaptive":
-        return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
-            x, weight, weight_scale, output_features
-        )
     return _mxfp8_trtllm_linear_fixed_impl(
         x,
         weight,
         weight_scale,
         output_features,
-        use_8x4_sf_layout=config.policy == "8x4",
+        use_8x4_sf_layout=(
+            use_8x4_sf_layout if config.policy == "adaptive" else config.policy == "8x4"
+        ),
+    )
+
+
+def mxfp8_trtllm_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    return torch.ops.vllm.mxfp8_trtllm_dispatch_linear(
+        x, weight, weight_scale, output_features
     )
 
 
@@ -244,8 +238,8 @@ def _mxfp8_trtllm_tactic_linear_fake(
 
 
 direct_register_custom_op(
-    op_name="mxfp8_trtllm_adaptive_linear",
-    op_func=_mxfp8_trtllm_adaptive_linear_impl,
+    op_name="mxfp8_trtllm_dispatch_linear",
+    op_func=_mxfp8_trtllm_dispatch_linear_impl,
     fake_impl=_mxfp8_trtllm_linear_fake,
 )
 direct_register_custom_op(

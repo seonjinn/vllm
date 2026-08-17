@@ -216,6 +216,33 @@ def test_mxfp8_trtllm_adaptive_op_uses_runtime_shape(monkeypatch) -> None:
     assert calls == [True, False]
 
 
+def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "2")
+    calls: list[bool] = []
+
+    def fixed_impl(*args, use_8x4_sf_layout: bool, **kwargs) -> torch.Tensor:
+        calls.append(use_8x4_sf_layout)
+        return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_linear_fixed_impl",
+        fixed_impl,
+    )
+
+    weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty((4096,), dtype=torch.uint8)
+
+    @torch.compile(backend="eager", dynamic=True)
+    def compiled_linear(x: torch.Tensor) -> torch.Tensor:
+        return mxfp8_trtllm_linear(x, weight, weight_scale, 130)
+
+    compiled_linear(torch.empty((2, 512), dtype=torch.bfloat16))
+    compiled_linear(torch.empty((3, 512), dtype=torch.bfloat16))
+
+    assert calls == [True, False]
+
+
 @pytest.mark.parametrize(
     ("compute_capability", "expected"),
     [(100, True), (103, True), (107, True), (101, False), (120, False)],

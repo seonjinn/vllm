@@ -144,7 +144,7 @@ def test_flashinfer_trtllm_mxfp8_custom_ops() -> None:
         ),
     )
     torch.library.opcheck(
-        torch.ops.vllm.mxfp8_trtllm_adaptive_linear.default,
+        torch.ops.vllm.mxfp8_trtllm_dispatch_linear.default,
         (x, layer.weight, layer.weight_scale, 256),
         test_utils=(
             "test_autograd_registration",
