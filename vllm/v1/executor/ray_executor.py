@@ -119,9 +119,17 @@ class RayDistributedExecutor(Executor):
         runtime_env.update(
             {
                 "nsight": {
-                    "t": "cuda,cudnn,cublas",
+                    "t": "cuda,nvtx,osrt",
                     "o": "'worker_process_%p'",
                     "cuda-graph-trace": "node",
+                    "trace-fork-before-exec": "true",
+                    "wait": "all",
+                    "capture-range": "cudaProfilerApi",
+                    "capture-range-end": "stop",
+                    "sample": "none",
+                    "cpuctxsw": "none",
+                    "cuda-memory-usage": "false",
+                    "export": "sqlite",
                 }
             }
         )
