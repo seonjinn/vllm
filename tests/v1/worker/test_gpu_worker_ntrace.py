@@ -18,6 +18,7 @@ def test_ntrace_profile_uses_rollout_boundaries() -> None:
     worker = Worker.__new__(Worker)
     worker.profiler_config = SimpleNamespace(profiler="ntrace")
     worker._ntrace_rollout_controller = Mock()
+    worker._ntrace_rollout_controller.assert_trace_completed = Mock()
 
     worker.profile(is_start=True, profile_prefix="decode")
     worker.profile(is_start=False)
