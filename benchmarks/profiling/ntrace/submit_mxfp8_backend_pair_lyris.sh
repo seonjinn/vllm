@@ -6,7 +6,7 @@ BENCH_ROOT=${BENCH_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-benchmark-
 VLLM_SOURCE_ROOT=${VLLM_SOURCE_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-ntrace-profile}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh}
 MODEL_PATH=${MODEL_PATH:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8}
-NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-4dbf6c2e-cuda13-py312}
+NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-4dbf6c2e-cuda13-py312-nonumpy}
 PATCHED_TRTLLM_GEMM=${PATCHED_TRTLLM_GEMM:-/lustre/fsw/coreai_dlalgo_llm/users/sna/experiments/flashinfer-mxfp8-lowm-heuristic/benchmark-graph-c634591f/cache-patched/.cache/flashinfer/0.6.16.post3/100a/cached_ops/trtllm_gemm/trtllm_gemm.so}
 CONTAINER_TRTLLM_GEMM=${CONTAINER_TRTLLM_GEMM:-/usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/trtllm_gemm/trtllm_gemm.so}
 

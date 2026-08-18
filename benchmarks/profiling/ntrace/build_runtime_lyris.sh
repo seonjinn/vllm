@@ -21,10 +21,12 @@ build_runtime() {
     --python /usr/bin/python3 \
     --target "${tmp_runtime}" \
     "${tmp_source}"
+  rm -rf "${tmp_runtime}"/numpy "${tmp_runtime}"/numpy-*.dist-info
   PYTHONPATH="${tmp_runtime}" /usr/bin/python3 - <<'PY'
 from pathlib import Path
 
 import ntrace
+import numpy
 import pyarrow
 from ntrace.backends import get_backend
 
@@ -32,6 +34,7 @@ runtime = Path(ntrace.__file__).parent.parent
 native = list((runtime / "ntrace").glob("_cupti_cpp*.so"))
 assert native, f"missing C++ CUPTI backend under {runtime}"
 print(f"ntrace={ntrace.__file__}")
+print(f"numpy={numpy.__version__} ({numpy.__file__})")
 print(f"pyarrow={pyarrow.__version__}")
 print(f"backend={get_backend()}")
 print(f"native={native[0]}")
@@ -55,7 +58,7 @@ WALLTIME=${WALLTIME:-00:30:00}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh}
 NTRACE_SOURCE=${NTRACE_SOURCE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/source}
 NTRACE_REVISION=${NTRACE_REVISION:-$(git -C "${NTRACE_SOURCE}" rev-parse --short=8 HEAD)}
-NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-cuda13-py312}
+NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-cuda13-py312-nonumpy}
 NTRACE_PATCH=${NTRACE_PATCH:-$(dirname "${BASH_SOURCE[0]}")/patches/ntrace-cuda13-cupti-nvtx-header.patch}
 LOG_DIR=${LOG_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271}
 DRY_RUN=${DRY_RUN:-0}
@@ -78,7 +81,7 @@ cmd=(
   --nodes=1
   --time="${WALLTIME}"
   --job-name="${ACCOUNT}-sna.ntrace-build-py312"
-  --output="${LOG_DIR}/build-${NTRACE_REVISION}-cuda13-py312-%j.log"
+  --output="${LOG_DIR}/build-${NTRACE_REVISION}-cuda13-py312-nonumpy-%j.log"
   --container-image="${CONTAINER_IMAGE}"
   --container-mounts="/lustre:/lustre"
   --wrap="${build_command}"
