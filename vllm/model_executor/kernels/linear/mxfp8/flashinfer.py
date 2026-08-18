@@ -85,13 +85,15 @@ def _mxfp8_trtllm_adaptive_linear_impl(
     weight_scale: torch.Tensor,
     output_features: int,
 ) -> torch.Tensor:
-    return _mxfp8_trtllm_linear_fixed_impl(
+    from flashinfer import mm_mxfp8_dynamic_quant
+
+    output = mm_mxfp8_dynamic_quant(
         x,
-        weight,
+        weight.t(),
         weight_scale,
-        output_features,
-        use_8x4_sf_layout=mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0])),
+        out_dtype=x.dtype,
     )
+    return output[:, :output_features].contiguous()
 
 
 def mxfp8_trtllm_linear(
