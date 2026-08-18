@@ -12,6 +12,7 @@ NTRACE_REVISION=${NTRACE_REVISION:-$(git -C "${NTRACE_SOURCE}" rev-parse --short
 NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-py312}
 LOG_DIR=${LOG_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271}
 DRY_RUN=${DRY_RUN:-0}
+SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
 
 mkdir -p "${LOG_DIR}"
 
@@ -66,6 +67,9 @@ cmd=(
   --container-mounts="/lustre:/lustre"
   --wrap="${build_command}"
 )
+if [[ ${SBATCH_TEST_ONLY} == 1 ]]; then
+  cmd+=(--test-only)
+fi
 
 if [[ ${DRY_RUN} == 1 ]]; then
   printf 'DRY_RUN:'
