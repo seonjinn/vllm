@@ -52,12 +52,15 @@ fi
 base_mounts=(
   "/lustre:/lustre"
   "${BENCH_ROOT}/.container_cache:/root/.cache"
-  "${VLLM_SOURCE_ROOT}/vllm/config/profiler.py:/usr/local/lib/python3.12/dist-packages/vllm/config/profiler.py"
-  "${VLLM_SOURCE_ROOT}/vllm/v1/worker/gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py"
-  "${VLLM_SOURCE_ROOT}/vllm/envs.py:/usr/local/lib/python3.12/dist-packages/vllm/envs.py"
-  "${VLLM_SOURCE_ROOT}/vllm/model_executor/kernels/linear/__init__.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/__init__.py"
-  "${VLLM_SOURCE_ROOT}/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py"
-  "${VLLM_SOURCE_ROOT}/vllm/utils/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py"
+)
+
+runtime_override_files=(
+  vllm/config/profiler.py
+  vllm/v1/worker/gpu_worker.py
+  vllm/envs.py
+  vllm/model_executor/kernels/linear/__init__.py
+  vllm/model_executor/kernels/linear/mxfp8/flashinfer.py
+  vllm/utils/flashinfer.py
 )
 
 for variant in ${VARIANTS}; do
@@ -79,7 +82,13 @@ for variant in ${VARIANTS}; do
   mount_list=$(IFS=,; echo "${mounts[*]}")
   run_root="${RUN_ROOT_BASE}/${STAMP}_${variant}_isl${ISL}_osl${OSL}_bs${BATCH_SIZE}"
   trace_root="${run_root}/ntrace"
-  mkdir -p "${run_root}" "${trace_root}"
+  runtime_override_root="${run_root}/runtime_override"
+  mkdir -p "${run_root}" "${trace_root}" "${runtime_override_root}"
+  for relative_path in "${runtime_override_files[@]}"; do
+    mkdir -p "${runtime_override_root}/$(dirname "${relative_path}")"
+    cp "${VLLM_SOURCE_ROOT}/${relative_path}" \
+      "${runtime_override_root}/${relative_path}"
+  done
   cat > "${run_root}/metadata.env" <<EOF
 variant=${variant}
 vllm_head=${vllm_head}
@@ -156,6 +165,7 @@ EOF
     FORCE_EXIT_AFTER_BENCH=1 \
     PYTHONPATH="${NTRACE_RUNTIME}" \
     VLLM_SUBPROCESS_PYTHONPATH="${NTRACE_RUNTIME}" \
+    VLLM_RUNTIME_OVERRIDE_DIR="${runtime_override_root}" \
     NTRACE_ROLLOUT_OUTPUT_DIR="${trace_root}" \
     NTRACE_ROLLOUT_RANKS=0 \
     NTRACE_ROLLOUT_CAPTURE_ITER=0 \
