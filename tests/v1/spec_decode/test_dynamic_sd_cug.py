@@ -15,7 +15,10 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 pytestmark = pytest.mark.cpu_test
@@ -198,6 +201,75 @@ def test_dynamic_sd_autoregressive_draft_decode_uses_fixed_query_len(monkeypatch
             uniform_token_count=1,
             num_active_loras=0,
         )
+
+
+@pytest.mark.parametrize(
+    ("speculator_cls", "sample_from_anchor", "physical_width"),
+    [
+        (DFlashSpeculator, False, 17),
+        (DSparkSpeculator, True, 7),
+        (DSparkSpeculator, False, 8),
+    ],
+)
+def test_dynamic_sd_parallel_drafter_keeps_physical_graph_width(
+    monkeypatch,
+    speculator_cls,
+    sample_from_anchor,
+    physical_width,
+):
+    """Parallel drafters must capture their fixed runtime query layout.
+
+    A dynamic-SD schedule controls target verification length, but the DFlash
+    query forward always processes its physical per-request layout.  This test
+    fails if the shared initializer reintroduces schedule-derived query widths.
+    """
+
+    max_num_seqs = 8
+    max_spec_tokens = 16 if speculator_cls is DFlashSpeculator else 7
+    schedule = [(1, 2, 3), (3, 4, 1), (5, 8, 0)]
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        num_spec_per_batch_size=schedule,
+    )
+
+    # Exercise the production initializer without loading a draft model.
+    speculator = object.__new__(speculator_cls)
+    speculator.vllm_config = vllm_config
+    speculator.device = torch.device("cpu")
+    speculator.num_query_per_req = physical_width
+    speculator.sample_from_anchor = sample_from_anchor
+    speculator.attn_cg_support = SimpleNamespace(
+        min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+        min_cg_attn_backend="test",
+    )
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
+
+    manager = speculator.query_cudagraph_manager
+    assert manager is not None
+    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert {desc.uniform_token_count for desc in full_descs} == {physical_width}
+
+    manager._graphs_captured = True
+    for num_reqs in range(1, max_num_seqs + 1):
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_reqs * physical_width,
+            uniform_token_count=physical_width,
+            num_active_loras=0,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
 
 
 def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
