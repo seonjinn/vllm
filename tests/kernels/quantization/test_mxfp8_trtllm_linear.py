@@ -20,6 +20,7 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
     _mxfp8_trtllm_layout_config,
+    _mxfp8_trtllm_adaptive_linear_impl,
     _mxfp8_trtllm_linear_fixed_impl,
     mxfp8_trtllm_linear,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -162,30 +163,38 @@ def test_mxfp8_trtllm_fixed_impl_uses_matching_scale_layout(
     assert output.is_contiguous()
 
 
-def test_mxfp8_trtllm_adaptive_op_uses_runtime_shape(monkeypatch) -> None:
-    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
-    monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "2")
-    calls: list[bool] = []
+def test_mxfp8_trtllm_adaptive_op_uses_joint_flashinfer_api(monkeypatch) -> None:
+    calls: dict[str, object] = {}
 
-    def fixed_impl(*args, use_8x4_sf_layout: bool, **kwargs) -> torch.Tensor:
-        calls.append(use_8x4_sf_layout)
-        return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+    def mm_mxfp8_dynamic_quant(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        *,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        calls.update(a=a, b=b, b_scale=b_scale, out_dtype=out_dtype)
+        return torch.ones((a.shape[0], b.shape[1]), dtype=out_dtype)
 
-    monkeypatch.setattr(
-        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_linear_fixed_impl",
-        fixed_impl,
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        types.SimpleNamespace(mm_mxfp8_dynamic_quant=mm_mxfp8_dynamic_quant),
     )
 
+    x = torch.empty((3, 512), dtype=torch.bfloat16)
     weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty((4096,), dtype=torch.uint8)
-    mxfp8_trtllm_linear(
-        torch.empty((2, 512), dtype=torch.bfloat16), weight, weight_scale, 130
-    )
-    mxfp8_trtllm_linear(
-        torch.empty((3, 512), dtype=torch.bfloat16), weight, weight_scale, 130
-    )
+    output = _mxfp8_trtllm_adaptive_linear_impl(x, weight, weight_scale, 130)
 
-    assert calls == [True, False]
+    assert calls == {
+        "a": x,
+        "b": weight.t(),
+        "b_scale": weight_scale,
+        "out_dtype": torch.bfloat16,
+    }
+    assert output.shape == (3, 130)
+    assert output.is_contiguous()
 
 
 @pytest.mark.parametrize(
