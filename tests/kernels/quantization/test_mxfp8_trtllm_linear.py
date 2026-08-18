@@ -187,12 +187,15 @@ def test_mxfp8_trtllm_adaptive_op_uses_joint_flashinfer_api(monkeypatch) -> None
     weight_scale = torch.empty((4096,), dtype=torch.uint8)
     output = _mxfp8_trtllm_adaptive_linear_impl(x, weight, weight_scale, 130)
 
-    assert calls == {
-        "a": x,
-        "b": weight.t(),
-        "b_scale": weight_scale,
-        "out_dtype": torch.bfloat16,
-    }
+    assert set(calls) == {"a", "b", "b_scale", "out_dtype"}
+    assert calls["a"] is x
+    assert calls["b_scale"] is weight_scale
+    assert calls["out_dtype"] is torch.bfloat16
+    called_weight = calls["b"]
+    assert isinstance(called_weight, torch.Tensor)
+    assert called_weight.shape == (512, 256)
+    assert called_weight.stride() == weight.t().stride()
+    assert called_weight.untyped_storage().data_ptr() == weight.untyped_storage().data_ptr()
     assert output.shape == (3, 130)
     assert output.is_contiguous()
 
