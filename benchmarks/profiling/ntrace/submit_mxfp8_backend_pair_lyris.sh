@@ -86,6 +86,7 @@ for variant in ${VARIANTS}; do
   esac
 
   mount_list=$(IFS=,; echo "${mounts[*]}")
+  mount_list_b64=$(printf '%s' "${mount_list}" | base64 | tr -d '\n')
   run_root="${RUN_ROOT_BASE}/${STAMP}_${variant}_isl${ISL}_osl${OSL}_bs${BATCH_SIZE}"
   trace_root="${run_root}/ntrace"
   runtime_override_root="${run_root}/runtime_override"
@@ -127,6 +128,7 @@ EOF
     JOB_PREFIX="coreai_dlalgo_llm-${USER:-sna}.ntrace-${variant}" \
     CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
     CONTAINER_MOUNTS="${mount_list}" \
+    CONTAINER_MOUNTS_B64="${mount_list_b64}" \
     JOB_CACHE_DIR="${BENCH_ROOT}/.container_cache" \
     SBATCH_EXPORT_MODE=all \
     ULTRA_MXFP8_MODEL="${MODEL_PATH}" \
