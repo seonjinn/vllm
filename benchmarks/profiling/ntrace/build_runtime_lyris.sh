@@ -14,25 +14,22 @@ LOG_DIR=${LOG_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271}
 DRY_RUN=${DRY_RUN:-0}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
 
-mkdir -p "${LOG_DIR}"
+build_runtime() {
+  local source_root=$1
+  local runtime=$2
+  local tmp_runtime="${runtime}.tmp.${SLURM_JOB_ID}"
 
-printf -v ntrace_source_q '%q' "${NTRACE_SOURCE}"
-printf -v ntrace_runtime_q '%q' "${NTRACE_RUNTIME}"
-build_command=$(cat <<EOF
-set -euo pipefail
+  rm -rf "${tmp_runtime}"
+  export NTRACE_BUILD_CUPTI_CPP=ON
+  export NTRACE_REQUIRE_CUXXFILT=ON
+  export CMAKE_ARGS='-DCUDA_INCLUDE_DIR=/usr/local/cuda-13.0/targets/sbsa-linux/include -DCUDART_LIBRARY=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so -DCUPTI_INCLUDE_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include -DCUPTI_LIBRARY=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcupti.so.13'
+  export LD_LIBRARY_PATH=/usr/local/cuda-13.0/targets/sbsa-linux/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}
 
-source_root=${ntrace_source_q}
-runtime=${ntrace_runtime_q}
-tmp_runtime="\${runtime}.tmp.\${SLURM_JOB_ID}"
-
-rm -rf "\${tmp_runtime}"
-export NTRACE_BUILD_CUPTI_CPP=ON
-export NTRACE_REQUIRE_CUXXFILT=ON
-export CMAKE_ARGS='-DCUDA_INCLUDE_DIR=/usr/local/cuda-13.0/targets/sbsa-linux/include -DCUDART_LIBRARY=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so -DCUPTI_INCLUDE_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include -DCUPTI_LIBRARY=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcupti.so.13'
-export LD_LIBRARY_PATH=/usr/local/cuda-13.0/targets/sbsa-linux/lib:/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib:\${LD_LIBRARY_PATH:-}
-
-uv pip install --python /usr/bin/python3 --target "\${tmp_runtime}" "\${source_root}"
-PYTHONPATH="\${tmp_runtime}" /usr/bin/python3 - <<'PY'
+  uv pip install \
+    --python /usr/bin/python3 \
+    --target "${tmp_runtime}" \
+    "${source_root}"
+  PYTHONPATH="${tmp_runtime}" /usr/bin/python3 - <<'PY'
 from pathlib import Path
 
 import ntrace
@@ -48,11 +45,23 @@ print(f"backend={get_backend()}")
 print(f"native={native[0]}")
 PY
 
-rm -rf "\${runtime}"
-mv "\${tmp_runtime}" "\${runtime}"
-echo "ntrace_runtime=\${runtime}"
-EOF
-)
+  rm -rf "${runtime}"
+  mv "${tmp_runtime}" "${runtime}"
+  echo "ntrace_runtime=${runtime}"
+}
+
+if [[ ${1:-} == --inner ]]; then
+  build_runtime "$2" "$3"
+  exit
+fi
+
+mkdir -p "${LOG_DIR}"
+
+script_path=$(realpath "${BASH_SOURCE[0]}")
+printf -v script_path_q '%q' "${script_path}"
+printf -v ntrace_source_q '%q' "${NTRACE_SOURCE}"
+printf -v ntrace_runtime_q '%q' "${NTRACE_RUNTIME}"
+build_command="bash ${script_path_q} --inner ${ntrace_source_q} ${ntrace_runtime_q}"
 
 cmd=(
   sbatch --parsable
