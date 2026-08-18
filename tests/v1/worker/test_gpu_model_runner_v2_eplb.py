@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -206,7 +207,12 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
 
 
-def test_v2_sample_tokens_propagates_k0_and_hides_stale_drafts(monkeypatch):
+@pytest.mark.parametrize(
+    ("selected_k", "expected_width"), [(None, 2), (2, 2), (1, 1), (0, 0)]
+)
+def test_v2_sample_tokens_publishes_proposed_active_width(
+    monkeypatch, selected_k, expected_width
+):
     runner = _make_runner(num_speculative_steps=2, _draft_workspace_lane=0)
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -223,7 +229,7 @@ def test_v2_sample_tokens_propagates_k0_and_hides_stale_drafts(monkeypatch):
         finished_req_ids=set(),
         ec_connector_output=None,
         routed_experts=None,
-        num_spec_tokens_to_schedule=0,
+        num_spec_tokens_to_schedule=selected_k,
     )
     runner.pcp_manager = None
     runner.pp_handler = None
@@ -256,9 +262,12 @@ def test_v2_sample_tokens_propagates_k0_and_hides_stale_drafts(monkeypatch):
             seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
         )
     )
+    proposed_drafts = torch.tensor([[10, 11], [12, 13]], dtype=torch.int64)[
+        :, :expected_width
+    ]
     runner.speculator = SimpleNamespace(
         supports_mm_inputs=False,
-        propose=Mock(return_value=torch.empty((2, 0), dtype=torch.int64)),
+        propose=Mock(return_value=proposed_drafts),
     )
     runner.adaptive_verification = None
     runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=Mock())
@@ -272,6 +281,10 @@ def test_v2_sample_tokens_propagates_k0_and_hides_stale_drafts(monkeypatch):
 
     mrv2.GPUModelRunner.sample_tokens(runner, None)
 
-    assert runner.speculator.propose.call_args.kwargs["num_speculative_tokens"] == 0
+    assert (
+        runner.speculator.propose.call_args.kwargs["num_speculative_tokens"]
+        == selected_k
+    )
     handled_drafts = runner.draft_tokens_handler.set_draft_tokens.call_args.args[1]
-    assert handled_drafts.shape == (2, 0)
+    assert handled_drafts.shape == (2, expected_width)
+    assert torch.equal(handled_drafts, proposed_drafts)

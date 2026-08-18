@@ -275,6 +275,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs, self.num_speculative_steps
         )
 
+    def _active_draft_tokens(
+        self, num_reqs: int, selected_k: int | None
+    ) -> torch.Tensor:
+        active_k = self.num_speculative_steps if selected_k is None else selected_k
+        if not 0 <= active_k <= self.num_speculative_steps:
+            raise ValueError(
+                "num_speculative_tokens must be between 0 and "
+                f"{self.num_speculative_steps}, got {active_k}"
+            )
+        return self.draft_tokens[:num_reqs, :active_k]
+
     def _build_draft_attn_metadata(
         self,
         num_reqs: int,
@@ -368,7 +379,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
-            return self.draft_tokens[:num_reqs]
+            return self._active_draft_tokens(num_reqs, num_speculative_tokens)
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
@@ -468,7 +479,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
-        return self.draft_tokens[:num_reqs]
+        return self._active_draft_tokens(num_reqs, num_speculative_tokens)
 
 
 @triton.jit

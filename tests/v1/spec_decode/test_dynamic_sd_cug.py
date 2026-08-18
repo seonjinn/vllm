@@ -272,6 +272,83 @@ def test_dynamic_sd_parallel_drafter_keeps_physical_graph_width(
         assert desc.cg_mode == CUDAGraphMode.FULL
 
 
+@pytest.mark.parametrize(
+    ("speculator_cls", "num_query_per_req"),
+    [(DFlashSpeculator, 5), (DSparkSpeculator, 4)],
+)
+@pytest.mark.parametrize(
+    ("selected_k", "expected", "raises"),
+    [
+        (None, 4, False),
+        (4, 4, False),
+        (2, 2, False),
+        (0, 0, False),
+        (-1, 0, True),
+        (5, 0, True),
+    ],
+)
+def test_parallel_drafter_publishes_selected_width(
+    speculator_cls,
+    num_query_per_req,
+    selected_k,
+    expected,
+    raises,
+):
+    """Parallel drafters return the scheduler-selected draft-token prefix."""
+    speculator = object.__new__(speculator_cls)
+    speculator.num_speculative_steps = 4
+    speculator.num_query_per_req = num_query_per_req
+    speculator.max_model_len = 128
+    speculator.hidden_states = torch.zeros(2, 3)
+    speculator.context_positions = torch.zeros(2, dtype=torch.int64)
+    speculator.draft_tokens = torch.arange(8).view(2, 4)
+    configured_width_drafts = speculator.draft_tokens.clone()
+    speculator.model = SimpleNamespace(
+        precompute_and_store_context_kv=lambda *args: None,
+    )
+    speculator._prepare_eplb_forward = lambda *args: None
+    generated: list[tuple[tuple, dict]] = []
+
+    def record_generate(*args, **kwargs):
+        generated.append((args, kwargs))
+
+    speculator._generate_draft = record_generate
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=2,
+        seq_lens_cpu_upper_bound=torch.tensor([3, 3]),
+    )
+
+    propose_kwargs = dict(
+        input_batch=input_batch,
+        attn_metadata={},
+        slot_mappings={},
+        last_hidden_states=torch.zeros(2, 3),
+        aux_hidden_states=None,
+        num_sampled=torch.zeros(2, dtype=torch.int32),
+        num_rejected=torch.zeros(2, dtype=torch.int32),
+        last_sampled=torch.zeros(2, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(2, dtype=torch.int64),
+        temperature=torch.zeros(2),
+        seeds=torch.zeros(2, dtype=torch.int64),
+        dummy_run=True,
+        skip_attn_for_dummy_run=True,
+        num_speculative_tokens=selected_k,
+    )
+    if raises:
+        with pytest.raises(ValueError, match="num_speculative_tokens"):
+            speculator.propose(**propose_kwargs)
+    else:
+        result = speculator.propose(**propose_kwargs)
+
+    assert len(generated) == 1
+    assert generated[0][0][:2] == (2, 2 * num_query_per_req)
+    if not raises:
+        assert result.shape == (2, expected)
+        assert torch.equal(result, configured_width_drafts[:, :expected])
+    assert torch.equal(speculator.draft_tokens, configured_width_drafts)
+
+
 def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
     """DSD should use PIECEWISE when the batch is not a uniform decode batch.
 
