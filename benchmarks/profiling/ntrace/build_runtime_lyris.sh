@@ -2,18 +2,6 @@
 
 set -euo pipefail
 
-ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
-PARTITION=${PARTITION:-gb200}
-QOS=${QOS:-user-restrictions}
-WALLTIME=${WALLTIME:-00:30:00}
-CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh}
-NTRACE_SOURCE=${NTRACE_SOURCE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/source}
-NTRACE_REVISION=${NTRACE_REVISION:-$(git -C "${NTRACE_SOURCE}" rev-parse --short=8 HEAD)}
-NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-py312}
-LOG_DIR=${LOG_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271}
-DRY_RUN=${DRY_RUN:-0}
-SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
-
 build_runtime() {
   local source_root=$1
   local runtime=$2
@@ -54,6 +42,18 @@ if [[ ${1:-} == --inner ]]; then
   build_runtime "$2" "$3"
   exit
 fi
+
+ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
+PARTITION=${PARTITION:-gb200}
+QOS=${QOS:-user-restrictions}
+WALLTIME=${WALLTIME:-00:30:00}
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh}
+NTRACE_SOURCE=${NTRACE_SOURCE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/source}
+NTRACE_REVISION=${NTRACE_REVISION:-$(git -C "${NTRACE_SOURCE}" rev-parse --short=8 HEAD)}
+NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-py312}
+LOG_DIR=${LOG_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271}
+DRY_RUN=${DRY_RUN:-0}
+SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
 
 mkdir -p "${LOG_DIR}"
 
