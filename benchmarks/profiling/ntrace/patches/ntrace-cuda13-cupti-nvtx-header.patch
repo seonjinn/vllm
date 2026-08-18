@@ -1,0 +1,14 @@
+diff --git a/src/ntrace/native/cupti_cpp.cpp b/src/ntrace/native/cupti_cpp.cpp
+index 4aa6bb9..8414ac2 100644
+--- a/src/ntrace/native/cupti_cpp.cpp
++++ b/src/ntrace/native/cupti_cpp.cpp
+@@ -23,7 +23,9 @@
+ 
+ #if defined(__has_include)
+ #if __has_include(<cupti_nvtx_cbid.h>) && __has_include(<generated_nvtx_meta.h>)
++#if CUPTI_API_VERSION < 130000
+ #include <cupti_nvtx_cbid.h>
++#endif
+ #include <generated_nvtx_meta.h>
+ #define NTRACE_HAS_CUPTI_NVTX_CALLBACKS 1
+ #endif

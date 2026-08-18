@@ -5,9 +5,13 @@ set -euo pipefail
 build_runtime() {
   local source_root=$1
   local runtime=$2
+  local patch_file=$3
   local tmp_runtime="${runtime}.tmp.${SLURM_JOB_ID}"
+  local tmp_source="${runtime}.source.${SLURM_JOB_ID}"
 
-  rm -rf "${tmp_runtime}"
+  rm -rf "${tmp_runtime}" "${tmp_source}"
+  cp -a "${source_root}" "${tmp_source}"
+  patch -d "${tmp_source}" -p1 < "${patch_file}"
   export NTRACE_BUILD_CUPTI_CPP=ON
   export NTRACE_REQUIRE_CUXXFILT=ON
   export CMAKE_ARGS='-DCUDA_INCLUDE_DIR=/usr/local/cuda-13.0/targets/sbsa-linux/include -DCUDART_LIBRARY=/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so -DCUPTI_INCLUDE_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include -DCUPTI_LIBRARY=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcupti.so.13'
@@ -16,7 +20,7 @@ build_runtime() {
   uv pip install \
     --python /usr/bin/python3 \
     --target "${tmp_runtime}" \
-    "${source_root}"
+    "${tmp_source}"
   PYTHONPATH="${tmp_runtime}" /usr/bin/python3 - <<'PY'
 from pathlib import Path
 
@@ -35,11 +39,12 @@ PY
 
   rm -rf "${runtime}"
   mv "${tmp_runtime}" "${runtime}"
+  rm -rf "${tmp_source}"
   echo "ntrace_runtime=${runtime}"
 }
 
 if [[ ${1:-} == --inner ]]; then
-  build_runtime "$2" "$3"
+  build_runtime "$2" "$3" "$4"
   exit
 fi
 
@@ -50,7 +55,8 @@ WALLTIME=${WALLTIME:-00:30:00}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh}
 NTRACE_SOURCE=${NTRACE_SOURCE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/source}
 NTRACE_REVISION=${NTRACE_REVISION:-$(git -C "${NTRACE_SOURCE}" rev-parse --short=8 HEAD)}
-NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-py312}
+NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-${NTRACE_REVISION}-cuda13-py312}
+NTRACE_PATCH=${NTRACE_PATCH:-$(dirname "${BASH_SOURCE[0]}")/patches/ntrace-cuda13-cupti-nvtx-header.patch}
 LOG_DIR=${LOG_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271}
 DRY_RUN=${DRY_RUN:-0}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
@@ -61,7 +67,8 @@ script_path=$(realpath "${BASH_SOURCE[0]}")
 printf -v script_path_q '%q' "${script_path}"
 printf -v ntrace_source_q '%q' "${NTRACE_SOURCE}"
 printf -v ntrace_runtime_q '%q' "${NTRACE_RUNTIME}"
-build_command="bash ${script_path_q} --inner ${ntrace_source_q} ${ntrace_runtime_q}"
+printf -v ntrace_patch_q '%q' "$(realpath "${NTRACE_PATCH}")"
+build_command="bash ${script_path_q} --inner ${ntrace_source_q} ${ntrace_runtime_q} ${ntrace_patch_q}"
 
 cmd=(
   sbatch --parsable
@@ -71,7 +78,7 @@ cmd=(
   --nodes=1
   --time="${WALLTIME}"
   --job-name="${ACCOUNT}-sna.ntrace-build-py312"
-  --output="${LOG_DIR}/build-${NTRACE_REVISION}-py312-%j.log"
+  --output="${LOG_DIR}/build-${NTRACE_REVISION}-cuda13-py312-%j.log"
   --container-image="${CONTAINER_IMAGE}"
   --container-mounts="/lustre:/lustre"
   --wrap="${build_command}"
