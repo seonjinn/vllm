@@ -19,9 +19,15 @@ WALLTIME=${WALLTIME:-02:00:00}
 ISL=${ISL:-1000}
 OSL=${OSL:-256}
 BATCH_SIZE=${BATCH_SIZE:-8}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-12024}
 BENCH_SEED=${BENCH_SEED:-17}
 WARMUP_SEED=${WARMUP_SEED:-117}
 COMPILATION_CONFIG_JSON=${COMPILATION_CONFIG_JSON:-'{"cudagraph_capture_sizes":[8],"cudagraph_mode":"FULL_AND_PIECEWISE","splitting_ops":["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::gdn_attention_core_xpu","vllm::olmo_hybrid_gdn_full_forward","vllm::sparse_attn_indexer","vllm::rocm_aiter_sparse_attn_indexer","vllm::deepseek_v4_attention","vllm::hpc_rope_norm_forward","vllm::unified_kv_cache_update","vllm::unified_mla_kv_cache_update","vllm::mxfp8_trtllm_dispatch_linear"]}'}
+
+if ((MAX_MODEL_LEN < ISL + OSL)); then
+  echo "ERROR: MAX_MODEL_LEN=${MAX_MODEL_LEN} is smaller than ISL+OSL=$((ISL + OSL))" >&2
+  exit 2
+fi
 
 required_paths=(
   "${BENCH_ROOT}/submit_bench_lyris_nemotron3_ultra_w4a16.sh"
@@ -104,6 +110,7 @@ concurrency=${BATCH_SIZE}
 num_requests=${BATCH_SIZE}
 isl=${ISL}
 osl=${OSL}
+max_model_len=${MAX_MODEL_LEN}
 cuda_graph=FULL_AND_PIECEWISE
 linear_backend=${linear_backend}
 moe_backend=flashinfer_trtllm
@@ -137,7 +144,7 @@ EOF
     BSIZES="${BATCH_SIZE}" \
     MULT=1 \
     REQUEST_SUPPLY_MODE=continuous \
-    MAX_MODEL_LEN="$((ISL + OSL + 256))" \
+    MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
     MAX_NUM_BATCHED_TOKENS=16384 \
     SERVER_MAX_NUM_SEQS="${BATCH_SIZE}" \
     GPU_MEM=0.90 \
