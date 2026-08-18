@@ -27,6 +27,7 @@ required_paths=(
   "${BENCH_ROOT}/submit_bench_lyris_nemotron3_ultra_w4a16.sh"
   "${BENCH_ROOT}/vllm-ultra-ray-bench-serve-static.sh"
   "${BENCH_ROOT}/benchmark_vllm_bench_serve_static.py"
+  "${VLLM_SOURCE_ROOT}/benchmarks/profiling/ntrace/benchmark_with_ntrace.py"
   "${VLLM_SOURCE_ROOT}/vllm/config/profiler.py"
   "${VLLM_SOURCE_ROOT}/vllm/v1/worker/gpu_worker.py"
   "${CONTAINER_IMAGE}"
@@ -105,6 +106,8 @@ EOF
     PRECISIONS=mxfp8 \
     STAMP="${STAMP}_${variant}" \
     RUN_ROOT="${run_root}" \
+    BENCH_PY="${VLLM_SOURCE_ROOT}/benchmarks/profiling/ntrace/benchmark_with_ntrace.py" \
+    NTRACE_BENCH_TARGET="${BENCH_ROOT}/benchmark_vllm_bench_serve_static.py" \
     JOB_PREFIX="coreai_dlalgo_llm-${USER:-sna}.ntrace-${variant}" \
     CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
     CONTAINER_MOUNTS="${mount_list}" \
@@ -147,13 +150,7 @@ EOF
     SERVER_HEALTH_TIMEOUT_S=7200 \
     WALLTIME="${WALLTIME}" \
     SUBMIT_DELAY_S=0 \
-    SERVER_PROFILER=ntrace \
-    CLIENT_PROFILE=1 \
-    PROFILE_FIRST_ATTEMPT=1 \
-    NSYS_PROFILE_ENABLED=1 \
-    NSYS_BIN=true \
-    NSYS_INSTALL_IF_MISSING=0 \
-    NSYS_COPY_DELAY_S=0 \
+    NSYS_PROFILE_ENABLED=0 \
     RAY_WORKERS_USE_NSIGHT=0 \
     SERVER_NSYS_PROFILE=0 \
     FORCE_EXIT_AFTER_BENCH=1 \
