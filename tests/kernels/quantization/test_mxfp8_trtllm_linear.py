@@ -17,9 +17,12 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp8_linear_kernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    MXFP8_TRTLLM_IMPL_ENV,
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
+    _mxfp8_trtllm_impl,
     _mxfp8_trtllm_layout_config,
+    _mxfp8_trtllm_linear_direct_impl,
     _mxfp8_trtllm_linear_fixed_impl,
     mxfp8_trtllm_linear,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -37,8 +40,10 @@ def _kernel() -> FlashInferTrtllmMxfp8LinearKernel:
 
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
+    _mxfp8_trtllm_impl.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
     yield
+    _mxfp8_trtllm_impl.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
 
 
@@ -77,8 +82,74 @@ def test_mxfp8_trtllm_layout_policy_rejects_invalid_value(monkeypatch) -> None:
 
 
 def test_mxfp8_trtllm_environment_variables_are_registered() -> None:
+    assert MXFP8_TRTLLM_IMPL_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_LAYOUT_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_SWITCH_M_ENV in envs.environment_variables
+
+
+@pytest.mark.parametrize("implementation", ["flashinfer", "direct"])
+def test_mxfp8_trtllm_implementation_is_configurable(
+    monkeypatch, implementation: str
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, implementation)
+
+    assert _mxfp8_trtllm_impl() == implementation
+
+
+def test_mxfp8_trtllm_direct_impl_calls_runner_with_matching_inputs(
+    monkeypatch,
+) -> None:
+    calls: dict[str, object] = {}
+    output = torch.empty((3, 256), dtype=torch.bfloat16)
+    workspace = torch.empty((32,), dtype=torch.int8)
+
+    class Runner:
+        def forward(self, inputs: list[object], *, tactic: int) -> object:
+            calls["inputs"] = inputs
+            calls["tactic"] = tactic
+            return inputs[5]
+
+    class Module:
+        def trtllm_mxfp8_gemm_runner(self, use_8x4_sf_layout: bool) -> Runner:
+            calls["layout"] = use_8x4_sf_layout
+            return Runner()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._get_trtllm_gemm_module",
+        lambda: Module(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._get_trtllm_workspace",
+        lambda device: workspace,
+    )
+    activation = torch.empty((3, 512), dtype=torch.float8_e4m3fn)
+    weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty((128,), dtype=torch.uint8)
+    weight_scale = torch.empty((4096,), dtype=torch.uint8)
+    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: output)
+    result = _mxfp8_trtllm_linear_direct_impl(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        use_8x4_sf_layout=True,
+    )
+
+    assert result is output
+    assert calls == {
+        "layout": True,
+        "inputs": [
+            activation,
+            weight.t(),
+            activation_scale,
+            weight_scale,
+            torch.bfloat16,
+            output,
+            workspace,
+        ],
+        "tactic": -1,
+    }
 
 
 @pytest.mark.parametrize("switch_m", ["0", "-1"])
@@ -160,6 +231,50 @@ def test_mxfp8_trtllm_fixed_impl_uses_matching_scale_layout(
     }
     assert output.shape == (3, 130)
     assert output.is_contiguous()
+
+
+def test_mxfp8_trtllm_fixed_impl_selects_direct_runner(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, "direct")
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.vllm_flashinfer.flashinfer_mxfp8_quantize_8x4",
+        lambda x: (
+            torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            torch.empty((128,), dtype=torch.uint8),
+        ),
+        raising=False,
+    )
+
+    def direct_impl(*args, **kwargs) -> torch.Tensor:
+        calls.append("direct")
+        return torch.ones(
+            (args[0].shape[0], args[1].shape[0]), dtype=kwargs["out_dtype"]
+        )
+
+    def wrong_wrapper(*args, **kwargs) -> torch.Tensor:
+        raise AssertionError("selected the FlashInfer wrapper")
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_linear_direct_impl",
+        direct_impl,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.vllm_flashinfer.mm_mxfp8",
+        wrong_wrapper,
+        raising=False,
+    )
+
+    output = _mxfp8_trtllm_linear_fixed_impl(
+        torch.zeros((3, 512), dtype=torch.bfloat16),
+        torch.zeros((256, 512), dtype=torch.float8_e4m3fn),
+        torch.zeros((4096,), dtype=torch.uint8),
+        130,
+        use_8x4_sf_layout=True,
+    )
+
+    assert calls == ["direct"]
+    assert output.shape == (3, 130)
 
 
 def test_mxfp8_trtllm_adaptive_op_uses_runtime_shape(monkeypatch) -> None:

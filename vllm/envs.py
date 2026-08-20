@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
+    VLLM_MXFP8_TRTLLM_IMPL: Literal["flashinfer", "direct"] = "flashinfer"
     VLLM_MXFP8_TRTLLM_LAYOUT: Literal["8x4", "128x4", "adaptive"] = "8x4"
     VLLM_MXFP8_TRTLLM_SWITCH_M: int = 256
     VLLM_ROCM_USE_AITER: bool = False
@@ -1190,6 +1191,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": lambda: (
         os.getenv("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower()
         in ("true", "1")
+    ),
+    "VLLM_MXFP8_TRTLLM_IMPL": env_with_choices(
+        "VLLM_MXFP8_TRTLLM_IMPL",
+        "flashinfer",
+        ["flashinfer", "direct"],
     ),
     "VLLM_MXFP8_TRTLLM_LAYOUT": env_with_choices(
         "VLLM_MXFP8_TRTLLM_LAYOUT",
