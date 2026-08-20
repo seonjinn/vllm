@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import cache
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -22,11 +22,17 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_TRTLLM_LAYOUT"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_TRTLLM_SWITCH_M"
+MXFP8_TRTLLM_IMPL_ENV = "VLLM_MXFP8_TRTLLM_IMPL"
 
 
 class _Mxfp8TrtllmLayoutConfig(NamedTuple):
     policy: str
     switch_m: int | None
+
+
+@cache
+def _mxfp8_trtllm_impl() -> str:
+    return envs.VLLM_MXFP8_TRTLLM_IMPL
 
 
 @cache
@@ -53,6 +59,54 @@ def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
     return m <= config.switch_m
 
 
+def _get_trtllm_gemm_module() -> Any:
+    from flashinfer.gemm.gemm_base import get_trtllm_gemm_module
+
+    return get_trtllm_gemm_module()
+
+
+def _get_trtllm_workspace(device: torch.device) -> torch.Tensor:
+    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE
+    from flashinfer.utils import _get_cache_buf
+
+    return _get_cache_buf(
+        "vllm_mxfp8_trtllm_direct_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        device,
+    )
+
+
+def _mxfp8_trtllm_linear_direct_impl(
+    input_mxfp8: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    out_dtype: torch.dtype,
+    use_8x4_sf_layout: bool,
+) -> torch.Tensor:
+    output = torch.empty(
+        (input_mxfp8.shape[0], weight.shape[0]),
+        dtype=out_dtype,
+        device=input_mxfp8.device,
+    )
+    workspace = _get_trtllm_workspace(input_mxfp8.device)
+    runner = _get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(use_8x4_sf_layout)
+    runner.forward(
+        [
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype,
+            output,
+            workspace,
+        ],
+        tactic=-1,
+    )
+    return output
+
+
 def _mxfp8_trtllm_linear_fixed_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -67,15 +121,25 @@ def _mxfp8_trtllm_linear_fixed_impl(
         else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
     )
     input_mxfp8, input_scale = quantize(x)
-    output = vllm_flashinfer.mm_mxfp8(
-        input_mxfp8,
-        weight.t(),
-        input_scale,
-        weight_scale,
-        out_dtype=x.dtype,
-        backend="trtllm",
-        use_8x4_sf_layout=use_8x4_sf_layout,
-    )
+    if _mxfp8_trtllm_impl() == "direct":
+        output = _mxfp8_trtllm_linear_direct_impl(
+            input_mxfp8,
+            weight,
+            input_scale,
+            weight_scale,
+            out_dtype=x.dtype,
+            use_8x4_sf_layout=use_8x4_sf_layout,
+        )
+    else:
+        output = vllm_flashinfer.mm_mxfp8(
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype=x.dtype,
+            backend="trtllm",
+            use_8x4_sf_layout=use_8x4_sf_layout,
+        )
     return output[:, :output_features].contiguous()
 
 
