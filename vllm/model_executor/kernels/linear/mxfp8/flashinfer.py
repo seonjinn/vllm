@@ -107,12 +107,11 @@ def _mxfp8_trtllm_linear_direct_impl(
     return output
 
 
-def _mxfp8_trtllm_linear_fixed_impl(
+def _mxfp8_trtllm_direct_linear_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     output_features: int,
-    *,
     use_8x4_sf_layout: bool,
 ) -> torch.Tensor:
     quantize = (
@@ -121,25 +120,59 @@ def _mxfp8_trtllm_linear_fixed_impl(
         else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
     )
     input_mxfp8, input_scale = quantize(x)
+    output = _mxfp8_trtllm_linear_direct_impl(
+        input_mxfp8,
+        weight,
+        input_scale,
+        weight_scale,
+        out_dtype=x.dtype,
+        use_8x4_sf_layout=use_8x4_sf_layout,
+    )
+    return output[:, :output_features].contiguous()
+
+
+def _mxfp8_trtllm_direct_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+    use_8x4_sf_layout: bool,
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], output_features), dtype=x.dtype, device=x.device)
+
+
+def _mxfp8_trtllm_linear_fixed_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+    *,
+    use_8x4_sf_layout: bool,
+) -> torch.Tensor:
     if _mxfp8_trtllm_impl() == "direct":
-        output = _mxfp8_trtllm_linear_direct_impl(
-            input_mxfp8,
+        return torch.ops.vllm.mxfp8_trtllm_direct_linear(
+            x,
             weight,
-            input_scale,
             weight_scale,
-            out_dtype=x.dtype,
-            use_8x4_sf_layout=use_8x4_sf_layout,
+            output_features,
+            use_8x4_sf_layout,
         )
-    else:
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            out_dtype=x.dtype,
-            backend="trtllm",
-            use_8x4_sf_layout=use_8x4_sf_layout,
-        )
+
+    quantize = (
+        vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+        if use_8x4_sf_layout
+        else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
+    )
+    input_mxfp8, input_scale = quantize(x)
+    output = vllm_flashinfer.mm_mxfp8(
+        input_mxfp8,
+        weight.t(),
+        input_scale,
+        weight_scale,
+        out_dtype=x.dtype,
+        backend="trtllm",
+        use_8x4_sf_layout=use_8x4_sf_layout,
+    )
     return output[:, :output_features].contiguous()
 
 
@@ -185,6 +218,13 @@ def _mxfp8_trtllm_linear_fake(
     output_features: int,
 ) -> torch.Tensor:
     return torch.empty((x.shape[0], output_features), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_direct_linear",
+    op_func=_mxfp8_trtllm_direct_linear_impl,
+    fake_impl=_mxfp8_trtllm_direct_linear_fake,
+)
 
 
 direct_register_custom_op(
