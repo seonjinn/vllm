@@ -6,11 +6,13 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
 
 import vllm.envs as envs
+import vllm.utils.flashinfer as fi_utils
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
@@ -235,7 +237,6 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     from flashinfer.autotuner import AutoTuner, set_autotune_process_group
 
-    import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
     world = get_world_group()
@@ -286,7 +287,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     try:
         with (
             torch.inference_mode(),
-            fi_utils.autotune(tune_mode=True, **autotune_kwargs),
+            _flashinfer_autotune_context(autotune_kwargs),
         ):
             runner._dummy_run(**dummy_run_kwargs)
     finally:
@@ -296,3 +297,30 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
     if is_leader:
         tuner.save_configs(str(cache_path))
+
+
+def _flashinfer_autotune_context(
+    autotune_kwargs: dict[str, object],
+) -> AbstractContextManager[None]:
+    if not envs.VLLM_FLASHINFER_AUTOTUNE_USE_V2:
+        return fi_utils.autotune(tune_mode=True, **autotune_kwargs)
+
+    from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2
+
+    policy = MeasurementPolicy(
+        execution_mode="cuda_graph",
+        cold_l2=True,
+        refinement_top_k=envs.VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_TOP_K,
+        refinement_rounds=envs.VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_ROUNDS,
+    )
+    logger.info_once(
+        "Using FlashInfer AutoTuner v2 with top-k=%d and rounds=%d",
+        envs.VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_TOP_K,
+        envs.VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_ROUNDS,
+    )
+    return autotune_v2(
+        mode="tune",
+        persistent_cache=False,
+        measurement_policy=policy,
+        **autotune_kwargs,
+    )

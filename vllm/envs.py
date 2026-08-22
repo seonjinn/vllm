@@ -213,6 +213,9 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
+    VLLM_FLASHINFER_AUTOTUNE_USE_V2: bool = False
+    VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_TOP_K: int = 1
+    VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_ROUNDS: int = 1
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1720,6 +1723,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             if v.strip()
         ]
     ),
+    "VLLM_FLASHINFER_AUTOTUNE_USE_V2": lambda: (
+        os.getenv("VLLM_FLASHINFER_AUTOTUNE_USE_V2", "0").lower() in ("1", "true")
+    ),
+    "VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_TOP_K": lambda: int(
+        os.getenv("VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_TOP_K", "1")
+    ),
+    "VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_ROUNDS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_ROUNDS", "1")
+    ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
@@ -2255,6 +2267,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        "VLLM_FLASHINFER_AUTOTUNE_USE_V2",
+        "VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_TOP_K",
+        "VLLM_FLASHINFER_AUTOTUNE_REFINEMENT_ROUNDS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
