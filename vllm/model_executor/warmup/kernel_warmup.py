@@ -320,7 +320,7 @@ def _flashinfer_autotune_context(
     )
     return autotune_v2(
         mode="tune",
-        persistent_cache=False,
+        persistent_cache=True,
         measurement_policy=policy,
         **autotune_kwargs,
     )

@@ -52,7 +52,7 @@ def test_flashinfer_v2_policy_matches_serving_objective(
     assert isinstance(autotune_call, dict)
     assert autotune_call == {
         "mode": "tune",
-        "persistent_cache": False,
+        "persistent_cache": True,
         "measurement_policy": autotune_call["measurement_policy"],
         "skip_ops": {"fp4_gemm"},
     }
