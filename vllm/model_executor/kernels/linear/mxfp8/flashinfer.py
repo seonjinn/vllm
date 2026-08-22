@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
-from vllm.utils.flashinfer import has_flashinfer_cutedsl
+from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
