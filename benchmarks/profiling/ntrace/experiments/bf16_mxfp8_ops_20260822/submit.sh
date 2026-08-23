@@ -54,12 +54,12 @@ runtime_override_files=(
 for phase in ${PHASES}; do
   case "${phase}" in
     prefill)
-      scenario=longin
+      scenario=short
       isl=10000
       osl=1
       ;;
     decode)
-      scenario=shortin
+      scenario=short
       isl=1000
       osl=256
       ;;
@@ -148,10 +148,10 @@ EOF
       MXFP8_MOE_BACKEND=flashinfer_trtllm \
       COMPILATION_CONFIG_JSON="${compilation_config}" \
       SCENARIOS_TO_RUN="${scenario}" \
-      ISL_SHORT_VALUE=1000 \
-      ISL_LONG_VALUE=10000 \
-      OSL_SHORT_VALUE=1 \
-      OSL_LONG_VALUE=256 \
+      ISL_SHORT_VALUE="${isl}" \
+      ISL_LONG_VALUE="${isl}" \
+      OSL_SHORT_VALUE="${osl}" \
+      OSL_LONG_VALUE="${osl}" \
       BSIZES="${CONCURRENCY}" \
       MULT=1 \
       REQUEST_SUPPLY_MODE=fixed-batch \
