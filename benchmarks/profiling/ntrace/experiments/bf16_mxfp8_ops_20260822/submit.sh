@@ -54,12 +54,12 @@ runtime_override_files=(
 for phase in ${PHASES}; do
   case "${phase}" in
     prefill)
-      scenario=short
+      scenario=shortin
       isl=10000
       osl=1
       ;;
     decode)
-      scenario=short
+      scenario=shortin
       isl=1000
       osl=256
       ;;
@@ -131,6 +131,8 @@ EOF
       RUN_ROOT="${run_root}" \
       BENCH_PY="${VLLM_SOURCE_ROOT}/benchmarks/profiling/ntrace/benchmark_with_ntrace.py" \
       NTRACE_BENCH_TARGET="${BENCH_ROOT}/benchmark_vllm_bench_serve_static.py" \
+      NTRACE_EXPECTED_ISL="${isl}" \
+      NTRACE_EXPECTED_OSL="${osl}" \
       JOB_PREFIX="coreai_dlalgo_llm-${USER:-sna}.ops-${phase}-${scope}" \
       CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
       JOB_CACHE_DIR="${BENCH_ROOT}/.container_cache" \
@@ -149,8 +151,6 @@ EOF
       COMPILATION_CONFIG_JSON="${compilation_config}" \
       SCENARIOS_TO_RUN="${scenario}" \
       ISL_SHORT_VALUE="${isl}" \
-      ISL_LONG_VALUE="${isl}" \
-      OSL_SHORT_VALUE="${osl}" \
       OSL_LONG_VALUE="${osl}" \
       BSIZES="${CONCURRENCY}" \
       MULT=1 \
