@@ -190,6 +190,134 @@ def _write_run(
     return run_dir
 
 
+def _hierarchy_node(
+    node_id: int,
+    *,
+    name: str,
+    start_ns: int,
+    direct_module: str | None = None,
+    direct_operation: str | None = None,
+    is_norm: bool = False,
+    is_dense: bool = False,
+    is_communication: bool = False,
+) -> dict[str, object]:
+    return {
+        "node_id": node_id,
+        "name": name,
+        "start_ns": start_ns,
+        "stream_id": 7,
+        "mean_duration_ns": 10,
+        "direct_module": direct_module,
+        "direct_operation": direct_operation,
+        "is_norm": is_norm,
+        "is_dense": is_dense,
+        "is_communication": is_communication,
+        "mixer_id": node_id if direct_module in {"mamba", "attention"} else None,
+    }
+
+
+def test_hierarchy_classifier_splits_routed_w13_and_w2() -> None:
+    frames = [
+        {
+            "filename": "/opt/vllm/fused_moe/routed_experts.py",
+            "funcname": "forward_monolithic",
+        }
+    ]
+
+    assert analyze_runs.classify_hierarchy_direct(
+        "bmm_Bfloat16_Bfloat16Bfloat16_Fp32_relu2_sm100f", frames
+    ) == ("moe", "routed W13 + activation")
+    assert analyze_runs.classify_hierarchy_direct(
+        "bmm_Bfloat16_Bfloat16Bfloat16_Fp32_sm100f", frames
+    ) == ("moe", "routed W2")
+    assert analyze_runs.classify_hierarchy_direct(
+        "bmm_MxE4m3_MxE4m3MxE4m3_Fp32_relu2_sm100f", frames
+    ) == ("moe", "routed W13 + activation")
+    assert analyze_runs.classify_hierarchy_direct(
+        "bmm_Bfloat16_MxE4m3MxE4m3_Fp32_sm100f", frames
+    ) == ("moe", "routed W2")
+
+
+def test_hierarchy_segments_modules_and_leaves_final_norm_outside_moe() -> None:
+    nodes = [
+        _hierarchy_node(0, name="embedding", start_ns=0),
+        _hierarchy_node(1, name="rms_norm", start_ns=10, is_norm=True),
+        _hierarchy_node(2, name="mamba_in", start_ns=20, is_dense=True),
+        _hierarchy_node(
+            3,
+            name="causal_conv",
+            start_ns=30,
+            direct_module="mamba",
+            direct_operation="causal conv",
+        ),
+        _hierarchy_node(4, name="mamba_out", start_ns=40, is_dense=True),
+        _hierarchy_node(5, name="all_reduce", start_ns=50, is_communication=True),
+        _hierarchy_node(6, name="rms_norm", start_ns=60, is_norm=True),
+        _hierarchy_node(7, name="qkv", start_ns=70, is_dense=True),
+        _hierarchy_node(
+            8,
+            name="fmha",
+            start_ns=80,
+            direct_module="attention",
+            direct_operation="attention core",
+        ),
+        _hierarchy_node(9, name="o_proj", start_ns=90, is_dense=True),
+        _hierarchy_node(10, name="all_reduce", start_ns=100, is_communication=True),
+        _hierarchy_node(11, name="rms_norm", start_ns=110, is_norm=True),
+        _hierarchy_node(12, name="router", start_ns=120, is_dense=True),
+        _hierarchy_node(
+            13,
+            name="routing",
+            start_ns=130,
+            direct_module="moe",
+            direct_operation="routing/top-k",
+        ),
+        _hierarchy_node(
+            19,
+            name="routing_cooperative",
+            start_ns=135,
+            direct_module="moe",
+            direct_operation="routing/top-k",
+        ),
+        _hierarchy_node(
+            14,
+            name="w13",
+            start_ns=140,
+            direct_module="moe",
+            direct_operation="routed W13 + activation",
+        ),
+        _hierarchy_node(
+            15,
+            name="w2",
+            start_ns=150,
+            direct_module="moe",
+            direct_operation="routed W2",
+        ),
+        _hierarchy_node(
+            16,
+            name="finalize",
+            start_ns=160,
+            direct_module="moe",
+            direct_operation="finalize/scatter",
+        ),
+        _hierarchy_node(17, name="all_reduce", start_ns=170, is_communication=True),
+        _hierarchy_node(18, name="rms_norm", start_ns=180, is_norm=True),
+    ]
+
+    assignments, component_counts = analyze_runs.attribute_main_stream_hierarchy(nodes)
+
+    assert component_counts == {"mamba": 1, "attention": 1, "moe": 1}
+    assert assignments[2] == ("mamba", "input projection")
+    assert assignments[4] == ("mamba", "output projection")
+    assert assignments[5] == ("mamba", "TP all-reduce")
+    assert assignments[7] == ("attention", "QKV projection")
+    assert assignments[9] == ("attention", "O projection")
+    assert assignments[12] == ("moe", "router projection")
+    assert assignments[17] == ("moe", "TP all-reduce")
+    assert 0 not in assignments
+    assert 18 not in assignments
+
+
 def test_summarize_trace_clips_filters_orders_and_aggregates(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     records = [

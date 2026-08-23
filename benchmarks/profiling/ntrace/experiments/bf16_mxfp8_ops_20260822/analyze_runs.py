@@ -170,6 +170,536 @@ def classify_kernel(name: str) -> str:
     return "other"
 
 
+def classify_hierarchy_direct(
+    name: str, frames: Sequence[Mapping[str, Any]]
+) -> tuple[str, str] | None:
+    lower = name.lower()
+    functions = {str(frame.get("funcname", "")) for frame in frames}
+    files = " ".join(str(frame.get("filename", "")) for frame in frames)
+
+    if "forward_monolithic" in functions:
+        if "quantize" in lower:
+            return "moe", "activation quantize"
+        if "routing::" in lower:
+            return "moe", "routing/top-k"
+        if "finalize" in lower:
+            return "moe", "finalize/scatter"
+        if "bmm_" in lower:
+            operation = "routed W13 + activation" if "relu2" in lower else "routed W2"
+            return "moe", operation
+        return "moe", "routed other"
+
+    if "shared_experts.py" in files:
+        operation = "shared activation" if "relu" in lower else "shared GEMM"
+        return "moe", operation
+
+    if "mamba_mixer2.py" in files or "mamba_ssm.py" in files:
+        if "causal_conv" in lower:
+            return "mamba", "causal conv"
+        if any(token in lower for token in ("selective", "scan", "state")):
+            return "mamba", "selective state update"
+        return "mamba", "state/cache index update"
+
+    attention_functions = {
+        "unified_attention_with_output",
+        "unified_kv_cache_update",
+        "do_kv_cache_update",
+        "trtllm_batch_decode_with_kv_cache",
+        "trtllm_batch_context_with_kv_cache",
+    }
+    if functions & attention_functions:
+        if "reshape_and_cache" in lower:
+            return "attention", "KV cache update"
+        if "fmha" in lower:
+            return "attention", "attention core"
+        return "attention", "attention setup/copy"
+    return None
+
+
+def _operation_for_segment_node(
+    node: Mapping[str, Any],
+    module: str,
+    position: int,
+    first_direct: int,
+    last_direct: int,
+) -> str:
+    if node.get("direct_module") == module and node.get("direct_operation"):
+        return str(node["direct_operation"])
+
+    before_core = position < first_direct
+    after_core = position > last_direct
+    is_dense = bool(node.get("is_dense"))
+    is_norm = bool(node.get("is_norm"))
+    is_communication = bool(node.get("is_communication"))
+
+    if module == "mamba":
+        if before_core:
+            if is_dense:
+                return "input projection"
+            return "input norm" if is_norm else "input setup"
+        if after_core:
+            if is_dense:
+                return "output projection"
+            if is_communication:
+                return "TP all-reduce"
+            return "output norm/gate" if is_norm else "output gate/residual"
+        return "state/core other"
+
+    if module == "attention":
+        if before_core:
+            if is_dense:
+                return "QKV projection"
+            return "input norm" if is_norm else "QKV setup/RoPE"
+        if after_core:
+            if is_dense:
+                return "O projection"
+            if is_communication:
+                return "TP all-reduce"
+            return "output norm" if is_norm else "output/residual"
+        return "attention core other"
+
+    if before_core:
+        if is_dense:
+            return "router projection"
+        return "input norm" if is_norm else "router setup"
+    if after_core:
+        if is_communication:
+            return "TP all-reduce"
+        if is_dense:
+            return "shared gate/combine GEMM"
+        return "output norm" if is_norm else "shared gate/combine"
+    return "routed other"
+
+
+def attribute_main_stream_hierarchy(
+    nodes: Sequence[Mapping[str, Any]],
+) -> tuple[dict[Any, tuple[str, str]], dict[str, int]]:
+    ordered = sorted(nodes, key=lambda node: int(node["start_ns"]))
+    anchors: list[tuple[int, str, object]] = []
+    seen_mixers: set[tuple[str, object]] = set()
+    for position, node in enumerate(ordered):
+        module = node.get("direct_module")
+        operation = node.get("direct_operation")
+        if module in {"mamba", "attention"}:
+            anchor_operation = {
+                "mamba": "causal conv",
+                "attention": "attention core",
+            }[str(module)]
+            if operation != anchor_operation:
+                continue
+            key = (str(module), node.get("mixer_id", position))
+            if key in seen_mixers:
+                continue
+            seen_mixers.add(key)
+            anchors.append((position, str(module), key))
+        elif module == "moe" and operation == "routing/top-k":
+            if (
+                anchors
+                and anchors[-1][1] == "moe"
+                and not any(
+                    ordered[index].get("is_norm")
+                    for index in range(anchors[-1][0] + 1, position + 1)
+                )
+            ):
+                continue
+            anchors.append((position, "moe", node["node_id"]))
+
+    starts: list[tuple[int, str, object, int]] = []
+    previous_start = -1
+    for anchor_position, module, key in anchors:
+        norm_positions = [
+            position
+            for position in range(previous_start + 1, anchor_position + 1)
+            if ordered[position].get("is_norm")
+        ]
+        if not norm_positions:
+            raise ValidationError(
+                f"cannot find input norm before {module} anchor {key!r}"
+            )
+        start = norm_positions[-1]
+        starts.append((start, module, key, anchor_position))
+        previous_start = start
+
+    assignments: dict[Any, tuple[str, str]] = {}
+    counts = Counter(module for _, module, _, _ in starts)
+    for segment_index, (start, module, _, anchor_position) in enumerate(starts):
+        if segment_index + 1 < len(starts):
+            end = starts[segment_index + 1][0]
+        else:
+            trailing_norm = next(
+                (
+                    position
+                    for position in range(anchor_position + 1, len(ordered))
+                    if ordered[position].get("is_norm")
+                ),
+                len(ordered),
+            )
+            end = trailing_norm
+
+        direct_positions = [
+            position
+            for position in range(start, end)
+            if ordered[position].get("direct_module") == module
+        ]
+        first_direct = min(direct_positions, default=anchor_position)
+        last_direct = max(direct_positions, default=anchor_position)
+        for position in range(start, end):
+            node = ordered[position]
+            operation = _operation_for_segment_node(
+                node, module, position, first_direct, last_direct
+            )
+            assignments[node["node_id"]] = module, operation
+    return assignments, dict(counts)
+
+
+def _hierarchy_kernel_flags(name: str) -> tuple[bool, bool, bool]:
+    lower = name.lower()
+    is_norm = any(
+        token in lower for token in ("rms_norm", "rmsnorm", "layer_norm", "layernorm")
+    )
+    is_dense = (
+        any(token in lower for token in ("nvjet_sm", "cublaslt::splitkreduce", "gemm"))
+        and "bmm_" not in lower
+    )
+    is_communication = any(
+        token in lower
+        for token in ("all_reduce", "allreduce", "nccl", "multimem_all_reduce")
+    )
+    return is_norm, is_dense, is_communication
+
+
+def _make_hierarchy_node(
+    *,
+    node_id: Any,
+    name: str,
+    start_ns: int,
+    stream_id: Any,
+    durations_ns: Sequence[int],
+    frames: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    direct = classify_hierarchy_direct(name, frames)
+    is_norm, is_dense, is_communication = _hierarchy_kernel_flags(name)
+    return {
+        "node_id": node_id,
+        "name": name,
+        "start_ns": start_ns,
+        "stream_id": stream_id,
+        "mean_duration_ns": sum(durations_ns) / len(durations_ns),
+        "direct_module": direct[0] if direct else None,
+        "direct_operation": direct[1] if direct else None,
+        "is_norm": is_norm,
+        "is_dense": is_dense,
+        "is_communication": is_communication,
+    }
+
+
+def _attribute_shared_experts(
+    nodes: Sequence[Mapping[str, Any]],
+    assignments: dict[Any, tuple[str, str]],
+) -> None:
+    shared = sorted(
+        (
+            node
+            for node in nodes
+            if node.get("direct_module") == "moe"
+            and node.get("direct_operation") in {"shared GEMM", "shared activation"}
+        ),
+        key=lambda node: int(node["start_ns"]),
+    )
+    for position, node in enumerate(shared):
+        operation = str(node["direct_operation"])
+        if operation == "shared GEMM":
+            next_activation = next(
+                (
+                    index
+                    for index in range(position + 1, len(shared))
+                    if shared[index].get("direct_operation") == "shared activation"
+                ),
+                None,
+            )
+            operation = (
+                "shared W13/up-gate"
+                if next_activation is not None and next_activation - position <= 2
+                else "shared W2/down"
+            )
+        assignments[node["node_id"]] = "moe", operation
+
+
+def _attribute_remaining_hierarchy_nodes(
+    nodes: Sequence[Mapping[str, Any]],
+    assignments: dict[Any, tuple[str, str]],
+) -> None:
+    for node in nodes:
+        if node["node_id"] in assignments:
+            continue
+        if node.get("is_communication"):
+            operation = "other communication"
+        elif node.get("is_dense"):
+            operation = "embedding/logits GEMM"
+        elif node.get("is_norm"):
+            operation = "final/initial norm"
+        else:
+            operation = "setup/residual/other"
+        assignments[node["node_id"]] = "other", operation
+
+
+def _summarize_hierarchy_assignments(
+    nodes: Sequence[Mapping[str, Any]],
+    assignments: Mapping[Any, tuple[str, str]],
+    component_counts: Mapping[str, int],
+) -> dict[str, Any]:
+    if len(assignments) != len(nodes):
+        raise ValidationError(
+            f"hierarchy assigned {len(assignments)} of {len(nodes)} nodes"
+        )
+    operation_totals: dict[tuple[str, str], list[float | int]] = defaultdict(
+        lambda: [0.0, 0]
+    )
+    for node in nodes:
+        module, operation = assignments[node["node_id"]]
+        totals = operation_totals[module, operation]
+        totals[0] += float(node["mean_duration_ns"])
+        totals[1] += 1
+
+    kernel_sum_ns = sum(float(node["mean_duration_ns"]) for node in nodes)
+    modules: dict[str, Any] = {}
+    for module in ("moe", "mamba", "attention", "other"):
+        operations = {
+            operation: {
+                "time_ns": time_ns,
+                "node_count": node_count,
+                "share_of_kernel_sum": time_ns / kernel_sum_ns
+                if kernel_sum_ns
+                else None,
+            }
+            for (owner, operation), (time_ns, node_count) in sorted(
+                operation_totals.items(), key=lambda item: (-item[1][0], item[0])
+            )
+            if owner == module
+        }
+        time_ns = sum(item["time_ns"] for item in operations.values())
+        modules[module] = {
+            "time_ns": time_ns,
+            "share_of_kernel_sum": time_ns / kernel_sum_ns if kernel_sum_ns else None,
+            "operations": operations,
+        }
+
+    attributed_sum_ns = sum(module["time_ns"] for module in modules.values())
+    if not math.isclose(attributed_sum_ns, kernel_sum_ns, rel_tol=0, abs_tol=1e-3):
+        raise ValidationError(
+            "hierarchy operation totals do not reconcile with kernel sum: "
+            f"{attributed_sum_ns} != {kernel_sum_ns}"
+        )
+    return {
+        "kernel_sum_ns": kernel_sum_ns,
+        "component_counts": dict(component_counts),
+        "modules": modules,
+        "reconciliation": {
+            "node_count": len(nodes),
+            "assigned_node_count": len(assignments),
+            "attributed_sum_ns": attributed_sum_ns,
+            "difference_ns": attributed_sum_ns - kernel_sum_ns,
+        },
+    }
+
+
+def _read_hierarchy_sidecars(
+    records_path: Path,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[int, list[dict[str, Any]]],
+    dict[tuple[Any, Any], tuple[Any, Any]],
+]:
+    stacks_path = records_path.with_name("ntrace_stacks_rank0.parquet")
+    graph_nodes_path = records_path.with_name("ntrace_graph_nodes_rank0.parquet")
+    if not stacks_path.is_file() or not graph_nodes_path.is_file():
+        raise ValidationError(
+            "hierarchical analysis requires ntrace stack and graph-node sidecars"
+        )
+    try:
+        records = pq.read_table(records_path).to_pylist()
+        stack_rows = pq.read_table(stacks_path).to_pylist()
+        edge_rows = pq.read_table(graph_nodes_path).to_pylist()
+    except Exception as error:
+        raise ValidationError(f"cannot read hierarchy sidecars: {error}") from error
+    stacks = {int(row["stack_id"]): row["frames"] for row in stack_rows}
+    parents = {
+        (row["graph_id"], row["graph_node_id"]): (
+            row["original_graph_id"],
+            row["original_graph_node_id"],
+        )
+        for row in edge_rows
+    }
+    return records, stacks, parents
+
+
+def _resolve_capture_key(
+    key: tuple[Any, Any],
+    captures: Mapping[tuple[Any, Any], Mapping[str, Any]],
+    parents: Mapping[tuple[Any, Any], tuple[Any, Any]],
+) -> tuple[Any, Any]:
+    visited: set[tuple[Any, Any]] = set()
+    while key not in captures and key in parents and key not in visited:
+        visited.add(key)
+        key = parents[key]
+    if key not in captures:
+        raise ValidationError(f"cannot resolve capture stack for graph node {key!r}")
+    return key
+
+
+def _decode_hierarchy(
+    records: Sequence[Mapping[str, Any]],
+    stacks: Mapping[int, Sequence[Mapping[str, Any]]],
+    parents: Mapping[tuple[Any, Any], tuple[Any, Any]],
+) -> dict[str, Any]:
+    captures = {
+        (record["graph_id"], record["graph_node_id"]): record
+        for record in records
+        if record.get("source") == "capture"
+    }
+    replay_records = [record for record in records if record.get("source") == "replay"]
+    if not replay_records:
+        raise ValidationError("decode hierarchy found no graph replay records")
+    graph_counts = Counter(record["graph_id"] for record in replay_records)
+    graph_id = graph_counts.most_common(1)[0][0]
+    dominant = [record for record in replay_records if record["graph_id"] == graph_id]
+    by_node: dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
+    for record in dominant:
+        if record.get("duration_ns") and record.get("start_ns") is not None:
+            by_node[record["graph_node_id"]].append(record)
+    for occurrences in by_node.values():
+        occurrences.sort(key=lambda record: int(record["start_ns"]))
+    replay_count = Counter(len(items) for items in by_node.values()).most_common(1)[0][
+        0
+    ]
+    representative_index = replay_count // 2
+
+    nodes: list[dict[str, Any]] = []
+    for node_id, occurrences in by_node.items():
+        if len(occurrences) != replay_count:
+            continue
+        representative = occurrences[representative_index]
+        capture_key = _resolve_capture_key((graph_id, node_id), captures, parents)
+        capture = captures[capture_key]
+        stack_id = capture.get("stack_id")
+        if stack_id is None or int(stack_id) not in stacks:
+            raise ValidationError(f"missing stack for graph node {node_id!r}")
+        name = (
+            representative.get("kernel_name_demangled")
+            or representative.get("symbol_name")
+            or "<unknown>"
+        )
+        nodes.append(
+            _make_hierarchy_node(
+                node_id=node_id,
+                name=str(name),
+                start_ns=int(representative["start_ns"]),
+                stream_id=representative.get("stream_id"),
+                durations_ns=[int(record["duration_ns"]) for record in occurrences],
+                frames=stacks[int(stack_id)],
+            )
+        )
+
+    main_stream = Counter(node["stream_id"] for node in nodes).most_common(1)[0][0]
+    main_nodes = [node for node in nodes if node["stream_id"] == main_stream]
+    assignments, component_counts = attribute_main_stream_hierarchy(main_nodes)
+    _attribute_shared_experts(nodes, assignments)
+    _attribute_remaining_hierarchy_nodes(nodes, assignments)
+    summary = _summarize_hierarchy_assignments(nodes, assignments, component_counts)
+    summary.update(
+        {
+            "mode": "decode_cuda_graph_mean_per_replay",
+            "graph_id": graph_id,
+            "replay_count": replay_count,
+            "main_stream_id": main_stream,
+        }
+    )
+    return summary
+
+
+def _prefill_hierarchy(
+    records_path: Path,
+    records: Sequence[Mapping[str, Any]],
+    stacks: Mapping[int, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    schema = pq.read_schema(records_path)
+    windows = _decode_windows(schema.metadata)
+    nodes: list[dict[str, Any]] = []
+    for row_index, record in enumerate(records):
+        if record.get("source") != "non_graph":
+            continue
+        start_ns = record.get("start_ns")
+        duration_ns = record.get("duration_ns")
+        stack_id = record.get("stack_id")
+        if (
+            start_ns is None
+            or duration_ns is None
+            or duration_ns <= 0
+            or stack_id is None
+            or int(stack_id) not in stacks
+        ):
+            continue
+        clipped = _intersections(
+            int(start_ns), int(start_ns) + int(duration_ns), windows
+        )
+        if not clipped:
+            continue
+        name = (
+            record.get("kernel_name_demangled")
+            or record.get("symbol_name")
+            or "<unknown>"
+        )
+        nodes.append(
+            _make_hierarchy_node(
+                node_id=row_index,
+                name=str(name),
+                start_ns=clipped[0][0],
+                stream_id=record.get("stream_id"),
+                durations_ns=[sum(end - start for start, end in clipped)],
+                frames=stacks[int(stack_id)],
+            )
+        )
+
+    main_stream = Counter(node["stream_id"] for node in nodes).most_common(1)[0][0]
+    main_nodes = [node for node in nodes if node["stream_id"] == main_stream]
+    assignments, component_counts = attribute_main_stream_hierarchy(main_nodes)
+    _attribute_shared_experts(nodes, assignments)
+    _attribute_remaining_hierarchy_nodes(nodes, assignments)
+    summary = _summarize_hierarchy_assignments(nodes, assignments, component_counts)
+    summary.update(
+        {
+            "mode": "prefill_workload_kernel_sum",
+            "main_stream_id": main_stream,
+        }
+    )
+    return summary
+
+
+def summarize_hierarchy(records_path: Path, phase: str) -> dict[str, Any]:
+    try:
+        records, stacks, parents = _read_hierarchy_sidecars(records_path)
+        summary = (
+            _decode_hierarchy(records, stacks, parents)
+            if phase == "decode"
+            else _prefill_hierarchy(records_path, records, stacks)
+        )
+    except ValidationError as error:
+        return {"available": False, "reason": str(error)}
+    return {
+        "available": True,
+        **summary,
+        "timing_semantics": (
+            "exclusive module attribution of kernel-duration sum; concurrent streams "
+            "can make the sum larger than wall time"
+        ),
+        "attribution_method": (
+            "captured Python stacks identify custom operations; the ordered RMSNorm "
+            "boundaries around Mamba, attention, and MoE anchors assign compiled dense "
+            "projection and communication kernels"
+        ),
+    }
+
+
 def union_duration_ns(intervals: Iterable[tuple[int, int]]) -> int:
     total = 0
     merged_end: int | None = None
@@ -938,16 +1468,18 @@ def analyze_run(
     expected_decode_replays = (
         metadata["osl"] - 1 if expected_phase == "decode" else None
     )
+    trace = summarize_trace(
+        trace_path,
+        sequence_limit=sequence_limit,
+        expected_decode_replays=expected_decode_replays,
+    )
+    trace["hierarchy"] = summarize_hierarchy(trace_path, expected_phase)
     return {
         "label": f"{expected_phase}_{expected_scope}",
         "run_dir": str(run_dir),
         "metadata": metadata,
         "benchmark": benchmark,
-        "trace": summarize_trace(
-            trace_path,
-            sequence_limit=sequence_limit,
-            expected_decode_replays=expected_decode_replays,
-        ),
+        "trace": trace,
     }
 
 

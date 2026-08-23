@@ -26,6 +26,35 @@ contract in both arms. The generation wave completed the exact
 `8,000 input / 2,048 output` contract and contained exactly 255 CUDA Graph
 decode replays in both arms.
 
+## Hierarchical GPU-work breakdown
+
+The hierarchy recovers the expected 48 Mamba, 12 Attention, and 48 MoE blocks
+in each decode graph. Every kernel node has exactly one owner, and the assigned
+durations reconcile with the raw kernel sum. Times below are exclusive sums of
+GPU kernel durations, not additive wall time; shared-expert work overlaps the
+main stream.
+
+| Decode module / replay | BF16 | MXFP8 | Change |
+| --- | ---: | ---: | ---: |
+| MoE | 10.726 ms (76.3%) | 8.280 ms (71.2%) | -22.8% |
+| Mamba | 2.748 ms (19.5%) | 2.758 ms (23.7%) | +0.3% |
+| Attention | 0.573 ms (4.1%) | 0.581 ms (5.0%) | +1.4% |
+| Other | 0.018 ms (0.1%) | 0.019 ms (0.2%) | +3.4% |
+
+The largest MoE changes are routed W13 plus activation (`2.361 -> 1.407 ms`),
+routed W2 (`2.367 -> 1.417 ms`), and the module-owned TP all-reduce interval
+(`2.390 -> 1.655 ms`). MXFP8 adds `0.110 ms` of activation quantization.
+Mamba and Attention are outside this MoE-only quantization scope and remain
+near parity. Attention includes QKV projection, FMHA, KV-cache update, O
+projection, setup, normalization, and its TP collective. Mamba includes input
+and output projections, causal convolution, selective-state and cache updates,
+gate/residual work, normalization, and its TP collective.
+
+The 10K-to-1 prefill wave contains six model-pass signatures due to chunked
+prefill. Across the full request wave, MoE GPU work changes from `915.763` to
+`774.209 ms`, Mamba from `606.197` to `621.640 ms`, and Attention from `95.755`
+to `95.329 ms`.
+
 ## Observed decode order
 
 The dominant CUDA stream repeats this layer-level order:
@@ -67,7 +96,7 @@ one CUDA stream is causal.
 
 - Four-arm metadata and exact-token contract: passed
 - Decode replay count: BF16 `255/255`, MXFP8 `255/255`
-- Synthetic analyzer tests: 36 passed
+- Synthetic analyzer tests: 38 passed
 - Ruff: passed
 - Pyright: passed
 - `git diff --check`: passed
