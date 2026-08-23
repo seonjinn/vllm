@@ -170,6 +170,49 @@ def classify_kernel(name: str) -> str:
     return "other"
 
 
+def classify_kernel_family(name: str) -> str:
+    lower = name.lower()
+    if "reducescatter" in lower or "reduce_scatter" in lower:
+        return "reduce-scatter"
+    if "allgather" in lower or "all_gather" in lower:
+        return "all-gather"
+    if "alltoall" in lower or "all_to_all" in lower:
+        return "all-to-all"
+    if "allreduce" in lower or "all_reduce" in lower:
+        return "all-reduce"
+    if "sendrecv" in lower or "send_recv" in lower:
+        return "send/recv"
+
+    category = classify_kernel(name)
+    if category == "moe_gemm":
+        return (
+            "MXFP8 routed-expert BMM"
+            if "mxe4m3" in lower or "fp8_block_scale" in lower
+            else "BF16 routed-expert BMM"
+        )
+    if category == "dense_mxfp8_gemm":
+        return "MXFP8 dense GEMM"
+    if category == "dense_bf16_gemm":
+        return "BF16 dense GEMM"
+    if category == "mxfp8_quantize":
+        return "MXFP8 activation quantize"
+    if category == "moe_routing":
+        return "MoE routing/top-k"
+    if category == "moe_finalize":
+        return "MoE finalize/scatter"
+    if category == "attention":
+        return "FMHA" if "fmha" in lower else "attention support"
+    if category == "mamba":
+        if "causal_conv" in lower:
+            return "causal convolution"
+        if "state" in lower or "scan" in lower:
+            return "selective state update"
+        return "Mamba support"
+    if category == "communication":
+        return "other collective"
+    return category.replace("_", " ")
+
+
 def classify_hierarchy_direct(
     name: str, frames: Sequence[Mapping[str, Any]]
 ) -> tuple[str, str] | None:
@@ -455,13 +498,41 @@ def _summarize_hierarchy_assignments(
     operation_totals: dict[tuple[str, str], list[float | int]] = defaultdict(
         lambda: [0.0, 0]
     )
+    family_totals: dict[str, list[float | int]] = defaultdict(lambda: [0.0, 0])
+    operation_family_totals: dict[tuple[str, str, str], list[float | int]] = (
+        defaultdict(lambda: [0.0, 0])
+    )
     for node in nodes:
         module, operation = assignments[node["node_id"]]
+        family = classify_kernel_family(str(node["name"]))
         totals = operation_totals[module, operation]
         totals[0] += float(node["mean_duration_ns"])
         totals[1] += 1
+        for family_bucket in (
+            family_totals[family],
+            operation_family_totals[module, operation, family],
+        ):
+            family_bucket[0] += float(node["mean_duration_ns"])
+            family_bucket[1] += 1
 
     kernel_sum_ns = sum(float(node["mean_duration_ns"]) for node in nodes)
+
+    def family_summary(
+        totals: Mapping[str, Sequence[float | int]],
+    ) -> dict[str, dict[str, float | int | None]]:
+        return {
+            family: {
+                "time_ns": time_ns,
+                "node_count": node_count,
+                "share_of_kernel_sum": time_ns / kernel_sum_ns
+                if kernel_sum_ns
+                else None,
+            }
+            for family, (time_ns, node_count) in sorted(
+                totals.items(), key=lambda item: (-item[1][0], item[0])
+            )
+        }
+
     modules: dict[str, Any] = {}
     for module in ("moe", "mamba", "attention", "other"):
         operations = {
@@ -471,6 +542,15 @@ def _summarize_hierarchy_assignments(
                 "share_of_kernel_sum": time_ns / kernel_sum_ns
                 if kernel_sum_ns
                 else None,
+                "kernel_families": family_summary(
+                    {
+                        family: totals
+                        for (owner, owner_operation, family), totals in (
+                            operation_family_totals.items()
+                        )
+                        if owner == module and owner_operation == operation
+                    }
+                ),
             }
             for (owner, operation), (time_ns, node_count) in sorted(
                 operation_totals.items(), key=lambda item: (-item[1][0], item[0])
@@ -478,9 +558,21 @@ def _summarize_hierarchy_assignments(
             if owner == module
         }
         time_ns = sum(item["time_ns"] for item in operations.values())
+        module_family_totals: dict[str, list[float | int]] = defaultdict(
+            lambda: [0.0, 0]
+        )
+        for (owner, _, family), (
+            family_time_ns,
+            node_count,
+        ) in operation_family_totals.items():
+            if owner != module:
+                continue
+            module_family_totals[family][0] += family_time_ns
+            module_family_totals[family][1] += node_count
         modules[module] = {
             "time_ns": time_ns,
             "share_of_kernel_sum": time_ns / kernel_sum_ns if kernel_sum_ns else None,
+            "kernel_families": family_summary(module_family_totals),
             "operations": operations,
         }
 
@@ -493,6 +585,7 @@ def _summarize_hierarchy_assignments(
     return {
         "kernel_sum_ns": kernel_sum_ns,
         "component_counts": dict(component_counts),
+        "kernel_families": family_summary(family_totals),
         "modules": modules,
         "reconciliation": {
             "node_count": len(nodes),

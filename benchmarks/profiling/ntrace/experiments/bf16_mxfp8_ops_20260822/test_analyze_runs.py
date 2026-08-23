@@ -769,6 +769,81 @@ def test_classify_kernel(name: str, expected: str) -> None:
     assert analyze_runs.classify_kernel(name) == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (
+            "bmm_MxE4m3_MxE4m3MxE4m3_Fp32_relu2_sm100f",
+            "MXFP8 routed-expert BMM",
+        ),
+        (
+            "bmm_Bfloat16_Bfloat16Bfloat16_Fp32_sm100f",
+            "BF16 routed-expert BMM",
+        ),
+        (
+            "multimem_all_reduce_kernel<c10::BFloat16>",
+            "all-reduce",
+        ),
+        ("ncclDevKernel_AllGather", "all-gather"),
+        ("ncclDevKernel_ReduceScatter", "reduce-scatter"),
+        ("ncclDevKernel_AllToAll", "all-to-all"),
+        ("fmhaSm100fKernel", "FMHA"),
+        ("_causal_conv1d_update_kernel", "causal convolution"),
+    ],
+)
+def test_classify_kernel_family(name: str, expected: str) -> None:
+    assert analyze_runs.classify_kernel_family(name) == expected
+
+
+def test_hierarchy_summary_includes_kernel_families() -> None:
+    nodes = [
+        {
+            **_hierarchy_node(
+                0,
+                name="bmm_MxE4m3_MxE4m3MxE4m3_Fp32_relu2_sm100f",
+                start_ns=0,
+            ),
+            "mean_duration_ns": 20,
+        },
+        {
+            **_hierarchy_node(
+                1,
+                name="multimem_all_reduce_kernel<c10::BFloat16>",
+                start_ns=10,
+                is_communication=True,
+            ),
+            "mean_duration_ns": 10,
+        },
+    ]
+    assignments = {
+        0: ("moe", "routed W13 + activation"),
+        1: ("moe", "TP all-reduce"),
+    }
+
+    summary = analyze_runs._summarize_hierarchy_assignments(
+        nodes, assignments, {"moe": 1}
+    )
+
+    assert summary["kernel_families"] == {
+        "MXFP8 routed-expert BMM": {
+            "time_ns": 20.0,
+            "node_count": 1,
+            "share_of_kernel_sum": pytest.approx(2 / 3),
+        },
+        "all-reduce": {
+            "time_ns": 10.0,
+            "node_count": 1,
+            "share_of_kernel_sum": pytest.approx(1 / 3),
+        },
+    }
+    assert (
+        summary["modules"]["moe"]["operations"]["TP all-reduce"]["kernel_families"][
+            "all-reduce"
+        ]["time_ns"]
+        == 10.0
+    )
+
+
 def test_summarize_trace_emits_refined_profiler_categories(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     names = (

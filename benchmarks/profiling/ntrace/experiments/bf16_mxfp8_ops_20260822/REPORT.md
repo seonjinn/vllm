@@ -90,6 +90,8 @@ one CUDA stream is causal.
 - Copied traces and benchmark JSON:
   `/Users/sna/MXFP8_generation/deliverables/bf16_mxfp8_ntrace_ops_20260822/matched_shape_fix`
 - Machine-readable comparison: `matched_shape_fix/analysis.json`
+- Hierarchy output includes module, operation, kernel-family, and collective-subtype
+  totals that reconcile to each arm's rank-0 kernel sum.
 - Per-arm llm-analyzer reports: `matched_shape_fix/<arm>/breakdown/`
 
 ## Validation
