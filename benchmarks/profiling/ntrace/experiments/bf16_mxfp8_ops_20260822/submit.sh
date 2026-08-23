@@ -3,7 +3,7 @@
 set -euo pipefail
 
 EXPERIMENT_DIR=$(cd "$(dirname "$0")" && pwd)
-VLLM_SOURCE_ROOT=${VLLM_SOURCE_ROOT:-$(cd "${EXPERIMENT_DIR}/../../../.." && pwd)}
+VLLM_SOURCE_ROOT=${VLLM_SOURCE_ROOT:-$(cd "${EXPERIMENT_DIR}/../../../../.." && pwd)}
 BENCH_ROOT=${BENCH_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-benchmark-v0271-adaptive-long}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64_20260813_2688476.sqsh}
 NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ntrace-vllm0271/runtime-4dbf6c2e-cuda13-py312-nonumpy}
