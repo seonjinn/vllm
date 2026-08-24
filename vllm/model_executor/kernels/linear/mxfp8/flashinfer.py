@@ -253,8 +253,8 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         input_shape = x.shape
         input_2d = x.view(-1, K)
 
-        input_mxfp8, input_scale = vllm_flashinfer.flashinfer_mxfp8_quantize_8x4(
-            input_2d
+        input_mxfp8, input_scale = mxfp8_e4m3_quantize(
+            input_2d, is_sf_swizzled_layout=True
         )
         output = vllm_flashinfer.mm_mxfp8(
             input_mxfp8,
@@ -263,7 +263,7 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
             weight_scale,
             out_dtype=x.dtype,
             backend="trtllm",
-            use_8x4_sf_layout=True,
+            use_8x4_sf_layout=False,
         )
         if output.shape[-1] != output_size:
             output = output[:, :output_size].contiguous()
