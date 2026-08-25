@@ -21,12 +21,12 @@ export XDG_CACHE_HOME="${scratch}/xdg"
 export FLASHINFER_JIT_DIR="${scratch}/jit"
 export FLASHINFER_GEN_SRC_DIR="${scratch}/generated"
 
-uv run --no-project python "${EXP_DIR}/prepare_exact_cache.py" \
+python3 "${EXP_DIR}/prepare_exact_cache.py" \
   --shapes "${shape_file}" \
   --output-dir "${output_dir}/cache" \
   --backend cute-dsl \
   --scale-layout 128x4
-uv run --no-project python \
+python3 \
   "${FLASHINFER_ROOT}/benchmarks/bench_mxfp8_backend_tactic_oracle.py" \
   --shapes "${shape_file}" \
   --selected-cache-dir "${output_dir}/cache" \
