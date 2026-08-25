@@ -115,4 +115,4 @@ def test_runtime_build_uses_oci_srun_container(tmp_path: Path) -> None:
     rendered = completed.stdout.replace("\\", "")
     assert f"--container-image={container}" in rendered
     assert "--container-mounts=/home:/home,/lustre:/lustre" in rendered
-    assert "--gpus-per-node=1" in rendered
+    assert "--gpus-per-node=4" in rendered
