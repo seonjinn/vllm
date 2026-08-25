@@ -42,6 +42,41 @@ can make these sums larger than elapsed wall time.
 MoE saves `2.015 ms`, while the full kernel sum saves `2.007 ms`. The small
 difference is explained by Mamba being `0.013 ms` slower in this sample.
 
+### Whole-replay GEMM and BMM portion
+
+The additive denominator is the exclusive GPU kernel-duration sum per decode
+replay: `15.330 ms` for Triton and `13.323 ms` for FlashInfer-TRTLLM. This is
+the defensible denominator for an operation portion that reconciles to 100%.
+It is not an exclusive wall-clock split because kernels on concurrent streams
+can overlap.
+
+| GEMM/BMM family | Triton | Portion | FlashInfer-TRTLLM | Portion | Time change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Routed expert GEMM/BMM | 5.378 ms | 35.1% | 4.265 ms | 32.0% | -20.7% |
+| Dense GEMM | 3.547 ms | 23.1% | 3.732 ms | 28.0% | +5.2% |
+| **All GEMM/BMM** | **8.925 ms** | **58.2%** | **7.997 ms** | **60.0%** | **-10.4%** |
+
+The GEMM/BMM absolute time falls by 10.4%, while its portion increases from
+58.2% to 60.0%. This is not a contradiction: routing, support, and other
+non-GEMM overhead shrink more than the GEMM/BMM total.
+
+| GEMM/BMM operation | Triton | Portion | FlashInfer-TRTLLM | Portion | Time change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Routed W13 + activation | 2.925 ms | 19.1% | 2.113 ms | 15.9% | -27.8% |
+| Routed W2 | 2.453 ms | 16.0% | 2.152 ms | 16.2% | -12.3% |
+| Router projection | 0.938 ms | 6.1% | 0.944 ms | 7.1% | +0.7% |
+| Mamba input projection | 0.792 ms | 5.2% | 0.798 ms | 6.0% | +0.8% |
+| Shared W13/up-gate | 0.558 ms | 3.6% | 0.692 ms | 5.2% | +23.9% |
+| Mamba output projection | 0.384 ms | 2.5% | 0.383 ms | 2.9% | -0.1% |
+| Shared gate/combine GEMM | 0.373 ms | 2.4% | 0.373 ms | 2.8% | +0.1% |
+| Shared W2/down | 0.299 ms | 1.9% | 0.332 ms | 2.5% | +11.2% |
+| Attention QKV projection | 0.138 ms | 0.9% | 0.142 ms | 1.1% | +2.7% |
+| Attention output projection | 0.066 ms | 0.4% | 0.067 ms | 0.5% | +1.8% |
+
+The dominant gain is routed W13 (`-0.812 ms`) followed by routed W2
+(`-0.301 ms`). Shared-expert W13 and W2 regress by a combined `0.167 ms`, but
+this is much smaller than the `1.113 ms` routed-expert saving.
+
 ### Mamba operation breakdown
 
 | Mamba operation per replay | Triton | FlashInfer-TRTLLM | Change |
