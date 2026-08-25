@@ -116,3 +116,52 @@ def test_runtime_build_uses_oci_srun_container(tmp_path: Path) -> None:
     assert f"--container-image={container}" in rendered
     assert "--container-mounts=/home:/home,/lustre:/lustre" in rendered
     assert "--gpus-per-node=4" in rendered
+
+
+def test_profile_scheduler_contract_is_overridable_for_lyris(tmp_path: Path) -> None:
+    bench_root = tmp_path / "bench"
+    runtime = tmp_path / "runtime"
+    container = tmp_path / "vllm.sqsh"
+    fake_submit = bench_root / "submit_bench_lyris_nemotron3_ultra_w4a16.sh"
+    _touch(
+        fake_submit,
+        "#!/usr/bin/env bash\n"
+        'printf \'%s/%s/%s\\n\' "$ACCOUNT" "$PARTITION" "$QOS"\n'
+        "printf '%s\\n' \"$CONTAINER_MOUNTS\"\n",
+    )
+    fake_submit.chmod(0o755)
+    _touch(bench_root / "vllm-ultra-ray-bench-serve-static.sh")
+    _touch(bench_root / "benchmark_vllm_bench_serve_static.py")
+    _touch(runtime / "ntrace" / "_cupti_cpp.fake.so")
+    _touch(container)
+
+    env = {
+        **os.environ,
+        "BENCH_ROOT": str(bench_root),
+        "VLLM_SOURCE_ROOT": str(REPO_ROOT),
+        "CONTAINER_IMAGE": str(container),
+        "NTRACE_RUNTIME": str(runtime),
+        "RUN_ROOT_BASE": str(tmp_path / "results"),
+        "STAMP": "lyris-test",
+        "BACKENDS": "triton",
+        "ACCOUNT": "coreai_dlalgo_llm",
+        "PARTITION": "gb200",
+        "QOS": "user-restrictions",
+        "TOPOLOGY_ARGS": "--switches=1@600",
+        "JOB_CACHE_DIR": str(tmp_path / "cache"),
+        "HF_HOME_OVERRIDE": str(tmp_path / "hf_home"),
+        "CONTAINER_MOUNTS": "/lustre:/lustre,/tmp/cache:/root/.cache",
+        "DRY_RUN": "1",
+        "SBATCH_TEST_ONLY": "1",
+    }
+    completed = subprocess.run(
+        ["bash", str(EXPERIMENT_DIR / "submit.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "coreai_dlalgo_llm/gb200/user-restrictions" in completed.stdout
+    assert "/lustre:/lustre,/tmp/cache:/root/.cache" in completed.stdout

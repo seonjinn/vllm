@@ -10,6 +10,13 @@ CONTAINER_SHA256=${CONTAINER_SHA256:-e7be53f2754097c88f7c801da92f6d94794ec4d78d9
 NTRACE_RUNTIME=${NTRACE_RUNTIME:-/lustre/fsw/portfolios/coreai/users/sna/ntrace-vllm0271/runtime-165ae08-cuda13-py312-nonumpy}
 NTRACE_REVISION=${NTRACE_REVISION:-165ae08}
 BF16_MODEL=${BF16_MODEL:-nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16}
+ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
+PARTITION=${PARTITION:-batch}
+QOS=${QOS:-normal}
+TOPOLOGY_ARGS=${TOPOLOGY_ARGS:---switches=1@600 --gpus-per-node=4}
+JOB_CACHE_DIR=${JOB_CACHE_DIR:-/raid/scratch/sna/vllm-benchmark/container-cache}
+HF_HOME_OVERRIDE=${HF_HOME_OVERRIDE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home}
+CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-/home:/home,/lustre:/lustre,${JOB_CACHE_DIR}:/root/.cache}
 
 BACKENDS=${BACKENDS:-"triton flashinfer_trtllm"}
 CONCURRENCY=${CONCURRENCY:-8}
@@ -101,10 +108,10 @@ EOF
 
   echo "backend=${backend} run_root=${run_root}"
   env \
-    ACCOUNT=coreai_dlalgo_llm \
-    PARTITION=batch \
-    QOS=normal \
-    TOPOLOGY_ARGS="--switches=1@600 --gpus-per-node=4" \
+    ACCOUNT="${ACCOUNT}" \
+    PARTITION="${PARTITION}" \
+    QOS="${QOS}" \
+    TOPOLOGY_ARGS="${TOPOLOGY_ARGS}" \
     PRECISIONS=bf16 \
     STAMP="${STAMP}_${backend}" \
     RUN_ROOT="${run_root}" \
@@ -115,10 +122,10 @@ EOF
     NTRACE_EXPECTED_OSL="${OSL}" \
     JOB_PREFIX="coreai_dlalgo_llm-${USER:-sna}.bf16-ntrace-${backend}" \
     CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
-    JOB_CACHE_DIR=/raid/scratch/sna/vllm-benchmark/container-cache \
-    CONTAINER_MOUNTS="/home:/home,/lustre:/lustre,/raid/scratch/sna/vllm-benchmark/container-cache:/root/.cache" \
+    JOB_CACHE_DIR="${JOB_CACHE_DIR}" \
+    CONTAINER_MOUNTS="${CONTAINER_MOUNTS}" \
     SBATCH_EXPORT_MODE=all \
-    HF_HOME_OVERRIDE=/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home \
+    HF_HOME_OVERRIDE="${HF_HOME_OVERRIDE}" \
     ULTRA_BF16_MODEL="${BF16_MODEL}" \
     BF16_NNODES=2 \
     BF16_TP=8 \
