@@ -24,7 +24,15 @@ to the separate unprofiled 1K/10K sweep.
 ## Launch
 
 The ntrace source revision is `compute/e2etrain/ntrace@165ae08`. Build its
-native CUDA 13 runtime first, then validate scheduling:
+native CUDA 13 runtime first. OCI-HSG exposes container integration on `srun`,
+so use the dedicated wrapper instead of passing container flags to `sbatch`:
+
+```bash
+SBATCH_TEST_ONLY=1 ./build_runtime_oci_hsg.sh
+SBATCH_TEST_ONLY=0 ./build_runtime_oci_hsg.sh
+```
+
+After the build succeeds, validate profiling-job scheduling:
 
 ```bash
 SBATCH_TEST_ONLY=1 ./submit.sh

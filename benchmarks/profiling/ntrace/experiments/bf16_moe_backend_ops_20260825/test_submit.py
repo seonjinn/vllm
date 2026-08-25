@@ -75,3 +75,44 @@ def test_dry_run_emits_matched_triton_and_trtllm_arms(tmp_path: Path) -> None:
         assert "precision=bf16" in text
         assert "tp=8" in text
         assert "cuda_graph=FULL_AND_PIECEWISE" in text
+
+
+def test_runtime_build_uses_oci_srun_container(tmp_path: Path) -> None:
+    source = tmp_path / "ntrace"
+    runtime = tmp_path / "runtime"
+    container = tmp_path / "vllm.sqsh"
+    patch = tmp_path / "ntrace.patch"
+    inner_script = tmp_path / "build_inner.sh"
+    source.mkdir()
+    _touch(container)
+    _touch(patch)
+    _touch(inner_script, "#!/usr/bin/env bash\n")
+
+    env = {
+        **os.environ,
+        "NTRACE_SOURCE": str(source),
+        "NTRACE_RUNTIME": str(runtime),
+        "NTRACE_PATCH": str(patch),
+        "NTRACE_REVISION": "165ae08",
+        "CONTAINER_IMAGE": str(container),
+        "BUILD_INNER_SCRIPT": str(inner_script),
+        "LOG_DIR": str(tmp_path / "logs"),
+        "DRY_RUN": "1",
+        "SBATCH_TEST_ONLY": "1",
+    }
+    completed = subprocess.run(
+        ["bash", str(EXPERIMENT_DIR / "build_runtime_oci_hsg.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "sbatch" in completed.stdout
+    assert "--test-only" in completed.stdout
+    assert "srun" in completed.stdout
+    rendered = completed.stdout.replace("\\", "")
+    assert f"--container-image={container}" in rendered
+    assert "--container-mounts=/home:/home,/lustre:/lustre" in rendered
+    assert "--gpus-per-node=1" in rendered
