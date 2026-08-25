@@ -127,7 +127,7 @@ def test_profile_scheduler_contract_is_overridable_for_lyris(tmp_path: Path) -> 
         fake_submit,
         "#!/usr/bin/env bash\n"
         'printf \'%s/%s/%s\\n\' "$ACCOUNT" "$PARTITION" "$QOS"\n'
-        "printf '%s\\n' \"$CONTAINER_MOUNTS\"\n",
+        "printf 'mounts_b64=%s\\n' \"$CONTAINER_MOUNTS_B64\"\n",
     )
     fake_submit.chmod(0o755)
     _touch(bench_root / "vllm-ultra-ray-bench-serve-static.sh")
@@ -164,4 +164,12 @@ def test_profile_scheduler_contract_is_overridable_for_lyris(tmp_path: Path) -> 
 
     assert completed.returncode == 0, completed.stderr
     assert "coreai_dlalgo_llm/gb200/user-restrictions" in completed.stdout
-    assert "/lustre:/lustre,/tmp/cache:/root/.cache" in completed.stdout
+    encoded = completed.stdout.split("mounts_b64=", 1)[1].splitlines()[0]
+    expected = subprocess.run(
+        ["base64"],
+        check=True,
+        capture_output=True,
+        text=True,
+        input=env["CONTAINER_MOUNTS"],
+    ).stdout.strip()
+    assert encoded == expected

@@ -51,6 +51,7 @@ if [[ -z ${ntrace_native} ]]; then
 fi
 
 vllm_head=$(git -C "${VLLM_SOURCE_ROOT}" rev-parse HEAD)
+container_mounts_b64=$(printf '%s' "${CONTAINER_MOUNTS}" | base64 | tr -d '\n')
 compilation_config='{"cudagraph_capture_sizes":[8],"cudagraph_mode":"FULL_AND_PIECEWISE","splitting_ops":["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::gdn_attention_core_xpu","vllm::olmo_hybrid_gdn_full_forward","vllm::sparse_attn_indexer","vllm::rocm_aiter_sparse_attn_indexer","vllm::deepseek_v4_attention","vllm::hpc_rope_norm_forward","vllm::unified_kv_cache_update","vllm::unified_mla_kv_cache_update"]}'
 runtime_override_files=(
   vllm/config/profiler.py
@@ -124,6 +125,7 @@ EOF
     CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
     JOB_CACHE_DIR="${JOB_CACHE_DIR}" \
     CONTAINER_MOUNTS="${CONTAINER_MOUNTS}" \
+    CONTAINER_MOUNTS_B64="${container_mounts_b64}" \
     SBATCH_EXPORT_MODE=all \
     HF_HOME_OVERRIDE="${HF_HOME_OVERRIDE}" \
     ULTRA_BF16_MODEL="${BF16_MODEL}" \
