@@ -5,6 +5,7 @@ set -euo pipefail
 readonly CLUSTER=${CLUSTER:-sna-mfa@login-lyris}
 readonly ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
 readonly PARTITION=${PARTITION:-gb200}
+readonly ORACLE_PARTITION=${ORACLE_PARTITION:-gb200-backfill}
 readonly QOS=${QOS:-user-restrictions}
 readonly SOURCE_ROOT=${SOURCE_ROOT:-/home/sna/vllm-v0271-mxfp8-all-observed-tactics}
 readonly FLASHINFER_ROOT=${FLASHINFER_ROOT:-/home/sna/flashinfer-mxfp8-all-backend-exact-cg-322dd00a}
@@ -23,6 +24,12 @@ remote_common=(
   --qos="${QOS}"
   --nodes=1
 )
+oracle_common=(
+  --account="${ACCOUNT}"
+  --partition="${ORACLE_PARTITION}"
+  --qos="${QOS}"
+  --nodes=1
+)
 export_common="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},MODEL_PATH=${MODEL_PATH},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},FLASHINFER_ROOT=${FLASHINFER_ROOT},RESULT_ROOT=${RESULT_ROOT}"
 
 ssh "${CLUSTER}" git -C "${SOURCE_ROOT}" pull --ff-only
@@ -33,7 +40,7 @@ if [[ "${remote_sha}" != "${SOURCE_COMMIT}" ]]; then
 fi
 ssh "${CLUSTER}" mkdir -p "${RESULT_ROOT}/slurm"
 
-ssh "${CLUSTER}" sbatch --test-only "${remote_common[@]}" \
+ssh "${CLUSTER}" sbatch --test-only "${oracle_common[@]}" \
   --time="${SERVER_TIME}" \
   --export="${export_common},RUN_KIND=capture-eager" \
   "${EXP_DIR}/run_server.sbatch"
@@ -54,7 +61,7 @@ graph_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --output="${RESULT_ROOT}/slurm/capture-graph-%j.out" \
   --export="${export_common},RUN_KIND=capture-graph" \
   "${EXP_DIR}/run_server.sbatch")
-oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
   --job-name="${ACCOUNT}-mx.obs.oracle" \
   --output="${RESULT_ROOT}/slurm/oracle-%j.out" \
@@ -80,4 +87,5 @@ done
 echo "capture_eager_job=${eager_job}"
 echo "capture_graph_job=${graph_job}"
 echo "oracle_job=${oracle_job}"
+echo "oracle_partition=${ORACLE_PARTITION}"
 echo "result_root=${RESULT_ROOT}"

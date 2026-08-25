@@ -36,3 +36,6 @@ Push this branch before submission, then initialize the remote source under
 Durable traces, lookup metadata, oracle reports, and benchmark JSON files are
 written below the printed Lustre result root. JIT, autotune, and Python caches
 are created under `/raid/scratch` and removed when each job exits.
+
+Serving jobs use `gb200`. The longer exhaustive oracle defaults to the
+eight-hour `gb200-backfill` partition; override `ORACLE_PARTITION` when needed.
