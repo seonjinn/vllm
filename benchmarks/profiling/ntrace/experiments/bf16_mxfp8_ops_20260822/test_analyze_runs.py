@@ -238,6 +238,35 @@ def test_hierarchy_classifier_splits_routed_w13_and_w2() -> None:
     ) == ("moe", "routed W2")
 
 
+@pytest.mark.parametrize(
+    ("name", "funcname", "expected_operation"),
+    [
+        ("moe_align_block_size_kernel", "_prepare_expert_assignment", "routing/top-k"),
+        ("fused_moe_kernel", "_base_w13_fn", "routed W13 + activation"),
+        ("fused_moe_kernel", "_base_w2_fn", "routed W2"),
+        ("moe_sum_vec_dynamic_kernel", "moe_sum", "finalize/scatter"),
+    ],
+)
+def test_hierarchy_classifier_supports_triton_modular_moe(
+    name: str, funcname: str, expected_operation: str
+) -> None:
+    frames = [
+        {
+            "filename": "/opt/vllm/fused_moe/experts/triton_moe.py",
+            "funcname": funcname,
+        },
+        {
+            "filename": "/opt/vllm/fused_moe/routed_experts.py",
+            "funcname": "forward_modular",
+        },
+    ]
+
+    assert analyze_runs.classify_hierarchy_direct(name, frames) == (
+        "moe",
+        expected_operation,
+    )
+
+
 def test_hierarchy_segments_modules_and_leaves_final_norm_outside_moe() -> None:
     nodes = [
         _hierarchy_node(0, name="embedding", start_ns=0),
@@ -742,6 +771,7 @@ def test_summarize_trace_rejects_decode_graph_replay_count_mismatch(
     [
         ("bmm_foo", "moe_gemm"),
         ("bmm_Bfloat16_Bfloat16Bfloat16_Fp32", "moe_gemm"),
+        ("fused_moe_kernel", "moe_gemm"),
         ("trtllm_fp8_block_scale_moe", "moe_gemm"),
         ("nvjet_sm100_tst_64x8_64x16", "dense_bf16_gemm"),
         ("void cublasLt::splitKreduce_kernel<32, 16>", "dense_bf16_gemm"),
@@ -780,6 +810,7 @@ def test_classify_kernel(name: str, expected: str) -> None:
             "bmm_Bfloat16_Bfloat16Bfloat16_Fp32_sm100f",
             "BF16 routed-expert BMM",
         ),
+        ("fused_moe_kernel", "Triton routed-expert GEMM"),
         (
             "multimem_all_reduce_kernel<c10::BFloat16>",
             "all-reduce",

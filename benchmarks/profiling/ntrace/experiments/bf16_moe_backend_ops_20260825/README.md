@@ -9,7 +9,7 @@ Nemotron 3 Ultra generation.
 - Image: `vllm_openai_v0271_aarch64_20260813_2688476.sqsh`
 - Image SHA256: `e7be53f2754097c88f7c801da92f6d94794ec4d78d9df937fcd315a6994297f0`
 - Model: `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`
-- Hardware: OCI-HSG, two GB200 nodes, TP8/DP1/PP1, expert parallel enabled
+- Hardware: Lyris, two GB200 nodes, TP8/DP1/PP1, expert parallel enabled
 - MoE backends: Triton and FlashInfer-TRTLLM
 - Attention backend: FlashInfer in both arms
 - CUDA Graph: `FULL_AND_PIECEWISE`, capture size 8
@@ -47,3 +47,9 @@ SBATCH_TEST_ONLY=0 ./submit.sh
 Each arm writes a metadata manifest and rank-scoped Parquet files. ntrace
 perturbs absolute latency, so the primary result is matched operation
 composition and kernel-time delta, not profiled requests per second.
+
+## Result
+
+The validated rank-0 result and root-cause analysis are in [REPORT.md](REPORT.md).
+The successful SLURM jobs are `2787474` (Triton) and `2787475`
+(FlashInfer-TRTLLM).

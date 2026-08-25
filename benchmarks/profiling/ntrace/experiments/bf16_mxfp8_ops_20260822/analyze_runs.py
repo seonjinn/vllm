@@ -133,7 +133,11 @@ def classify_kernel(name: str) -> str:
         return "moe_routing"
     if "moe::dev::finalize" in lower:
         return "moe_finalize"
-    if "bmm_" in lower or "trtllm_fp8_block_scale_moe" in lower:
+    if (
+        "bmm_" in lower
+        or "trtllm_fp8_block_scale_moe" in lower
+        or "fused_moe_kernel" in lower
+    ):
         return "moe_gemm"
     if (
         "sm100blockscaled" in lower
@@ -185,6 +189,8 @@ def classify_kernel_family(name: str) -> str:
 
     category = classify_kernel(name)
     if category == "moe_gemm":
+        if "fused_moe_kernel" in lower:
+            return "Triton routed-expert GEMM"
         return (
             "MXFP8 routed-expert BMM"
             if "mxe4m3" in lower or "fp8_block_scale" in lower
@@ -219,6 +225,16 @@ def classify_hierarchy_direct(
     lower = name.lower()
     functions = {str(frame.get("funcname", "")) for frame in frames}
     files = " ".join(str(frame.get("filename", "")) for frame in frames)
+
+    if "triton_moe.py" in files and "forward_modular" in functions:
+        if "_base_w13_fn" in functions:
+            return "moe", "routed W13 + activation"
+        if "_base_w2_fn" in functions:
+            return "moe", "routed W2"
+        if "_prepare_expert_assignment" in functions:
+            return "moe", "routing/top-k"
+        if "moe_sum" in functions:
+            return "moe", "finalize/scatter"
 
     if "forward_monolithic" in functions:
         if "quantize" in lower:
