@@ -14,11 +14,12 @@ then compares the generated lookup with the normal vLLM autotuner.
 - Dense backend: vLLM `auto` (CuTeDSL on GB200)
 - MoE backend: FlashInfer TRTLLM
 - Workloads: 1K/10K, 10K/1K, and 1K/1K ISL/OSL
-- Shape capture concurrency: 1, 2, 4, 8, 16, 32; one request wave
+- Shape capture concurrency: 1, 2, 4, 8, 16, 32; ten request waves
 - Final A/B concurrency: 1, 8, 32; ten request waves
 - Final execution: CUDA Graph enabled
 
-The eager capture discovers irregular runtime values such as `M=1001`. The
+The eager capture discovers irregular runtime values such as `M=1001`. Ten
+waves match the final A/B and expose more continuous-batching mixtures. The
 graph capture adds the shapes chosen during graph construction. The offline
 lookup uses an exact `(M, N, K, runner)` key. A miss always delegates to the
 normal FlashInfer autotuner.
