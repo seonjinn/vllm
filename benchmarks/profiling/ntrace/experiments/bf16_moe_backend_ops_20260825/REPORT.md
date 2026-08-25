@@ -42,6 +42,42 @@ can make these sums larger than elapsed wall time.
 MoE saves `2.015 ms`, while the full kernel sum saves `2.007 ms`. The small
 difference is explained by Mamba being `0.013 ms` slower in this sample.
 
+### Mamba operation breakdown
+
+| Mamba operation per replay | Triton | FlashInfer-TRTLLM | Change |
+| --- | ---: | ---: | ---: |
+| Input projection | 0.792 ms | 0.798 ms | +0.8% |
+| TP all-reduce | 0.547 ms | 0.541 ms | -1.0% |
+| Output projection | 0.384 ms | 0.383 ms | -0.1% |
+| Input norm | 0.248 ms | 0.242 ms | -2.5% |
+| Selective state update | 0.211 ms | 0.208 ms | -1.4% |
+| State/cache index update | 0.201 ms | 0.222 ms | +10.5% |
+| Output gate/residual | 0.177 ms | 0.188 ms | +6.0% |
+| Causal convolution | 0.164 ms | 0.154 ms | -6.4% |
+| **Mamba total** | **2.723 ms** | **2.736 ms** | **+0.5%** |
+
+The sub-operation shifts cancel out. The largest relative regression,
+state/cache index update, is only `0.021 ms` in absolute time. There is no
+evidence that changing the MoE backend materially changes Mamba performance.
+
+### Attention operation breakdown
+
+| Attention operation per replay | Triton | FlashInfer-TRTLLM | Change |
+| --- | ---: | ---: | ---: |
+| QKV projection | 0.138 ms | 0.142 ms | +2.7% |
+| TP all-reduce | 0.128 ms | 0.132 ms | +3.7% |
+| Attention core | 0.110 ms | 0.108 ms | -1.2% |
+| Output projection | 0.066 ms | 0.067 ms | +1.8% |
+| Attention setup/copy | 0.052 ms | 0.048 ms | -8.2% |
+| Input norm | 0.046 ms | 0.045 ms | -2.4% |
+| KV cache update | 0.035 ms | 0.028 ms | -19.0% |
+| **Attention total** | **0.574 ms** | **0.570 ms** | **-0.6%** |
+
+KV cache update has the largest relative improvement, but saves only
+`0.0066 ms` per replay. Small increases in QKV projection, output projection,
+and TP all-reduce offset it. Attention therefore remains at parity and does
+not explain the end-to-end speedup.
+
 ## MoE root cause
 
 | MoE bucket per replay | Triton | FlashInfer-TRTLLM | Saved | Share of total kernel saving |
@@ -92,6 +128,8 @@ backend rather than the common attention backend or the rest of the model.
 - SLURM jobs: Triton `2787474`, FlashInfer-TRTLLM `2787475`
 - Local artifact root:
   `/Users/sna/MXFP8_generation/deliverables/bf16_moe_backend_ntrace_20260825/rayv2_decode`
+- Combined one-page HTML:
+  `/Users/sna/MXFP8_generation/deliverables/bf16_moe_backend_ntrace_20260825/bf16_moe_backend_comparison.html`
 - Per-arm interactive hierarchy:
   `<artifact root>/<backend>/breakdown/silicon_breakdown.html`
 - Per-arm trace files: records, stacks, graph nodes, and memops Parquet
@@ -101,6 +139,19 @@ backend rather than the common attention backend or the rest of the model.
 - Hierarchical attribution reconciles every graph node and its kernel-duration
   sum
 
-The initial comparison covers rank 0 of eight TP ranks. It must not sum timing
-across ranks. A ranks 0-7 capture should report the critical or maximum rank
-before treating this as a topology-wide breakdown.
+## All-rank validation
+
+The follow-up captures completed for ranks 0-7 in both arms:
+
+- Triton job: `2788246`
+- FlashInfer-TRTLLM job: `2788247`
+- Exact output tokens: `2,048/2,048` in both arms
+- Decode graph nodes on every rank: Triton `1,695`, FlashInfer-TRTLLM `1,407`
+- MoE kernel-time change across ranks: `-20.2%` to `-19.7%`, mean `-19.9%`
+
+The MoE reduction is therefore not a rank-0-only effect. The eight-rank
+simultaneous CUPTI capture does perturb collective waiting: total kernel sum
+and graph span vary strongly by rank even though the MoE time is stable. Its
+request throughput and cross-rank total span are not used as production
+performance evidence. Never sum rank timing; production throughput remains
+tied to an unprofiled matched sweep.

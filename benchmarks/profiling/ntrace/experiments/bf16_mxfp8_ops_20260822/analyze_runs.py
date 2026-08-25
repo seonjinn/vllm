@@ -619,8 +619,8 @@ def _read_hierarchy_sidecars(
     dict[int, list[dict[str, Any]]],
     dict[tuple[Any, Any], tuple[Any, Any]],
 ]:
-    stacks_path = records_path.with_name("ntrace_stacks_rank0.parquet")
-    graph_nodes_path = records_path.with_name("ntrace_graph_nodes_rank0.parquet")
+    stacks_path = _rank_sidecar_path(records_path, "stacks")
+    graph_nodes_path = _rank_sidecar_path(records_path, "graph_nodes")
     if not stacks_path.is_file() or not graph_nodes_path.is_file():
         raise ValidationError(
             "hierarchical analysis requires ntrace stack and graph-node sidecars"
@@ -640,6 +640,18 @@ def _read_hierarchy_sidecars(
         for row in edge_rows
     }
     return records, stacks, parents
+
+
+def _rank_sidecar_path(records_path: Path, sidecar: str) -> Path:
+    prefix = "ntrace_records_rank"
+    suffix = ".parquet"
+    name = records_path.name
+    rank = name.removeprefix(prefix).removesuffix(suffix)
+    if not name.startswith(prefix) or not name.endswith(suffix) or not rank.isdigit():
+        raise ValidationError(
+            f"cannot infer trace rank from records filename: {records_path.name}"
+        )
+    return records_path.with_name(f"ntrace_{sidecar}_rank{rank}.parquet")
 
 
 def _resolve_capture_key(
@@ -1114,7 +1126,7 @@ def _compress_sequence(
 def _summarize_memops(
     records_path: Path, windows: Sequence[tuple[int, int]]
 ) -> tuple[dict[str, Any], list[tuple[int, int]]]:
-    path = records_path.with_name("ntrace_memops_rank0.parquet")
+    path = _rank_sidecar_path(records_path, "memops")
     if not path.is_file():
         return {
             "available": False,

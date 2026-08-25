@@ -216,6 +216,17 @@ def _hierarchy_node(
     }
 
 
+def test_rank_sidecar_path_preserves_trace_rank(tmp_path: Path) -> None:
+    records = tmp_path / "ntrace_records_rank7.parquet"
+
+    assert analyze_runs._rank_sidecar_path(records, "stacks") == (
+        tmp_path / "ntrace_stacks_rank7.parquet"
+    )
+    assert analyze_runs._rank_sidecar_path(records, "memops") == (
+        tmp_path / "ntrace_memops_rank7.parquet"
+    )
+
+
 def test_hierarchy_classifier_splits_routed_w13_and_w2() -> None:
     frames = [
         {
