@@ -3,6 +3,7 @@
 set -euo pipefail
 
 readonly shard=${SLURM_LOCALID}
+readonly gpu_index=${SLURM_LOCALID}
 readonly scratch="/raid/scratch/${USER}/mxfp8_observed_oracle/${SLURM_JOB_ID}/${shard}"
 readonly shape_file="${OBSERVED_DIR}/shards/shard_${shard}.csv"
 readonly output_dir="${ORACLE_DIR}/shards/${shard}"
@@ -14,6 +15,7 @@ if [[ $(wc -l <"${shape_file}") -le 1 ]]; then
 fi
 
 export PYTHONPATH="${FLASHINFER_ROOT}:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES="${gpu_index}"
 export FLASHINFER_CUDA_ARCH_LIST=10.0a
 export XDG_CACHE_HOME="${scratch}/xdg"
 export FLASHINFER_JIT_DIR="${scratch}/jit"

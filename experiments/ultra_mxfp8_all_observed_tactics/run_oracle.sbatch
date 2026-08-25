@@ -29,8 +29,6 @@ srun --ntasks=1 \
 srun \
   --ntasks="${SHARD_COUNT}" \
   --ntasks-per-node="${SHARD_COUNT}" \
-  --gpus-per-task=1 \
-  --gpu-bind=single:1 \
   --container-image="${CONTAINER_IMAGE}" \
   --container-mounts="${mounts}" \
   --container-workdir="${FLASHINFER_ROOT}" \

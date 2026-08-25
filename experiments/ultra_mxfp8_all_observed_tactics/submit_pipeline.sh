@@ -40,11 +40,11 @@ if [[ "${remote_sha}" != "${SOURCE_COMMIT}" ]]; then
 fi
 ssh "${CLUSTER}" mkdir -p "${RESULT_ROOT}/slurm"
 
-ssh "${CLUSTER}" sbatch --test-only "${oracle_common[@]}" \
+ssh "${CLUSTER}" sbatch --test-only "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
   --export="${export_common},RUN_KIND=capture-eager" \
   "${EXP_DIR}/run_server.sbatch"
-ssh "${CLUSTER}" sbatch --test-only "${remote_common[@]}" \
+ssh "${CLUSTER}" sbatch --test-only "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
   --export="${export_common}" \
   "${EXP_DIR}/run_oracle.sbatch"
