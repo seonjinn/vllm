@@ -99,6 +99,7 @@ num_requests=${CONCURRENCY}
 isl=${ISL}
 osl=${OSL}
 cuda_graph=FULL_AND_PIECEWISE
+ray_executor=v2
 linear_backend=vllm_default
 moe_backend=${backend}
 kv_cache_dtype=auto
@@ -171,6 +172,8 @@ EOF
     PROFILE_FIRST_ATTEMPT=1 \
     NSYS_PROFILE_ENABLED=0 \
     RAY_WORKERS_USE_NSIGHT=0 \
+    RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 \
+    VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 \
     SERVER_NSYS_PROFILE=0 \
     FORCE_EXIT_AFTER_BENCH=1 \
     PYTHONPATH="${NTRACE_RUNTIME}" \

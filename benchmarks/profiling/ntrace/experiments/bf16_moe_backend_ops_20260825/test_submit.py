@@ -32,7 +32,10 @@ def test_dry_run_emits_matched_triton_and_trtllm_arms(tmp_path: Path) -> None:
         "printf 'shape=%s/%s c=%s mult=%s\\n' "
         '"$ISL_SHORT_VALUE" "$OSL_LONG_VALUE" "$BSIZES" "$MULT"\n'
         "printf 'profiler=%s ranks=%s\\n' "
-        '"$SERVER_PROFILER" "$NTRACE_ROLLOUT_RANKS"\n',
+        '"$SERVER_PROFILER" "$NTRACE_ROLLOUT_RANKS"\n'
+        "printf 'ray_v2=%s ray_accel_zero=%s\\n' "
+        '"$VLLM_USE_RAY_V2_EXECUTOR_BACKEND" '
+        '"$RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"\n',
     )
     fake_submit.chmod(0o755)
     _touch(bench_root / "vllm-ultra-ray-bench-serve-static.sh")
@@ -64,6 +67,7 @@ def test_dry_run_emits_matched_triton_and_trtllm_arms(tmp_path: Path) -> None:
     scheduler_contract = "account=coreai_dlalgo_llm partition=batch qos=normal"
     assert completed.stdout.count(scheduler_contract) == 2
     assert completed.stdout.count("profiler=ntrace ranks=0") == 2
+    assert completed.stdout.count("ray_v2=1 ray_accel_zero=0") == 2
     assert "backend=triton" in completed.stdout
     assert "backend=flashinfer_trtllm" in completed.stdout
 
@@ -75,6 +79,7 @@ def test_dry_run_emits_matched_triton_and_trtllm_arms(tmp_path: Path) -> None:
         assert "precision=bf16" in text
         assert "tp=8" in text
         assert "cuda_graph=FULL_AND_PIECEWISE" in text
+        assert "ray_executor=v2" in text
 
 
 def test_runtime_build_uses_oci_srun_container(tmp_path: Path) -> None:
