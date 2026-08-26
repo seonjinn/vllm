@@ -27,7 +27,7 @@ export SCRATCH_ROOT="/raid/scratch/${USER}/mxfp8_all_observed/${SLURM_JOB_ID}"
 
 case "${RUN_KIND}" in
   capture-eager)
-    export WORKLOADS=${WORKLOADS:-"1000:10000 10000:1000 1000:1000"}
+    export WORKLOADS=${WORKLOADS:-"1000:64 10000:64"}
     export CONCURRENCIES=${CONCURRENCIES:-"1 2 4 8 16 32"}
     export PROMPT_MULTIPLIER=${PROMPT_MULTIPLIER:-10}
     export TRACE_PHASE=eager ENFORCE_EAGER=1 USE_LOOKUP=0
