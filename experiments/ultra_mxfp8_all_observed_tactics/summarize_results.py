@@ -157,6 +157,9 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         _load(path)
         for path in sorted(root.glob("oracle/shards/*/cache/exact_cache_metadata.json"))
     ]
+    cache_tuning_times = [
+        float(metadata.get("tuning_time_s", 0.0)) for metadata in cache_metadata
+    ]
     speedups = [float(row["speedup"]) for row in rows]
     regrets = [100.0 * (speedup - 1.0) for speedup in speedups]
     candidate_counts = [int(row["candidate_count"]) for row in rows]
@@ -190,9 +193,8 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         "minimum_oracle_cosine_similarity": min(
             float(row["oracle_cosine_similarity"]) for row in rows
         ),
-        "tuning_time_s": sum(
-            float(metadata.get("tuning_time_s", 0.0)) for metadata in cache_metadata
-        ),
+        "cache_tuning_gpu_s": sum(cache_tuning_times),
+        "cache_tuning_wall_s_estimate": max(cache_tuning_times),
         "top_regrets": top_regrets,
         "reports": [str(path) for path in report_paths],
     }

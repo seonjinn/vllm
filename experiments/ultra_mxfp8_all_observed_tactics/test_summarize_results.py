@@ -118,6 +118,11 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     (cache_dir / "exact_cache_metadata.json").write_text(
         json.dumps({"tuning_time_s": 12.5})
     )
+    second_cache_dir = tmp_path / "oracle" / "shards" / "1" / "cache"
+    second_cache_dir.mkdir(parents=True)
+    (second_cache_dir / "exact_cache_metadata.json").write_text(
+        json.dumps({"tuning_time_s": 2.5})
+    )
 
     summary = summarize_backend(tmp_path, "cute-dsl")
 
@@ -130,7 +135,8 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["oracle"]["shape_count"] == 2
     assert summary["oracle"]["geomean_speedup"] == pytest.approx(1.2**0.5)
     assert summary["oracle"]["different_tactic_count"] == 1
-    assert summary["oracle"]["tuning_time_s"] == pytest.approx(12.5)
+    assert summary["oracle"]["cache_tuning_gpu_s"] == pytest.approx(15.0)
+    assert summary["oracle"]["cache_tuning_wall_s_estimate"] == pytest.approx(12.5)
     assert summary["oracle"]["candidate_count_min"] == 2
     assert summary["oracle"]["candidate_count_max"] == 4
     assert summary["oracle"]["regret_pct_p50"] == pytest.approx(10.0)
