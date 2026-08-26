@@ -22,6 +22,7 @@ _CROSS_BACKEND_METADATA = (
     "flashinfer_file",
     "vllm_version",
     "vllm_file",
+    "vllm_compiled_file",
     "gpu_name",
     "driver_version",
     "container",
@@ -182,6 +183,7 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
         "flashinfer_file",
         "vllm_version",
         "vllm_file",
+        "vllm_compiled_file",
         "gpu_name",
         "driver_version",
         "container",
@@ -229,6 +231,12 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
     if metadata_mismatches:
         raise ValueError(
             f"baseline and lookup metadata do not match: {metadata_mismatches}"
+        )
+    if baseline_metadata["expected_vllm_version"] != baseline_metadata["vllm_version"]:
+        raise ValueError(
+            "vLLM version mismatch: "
+            f"expected={baseline_metadata['expected_vllm_version']}, "
+            f"actual={baseline_metadata['vllm_version']}"
         )
 
     baseline_files = _result_files(baseline_dir)
@@ -432,22 +440,53 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
     backends = {report.get("backend") for report in reports}
     layouts = {report.get("scale_layout") for report in reports}
     flashinfer_commits = {report.get("flashinfer_commit") for report in reports}
+    flashinfer_versions = {report.get("flashinfer_version") for report in reports}
+    flashinfer_files = {report.get("flashinfer_file") for report in reports}
+    container_hashes = {report.get("container_sha256") for report in reports}
     gpus = {report.get("gpu") for report in reports}
+    correctness_configs = {
+        (
+            report.get("correctness", {}).get("minimum_cosine_similarity"),
+            report.get("correctness", {}).get("rtol"),
+            report.get("correctness", {}).get("atol"),
+        )
+        for report in reports
+    }
     if (
         len(backends) != 1
         or len(layouts) != 1
         or len(flashinfer_commits) != 1
+        or len(flashinfer_versions) != 1
+        or len(flashinfer_files) != 1
+        or len(container_hashes) != 1
         or len(gpus) != 1
+        or len(correctness_configs) != 1
         or any(
             value in (None, "")
-            for values in (backends, layouts, flashinfer_commits, gpus)
+            for values in (
+                backends,
+                layouts,
+                flashinfer_commits,
+                flashinfer_versions,
+                flashinfer_files,
+                container_hashes,
+                gpus,
+            )
             for value in values
+        )
+        or any(
+            value in (None, "") for config in correctness_configs for value in config
         )
     ):
         raise ValueError(
             "oracle report provenance mismatch: "
-            f"{backends}, {layouts}, {flashinfer_commits}, {gpus}"
+            f"{backends}, {layouts}, {flashinfer_commits}, {flashinfer_versions}, "
+            f"{flashinfer_files}, {container_hashes}, {gpus}, {correctness_configs}"
         )
+    min_cosine, rtol, atol = next(iter(correctness_configs))
+    correctness_values = [float(min_cosine), float(rtol), float(atol)]
+    if any(not math.isfinite(value) or value < 0 for value in correctness_values):
+        raise ValueError(f"invalid oracle correctness thresholds: {correctness_values}")
     speedups = [float(row["speedup"]) for row in rows]
     selected_times = [float(row["selected_ms"]) for row in rows]
     oracle_times = [float(row["oracle_ms"]) for row in rows]
@@ -468,6 +507,22 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         raise ValueError("oracle reports contain invalid profiling times")
     regrets = [100.0 * (speedup - 1.0) for speedup in speedups]
     candidate_counts = [int(row["candidate_count"]) for row in rows]
+    finite_pass_count = sum(row.get("oracle_finite") is True for row in rows)
+    selected_allclose_pass_count = sum(
+        row.get("oracle_matches_selected") is True for row in rows
+    )
+    bf16_cosine_pass_count = sum(value >= float(min_cosine) for value in cosine_values)
+    if (
+        finite_pass_count != len(rows)
+        or selected_allclose_pass_count != len(rows)
+        or bf16_cosine_pass_count != len(rows)
+    ):
+        raise ValueError(
+            "oracle correctness incomplete: "
+            f"shapes={len(rows)}, finite={finite_pass_count}, "
+            f"selected_allclose={selected_allclose_pass_count}, "
+            f"bf16_cosine={bf16_cosine_pass_count}"
+        )
     top_regrets = []
     for row in sorted(rows, key=lambda item: float(item["speedup"]), reverse=True)[:20]:
         top_regrets.append(
@@ -487,6 +542,9 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         "backend": next(iter(backends)),
         "scale_layout": next(iter(layouts)),
         "flashinfer_commit": next(iter(flashinfer_commits)),
+        "flashinfer_version": next(iter(flashinfer_versions)),
+        "flashinfer_file": next(iter(flashinfer_files)),
+        "container_sha256": next(iter(container_hashes)),
         "gpu": next(iter(gpus)),
         "shape_count": len(rows),
         "geomean_speedup": _geomean(speedups),
@@ -502,6 +560,14 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         "minimum_oracle_cosine_similarity": min(
             float(row["oracle_cosine_similarity"]) for row in rows
         ),
+        "correctness": {
+            "minimum_cosine_similarity_required": float(min_cosine),
+            "rtol": float(rtol),
+            "atol": float(atol),
+            "finite_pass_count": finite_pass_count,
+            "selected_allclose_pass_count": selected_allclose_pass_count,
+            "bf16_cosine_pass_count": bf16_cosine_pass_count,
+        },
         "measured_candidate_gpu_s": sum(measured_candidate_gpu_times),
         "profiling_wall_s_estimate": max(profiling_wall_times),
         "top_regrets": top_regrets,
@@ -554,6 +620,14 @@ def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]
             "incomplete lookup rank coverage: "
             f"expected={sorted(expected_ranks)}, actual={sorted(ranks)}"
         )
+    allowed_sources = {"offline_lookup", "default_autotuner"}
+    unexpected_sources = {
+        source for values in sources.values() for source in values
+    } - allowed_sources
+    if unexpected_sources:
+        raise ValueError(
+            f"unexpected lookup selection sources: {sorted(unexpected_sources)}"
+        )
     conflicts = {key: value for key, value in sources.items() if len(value) != 1}
     if conflicts:
         raise ValueError(
@@ -568,6 +642,33 @@ def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]
     )
     selection_call_count = sum(selection_call_counts.values())
     selection_call_miss_count = selection_call_count - selection_call_hit_count
+    selection_source_counts = {
+        source: sum(
+            count
+            for (*_, observed_source), count in selection_call_counts.items()
+            if observed_source == source
+        )
+        for source in sorted(allowed_sources)
+        if any(key[-1] == source for key in selection_call_counts)
+    }
+    lookup_path = root / "oracle" / "lookup.json"
+    if not lookup_path.is_file():
+        raise ValueError(f"lookup manifest is missing: {lookup_path}")
+    lookup_bytes = lookup_path.read_bytes()
+    lookup_payload = json.loads(lookup_bytes)
+    manifest_fields = (
+        "backend",
+        "scale_layout",
+        "flashinfer_commit",
+        "flashinfer_version",
+        "flashinfer_file",
+        "container_sha256",
+        "gpu",
+        "entry_count",
+    )
+    missing_manifest = [key for key in manifest_fields if not lookup_payload.get(key)]
+    if missing_manifest:
+        raise ValueError(f"lookup manifest is incomplete: {missing_manifest}")
     coverage_by_m = []
     for m in sorted({key[0] for key in sources}):
         group = [value for key, value in sources.items() if key[0] == m]
@@ -591,6 +692,12 @@ def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]
         "selection_call_miss_count": selection_call_miss_count,
         "selection_call_weighted_hit_rate": selection_call_hit_count
         / selection_call_count,
+        "selection_source_counts": selection_source_counts,
+        "manifest": {
+            "path": str(lookup_path),
+            "sha256": hashlib.sha256(lookup_bytes).hexdigest(),
+            **{key: lookup_payload[key] for key in manifest_fields},
+        },
         "coverage_by_m": coverage_by_m,
     }
 
@@ -608,12 +715,18 @@ def summarize_backend(root: Path, backend: str) -> dict[str, Any]:
         "oracle_backend": oracle["backend"],
         "scale_layout": oracle["scale_layout"],
         "flashinfer_commit": oracle["flashinfer_commit"],
+        "flashinfer_version": oracle["flashinfer_version"],
+        "flashinfer_file": oracle["flashinfer_file"],
+        "container_sha256": oracle["container_sha256"],
         "gpu": oracle["gpu"],
     }
     expected_oracle_metadata = {
         "oracle_backend": expected["oracle_backend"],
         "scale_layout": expected["scale_layout"],
         "flashinfer_commit": expected["flashinfer_commit"],
+        "flashinfer_version": expected["flashinfer"],
+        "flashinfer_file": expected["flashinfer_file"],
+        "container_sha256": expected["container_sha256"],
         "gpu": expected["gpu_name"],
     }
     if oracle_metadata != expected_oracle_metadata:
@@ -621,12 +734,32 @@ def summarize_backend(root: Path, backend: str) -> dict[str, Any]:
             "serving and oracle provenance do not match: "
             f"serving={expected_oracle_metadata}, oracle={oracle_metadata}"
         )
+    lookup = _summarize_lookup(root, expected_rank_count=int(expected["tp"]))
+    expected_lookup_manifest = {
+        "backend": expected["oracle_backend"],
+        "scale_layout": expected["scale_layout"],
+        "flashinfer_commit": expected["flashinfer_commit"],
+        "flashinfer_version": expected["flashinfer"],
+        "flashinfer_file": expected["flashinfer_file"],
+        "container_sha256": expected["container_sha256"],
+        "gpu": expected["gpu_name"],
+        "entry_count": oracle["shape_count"],
+    }
+    manifest_mismatches = {
+        key: (value, lookup["manifest"].get(key))
+        for key, value in expected_lookup_manifest.items()
+        if lookup["manifest"].get(key) != value
+    }
+    if manifest_mismatches:
+        raise ValueError(
+            f"serving and lookup provenance do not match: {manifest_mismatches}"
+        )
     return {
         "backend": backend,
         "result_root": str(root),
         "e2e": e2e,
         "oracle": oracle,
-        "lookup": _summarize_lookup(root, expected_rank_count=int(expected["tp"])),
+        "lookup": lookup,
     }
 
 

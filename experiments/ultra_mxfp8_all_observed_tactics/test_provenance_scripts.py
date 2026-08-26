@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,60 @@ import pytest
 EXPERIMENT_DIR = Path(__file__).parent
 SERVER_ENTRYPOINT = EXPERIMENT_DIR / "server_entrypoint.sh"
 PREPARE_ORACLE_INPUTS = EXPERIMENT_DIR / "prepare_oracle_inputs.sh"
+
+
+def test_request_trace_flush_finalizes_live_worker_without_stopping_it(
+    tmp_path: Path,
+) -> None:
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, sys\n"
+                "from pathlib import Path\n"
+                "from experiments.ultra_mxfp8_all_observed_tactics."
+                "shape_tactic_runtime import ShapeTrace\n"
+                "trace = ShapeTrace(Path(sys.argv[1]), 'baseline')\n"
+                "trace.record((2, 2048, 8192), object(), 5, "
+                "'default_autotuner')\n"
+                "print(os.getpid(), flush=True)\n"
+                "while True:\n"
+                "    signal.pause()\n"
+            ),
+            str(tmp_path),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert worker.stdout is not None
+        pid = int(worker.stdout.readline())
+        deadline = time.monotonic() + 2
+        trace_path = tmp_path / f"trace.{pid}.jsonl"
+        while not trace_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert trace_path.is_file()
+
+        result = subprocess.run(
+            [
+                "bash",
+                str(SERVER_ENTRYPOINT),
+                "--request-trace-flush",
+                str(tmp_path),
+                "2",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / f"counts.{pid}.complete").is_file()
+        assert worker.poll() is None
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
 
 
 def _record_cudagraph_evidence(

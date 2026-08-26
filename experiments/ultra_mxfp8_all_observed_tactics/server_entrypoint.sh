@@ -50,6 +50,43 @@ record_cudagraph_evidence() {
   fi
 }
 
+request_trace_flush() {
+  local trace_dir=$1
+  local timeout_s=$2
+  local trace pid
+  local -a traces pids missing
+  shopt -s nullglob
+  traces=("${trace_dir}"/trace.*.jsonl)
+  if ((${#traces[@]} == 0)); then
+    echo "No MXFP8 tactic traces were produced in ${trace_dir}" >&2
+    return 1
+  fi
+  for trace in "${traces[@]}"; do
+    pid=$(basename "${trace}")
+    pid=${pid#trace.}
+    pid=${pid%.jsonl}
+    pids+=("${pid}")
+    if ! kill -USR1 "${pid}" 2>/dev/null; then
+      echo "MXFP8 trace worker ${pid} exited before flush" >&2
+      return 1
+    fi
+  done
+
+  local deadline=$((SECONDS + timeout_s))
+  while true; do
+    missing=()
+    for pid in "${pids[@]}"; do
+      [[ -f "${trace_dir}/counts.${pid}.complete" ]] || missing+=("${pid}")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    if ((SECONDS >= deadline)); then
+      echo "Timed out waiting for MXFP8 trace workers: ${missing[*]}" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 if [[ "${1:-}" == --record-cudagraph-evidence ]]; then
   if (($# != 5)); then
     echo "Usage: $0 --record-cudagraph-evidence RUN_KIND ENFORCE_EAGER SERVER_LOG METADATA" \
@@ -57,6 +94,15 @@ if [[ "${1:-}" == --record-cudagraph-evidence ]]; then
     exit 2
   fi
   record_cudagraph_evidence "$2" "$3" "$4" "$5"
+  exit
+fi
+
+if [[ "${1:-}" == --request-trace-flush ]]; then
+  if (($# != 3)); then
+    echo "Usage: $0 --request-trace-flush TRACE_DIR TIMEOUT_S" >&2
+    exit 2
+  fi
+  request_trace_flush "$2" "$3"
   exit
 fi
 
@@ -295,6 +341,7 @@ PY
   workload_index=$((workload_index + 1))
 done
 
+request_trace_flush "${SCRATCH_ROOT}/traces" 30
 stop_server
 record_cudagraph_evidence \
   "${RUN_KIND}" "${ENFORCE_EAGER}" "${RUN_DIR}/server.log" \

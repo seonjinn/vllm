@@ -8,7 +8,9 @@ import pytest
 
 from experiments.ultra_mxfp8_all_observed_tactics import summarize_results
 from experiments.ultra_mxfp8_all_observed_tactics.summarize_results import (
+    _summarize_e2e,
     _summarize_lookup,
+    _summarize_oracle,
     summarize_backend,
 )
 
@@ -55,6 +57,7 @@ def _write_metadata(path: Path, run_kind: str) -> None:
                 "flashinfer_file=/flashinfer/__init__.py",
                 "vllm_version=0.27.1",
                 "vllm_file=/vllm/__init__.py",
+                "vllm_compiled_file=/site-packages/vllm/_C.abi3.so",
                 "gpu_name=NVIDIA GB200",
                 "driver_version=590.00",
                 "container=/container.sqsh",
@@ -142,6 +145,22 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
         + "\n"
     )
     (traces / "counts.1.complete").touch()
+    oracle_root = tmp_path / "oracle"
+    oracle_root.mkdir()
+    (oracle_root / "lookup.json").write_text(
+        json.dumps(
+            {
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
+                "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
+                "gpu": "NVIDIA GB200",
+                "entry_count": 2,
+            }
+        )
+    )
     report_dir = tmp_path / "oracle" / "shards" / "0" / "oracle"
     report_dir.mkdir(parents=True)
     (report_dir / "report.json").write_text(
@@ -150,7 +169,15 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                 "backend": "cute-dsl",
                 "scale_layout": "128x4",
                 "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
                 "gpu": "NVIDIA GB200",
+                "correctness": {
+                    "minimum_cosine_similarity": 0.98,
+                    "rtol": 0.02,
+                    "atol": 0.1,
+                },
                 "profiling_wall_s": 12.5,
                 "measured_candidate_gpu_s": 15.0,
                 "shapes": [
@@ -166,6 +193,8 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                         "selected_tactic": 3,
                         "oracle_tactic": 7,
                         "oracle_cosine_similarity": 0.999,
+                        "oracle_finite": True,
+                        "oracle_matches_selected": True,
                     },
                     {
                         "m": 2,
@@ -179,6 +208,8 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                         "selected_tactic": 3,
                         "oracle_tactic": 3,
                         "oracle_cosine_similarity": 0.998,
+                        "oracle_finite": True,
+                        "oracle_matches_selected": True,
                     },
                 ],
             }
@@ -196,6 +227,17 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["oracle"]["shape_count"] == 2
     assert summary["oracle"]["geomean_speedup"] == pytest.approx(1.2**0.5)
     assert summary["oracle"]["different_tactic_count"] == 1
+    assert summary["oracle"]["flashinfer_version"] == "0.6.18"
+    assert summary["oracle"]["flashinfer_file"] == "/flashinfer/__init__.py"
+    assert summary["oracle"]["container_sha256"] == "container-sha"
+    assert summary["oracle"]["correctness"] == {
+        "minimum_cosine_similarity_required": pytest.approx(0.98),
+        "rtol": pytest.approx(0.02),
+        "atol": pytest.approx(0.1),
+        "finite_pass_count": 2,
+        "selected_allclose_pass_count": 2,
+        "bf16_cosine_pass_count": 2,
+    }
     assert summary["oracle"]["measured_candidate_gpu_s"] == pytest.approx(15.0)
     assert summary["oracle"]["profiling_wall_s_estimate"] == pytest.approx(12.5)
     assert summary["oracle"]["candidate_count_min"] == 2
@@ -237,6 +279,12 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["lookup"]["unique_miss_count"] == 1
     assert summary["lookup"]["unique_hit_rate"] == pytest.approx(0.5)
     assert summary["lookup"]["selection_call_weighted_hit_rate"] == pytest.approx(0.75)
+    assert summary["lookup"]["selection_source_counts"] == {
+        "default_autotuner": 1,
+        "offline_lookup": 3,
+    }
+    assert summary["lookup"]["manifest"]["backend"] == "cute-dsl"
+    assert len(summary["lookup"]["manifest"]["sha256"]) == 64
     assert summary["lookup"]["coverage_by_m"] == [
         {"m": 1, "unique_dispatch_count": 1, "hit_rate": pytest.approx(1.0)},
         {"m": 2, "unique_dispatch_count": 1, "hit_rate": pytest.approx(0.0)},
@@ -265,6 +313,83 @@ def test_summarize_backend_requires_matched_result_files(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="result files do not match"):
         summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_summarize_e2e_rejects_expected_vllm_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "serving" / "baseline" / "11"
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    baseline.mkdir(parents=True)
+    lookup.mkdir(parents=True)
+    (baseline / "COMPLETE").touch()
+    (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
+    for metadata_path in (baseline / "metadata.txt", lookup / "metadata.txt"):
+        metadata_path.write_text(
+            metadata_path.read_text().replace(
+                "\nvllm_version=0.27.1", "\nvllm_version=0.27.0"
+            )
+        )
+    _write_result(
+        baseline / "result_isl1000_osl1000_c1.json",
+        output_tps=100.0,
+        duration=200.0,
+    )
+    _write_result(
+        lookup / "result_isl1000_osl1000_c1.json",
+        output_tps=110.0,
+        duration=180.0,
+    )
+
+    with pytest.raises(ValueError, match="vLLM version mismatch"):
+        _summarize_e2e(tmp_path)
+
+
+def test_summarize_oracle_rejects_incomplete_correctness(tmp_path: Path) -> None:
+    report_dir = tmp_path / "oracle" / "shards" / "0" / "oracle"
+    report_dir.mkdir(parents=True)
+    (report_dir / "report.json").write_text(
+        json.dumps(
+            {
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
+                "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
+                "gpu": "NVIDIA GB200",
+                "correctness": {
+                    "minimum_cosine_similarity": 0.98,
+                    "rtol": 0.02,
+                    "atol": 0.1,
+                },
+                "profiling_wall_s": 1.0,
+                "measured_candidate_gpu_s": 1.0,
+                "shapes": [
+                    {
+                        "m": 1,
+                        "n": 2304,
+                        "k": 8192,
+                        "speedup": 1.0,
+                        "selected_ms": 1.0,
+                        "oracle_ms": 1.0,
+                        "candidate_count": 1,
+                        "same_tactic": True,
+                        "selected_tactic": 3,
+                        "oracle_tactic": 3,
+                        "oracle_cosine_similarity": 0.99,
+                        "oracle_finite": True,
+                        "oracle_matches_selected": False,
+                    }
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="oracle correctness incomplete"):
+        _summarize_oracle(tmp_path)
 
 
 def test_summarize_backend_requires_matching_cudagraph_evidence(
@@ -325,6 +450,31 @@ def test_summarize_lookup_rejects_incomplete_expected_rank_coverage(
 
     with pytest.raises(ValueError, match="incomplete lookup rank coverage"):
         _summarize_lookup(tmp_path, expected_rank_count=2)
+
+
+def test_summarize_lookup_rejects_unexpected_selection_source(tmp_path: Path) -> None:
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    traces = lookup / "traces"
+    traces.mkdir(parents=True)
+    (lookup / "COMPLETE").touch()
+    (traces / "counts.1.jsonl").write_text(
+        json.dumps(
+            {
+                "m": 1,
+                "n": 2304,
+                "k": 8192,
+                "runner": "CuteRunner",
+                "selection_source": "forced_tactic",
+                "invocation_count": 1,
+                "rank": "0",
+            }
+        )
+        + "\n"
+    )
+    (traces / "counts.1.complete").touch()
+
+    with pytest.raises(ValueError, match="unexpected lookup selection sources"):
+        _summarize_lookup(tmp_path, expected_rank_count=1)
 
 
 def test_comparison_validation_rejects_cross_backend_provenance_mismatch(

@@ -9,6 +9,7 @@ import atexit
 import json
 import math
 import os
+import signal
 import socket
 import sys
 import threading
@@ -204,8 +205,13 @@ class ShapeTrace:
         self._invocation_index = 0
         self._calls_since_flush = 0
         self._rank: str | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         atexit.register(self.finalize)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGUSR1, self._handle_flush_signal)
+
+    def _handle_flush_signal(self, _signum: int, _frame: Any) -> None:
+        self.finalize()
 
     def flush(self) -> None:
         with self._lock:
