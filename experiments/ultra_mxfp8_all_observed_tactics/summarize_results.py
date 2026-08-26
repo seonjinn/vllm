@@ -24,6 +24,17 @@ def _geomean(values: list[float]) -> float:
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
 def _complete_run(root: Path, kind: str) -> Path:
     markers = sorted((root / "serving" / kind).glob("*/COMPLETE"))
     if len(markers) != 1:
@@ -123,18 +134,41 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         for path in sorted(root.glob("oracle/shards/*/cache/exact_cache_metadata.json"))
     ]
     speedups = [float(row["speedup"]) for row in rows]
+    regrets = [100.0 * (speedup - 1.0) for speedup in speedups]
+    candidate_counts = [int(row["candidate_count"]) for row in rows]
+    top_regrets = []
+    for row in sorted(rows, key=lambda item: float(item["speedup"]), reverse=True)[:20]:
+        top_regrets.append(
+            {
+                "m": int(row["m"]),
+                "n": int(row["n"]),
+                "k": int(row["k"]),
+                "candidate_count": int(row["candidate_count"]),
+                "selected_ms": float(row["selected_ms"]),
+                "oracle_ms": float(row["oracle_ms"]),
+                "regret_pct": 100.0 * (float(row["speedup"]) - 1.0),
+                "selected_tactic": row["selected_tactic"],
+                "oracle_tactic": row["oracle_tactic"],
+            }
+        )
     return {
         "shape_count": len(rows),
         "geomean_speedup": _geomean(speedups),
         "max_speedup": max(speedups),
         "max_regret_pct": 100.0 * (max(speedups) - 1.0),
         "different_tactic_count": sum(not row["same_tactic"] for row in rows),
+        "candidate_count_min": min(candidate_counts),
+        "candidate_count_max": max(candidate_counts),
+        "regret_pct_p50": _percentile(regrets, 50.0),
+        "regret_pct_p90": _percentile(regrets, 90.0),
+        "regret_pct_p99": _percentile(regrets, 99.0),
         "minimum_oracle_cosine_similarity": min(
             float(row["oracle_cosine_similarity"]) for row in rows
         ),
         "tuning_time_s": sum(
             float(metadata.get("tuning_time_s", 0.0)) for metadata in cache_metadata
         ),
+        "top_regrets": top_regrets,
         "reports": [str(path) for path in report_paths],
     }
 
