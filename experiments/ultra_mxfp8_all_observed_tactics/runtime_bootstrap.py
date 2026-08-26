@@ -6,12 +6,44 @@
 from __future__ import annotations
 
 import importlib
+import importlib.abc
+import importlib.machinery
 import importlib.util
 import os
 import site
 import sys
 from pathlib import Path
 from types import ModuleType
+
+
+class _CombinedVllmPackageFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, source_package: Path, installed_package: Path) -> None:
+        self.source_package = source_package
+        self.installed_package = installed_package
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: object = None,
+        target: ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        del path, target
+        prefix = "vllm."
+        if not fullname.startswith(prefix):
+            return None
+
+        relative_parts = fullname[len(prefix) :].split(".")
+        source_dir = self.source_package.joinpath(*relative_parts)
+        installed_dir = self.installed_package.joinpath(*relative_parts)
+        source_init = source_dir / "__init__.py"
+        if not source_init.is_file() or not installed_dir.is_dir():
+            return None
+
+        return importlib.util.spec_from_file_location(
+            fullname,
+            source_init,
+            submodule_search_locations=[str(source_dir), str(installed_dir)],
+        )
 
 
 def _verify_import(module: ModuleType, root: Path, name: str) -> None:
@@ -37,6 +69,8 @@ def _installed_package_path(name: str, excluded_roots: tuple[Path, ...]) -> Path
 
 def _load_vllm(source_root: Path, installed_root: Path) -> ModuleType:
     source_package = source_root / "vllm"
+    finder = _CombinedVllmPackageFinder(source_package, installed_root)
+    sys.meta_path.insert(0, finder)
     spec = importlib.util.spec_from_file_location(
         "vllm",
         source_package / "__init__.py",
@@ -50,6 +84,7 @@ def _load_vllm(source_root: Path, installed_root: Path) -> ModuleType:
         spec.loader.exec_module(module)
     except BaseException:
         sys.modules.pop(spec.name, None)
+        sys.meta_path.remove(finder)
         raise
     return module
 
