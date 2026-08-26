@@ -55,37 +55,31 @@ eager_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --output="${RESULT_ROOT}/slurm/capture-eager-%j.out" \
   --export="${export_common},RUN_KIND=capture-eager" \
   "${EXP_DIR}/run_server.sbatch")
-graph_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+baseline_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
-  --job-name="${ACCOUNT}-mx.obs.graph" \
-  --output="${RESULT_ROOT}/slurm/capture-graph-%j.out" \
-  --export="${export_common},RUN_KIND=capture-graph" \
+  --job-name="${ACCOUNT}-mx.obs.baseline" \
+  --output="${RESULT_ROOT}/slurm/baseline-%j.out" \
+  --export="${export_common},RUN_KIND=baseline" \
   "${EXP_DIR}/run_server.sbatch")
 oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
   --job-name="${ACCOUNT}-mx.obs.oracle" \
   --output="${RESULT_ROOT}/slurm/oracle-%j.out" \
-  --dependency="afterok:${eager_job}:${graph_job}" \
+  --dependency="afterok:${eager_job}:${baseline_job}" \
   --export="${export_common}" \
   "${EXP_DIR}/run_oracle.sbatch")
 
-for run_kind in baseline lookup; do
-  extra_export=""
-  if [[ "${run_kind}" == lookup ]]; then
-    extra_export=",LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json"
-  fi
-  job_id=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
-    --time="${SERVER_TIME}" \
-    --job-name="${ACCOUNT}-mx.obs.${run_kind}" \
-    --output="${RESULT_ROOT}/slurm/${run_kind}-%j.out" \
-    --dependency="afterok:${oracle_job}" \
-    --export="${export_common},RUN_KIND=${run_kind}${extra_export}" \
-    "${EXP_DIR}/run_server.sbatch")
-  echo "${run_kind}_job=${job_id}"
-done
+lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+  --time="${SERVER_TIME}" \
+  --job-name="${ACCOUNT}-mx.obs.lookup" \
+  --output="${RESULT_ROOT}/slurm/lookup-%j.out" \
+  --dependency="afterok:${oracle_job}" \
+  --export="${export_common},RUN_KIND=lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
+  "${EXP_DIR}/run_server.sbatch")
 
 echo "capture_eager_job=${eager_job}"
-echo "capture_graph_job=${graph_job}"
+echo "baseline_job=${baseline_job}"
 echo "oracle_job=${oracle_job}"
+echo "lookup_job=${lookup_job}"
 echo "oracle_partition=${ORACLE_PARTITION}"
 echo "result_root=${RESULT_ROOT}"

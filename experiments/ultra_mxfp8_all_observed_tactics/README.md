@@ -17,16 +17,18 @@ then compares the generated lookup with the normal vLLM autotuner.
 - Shape capture concurrency: 1, 2, 4, 8, 16, 32; ten request waves
 - Eager shape probe: 1K/64 and 10K/64 ISL/OSL to expose dynamic scheduler
   mixtures without paying eager-mode cost for long decode
-- CUDA Graph shape capture: full 1K/10K, 10K/1K, and 1K/1K workloads
-- Final A/B concurrency: 1, 8, 32; ten request waves
+- CUDA Graph baseline and shape capture: full 1K/10K, 10K/1K, and 1K/1K
+  workloads
+- Final baseline/lookup A/B concurrency: 1, 8, 32; ten request waves
 - Final execution: CUDA Graph enabled
 
 The short eager capture discovers irregular runtime values such as `M=1001`
 without spending hours decoding in eager mode. Ten waves expose
-continuous-batching mixtures. The graph capture runs the full workloads and
-adds shapes chosen during graph construction. The offline lookup uses an exact
-`(M, N, K, runner)` key. A miss always delegates to the normal FlashInfer
-autotuner.
+continuous-batching mixtures. The baseline run executes the full CUDA Graph
+workloads, records every shape, and supplies the before measurement. The
+offline lookup uses an exact `(M, N, K, runner)` key. A miss always delegates
+to the normal FlashInfer autotuner. The final lookup run repeats the baseline
+workloads after the oracle is built.
 
 ## Run
 
