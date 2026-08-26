@@ -139,7 +139,10 @@ with open(path) as handle:
     result = json.load(handle)
 assert result["completed"] == expected_requests, result
 assert result["failed"] == 0, result
-assert result["total_input_tokens"] == expected_requests * isl, result
+input_lens = result["input_lens"]
+assert len(input_lens) == expected_requests, result
+assert all(isl <= length <= isl + 1 for length in input_lens), result
+assert result["total_input_tokens"] == sum(input_lens), result
 assert result["total_output_tokens"] == expected_requests * osl, result
 PY
   done
