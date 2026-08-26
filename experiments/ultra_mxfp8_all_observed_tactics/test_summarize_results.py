@@ -135,6 +135,26 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["oracle"]["candidate_count_max"] == 4
     assert summary["oracle"]["regret_pct_p50"] == pytest.approx(10.0)
     assert summary["oracle"]["regret_pct_p90"] == pytest.approx(18.0)
+    assert summary["oracle"]["regret_by_m"] == [
+        {
+            "m": 1,
+            "shape_count": 1,
+            "geomean_speedup": pytest.approx(1.2),
+            "regret_pct_p50": pytest.approx(20.0),
+            "regret_pct_p90": pytest.approx(20.0),
+            "max_regret_pct": pytest.approx(20.0),
+            "different_tactic_rate": pytest.approx(1.0),
+        },
+        {
+            "m": 2,
+            "shape_count": 1,
+            "geomean_speedup": pytest.approx(1.0),
+            "regret_pct_p50": pytest.approx(0.0),
+            "regret_pct_p90": pytest.approx(0.0),
+            "max_regret_pct": pytest.approx(0.0),
+            "different_tactic_rate": pytest.approx(0.0),
+        },
+    ]
     assert summary["oracle"]["top_regrets"][0] == {
         "m": 1,
         "n": 2304,
@@ -149,6 +169,10 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["lookup"]["unique_hit_count"] == 1
     assert summary["lookup"]["unique_miss_count"] == 1
     assert summary["lookup"]["unique_hit_rate"] == pytest.approx(0.5)
+    assert summary["lookup"]["coverage_by_m"] == [
+        {"m": 1, "unique_dispatch_count": 1, "hit_rate": pytest.approx(1.0)},
+        {"m": 2, "unique_dispatch_count": 1, "hit_rate": pytest.approx(0.0)},
+    ]
 
 
 def test_summarize_backend_requires_matched_result_files(tmp_path: Path) -> None:

@@ -35,6 +35,30 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+def _regret_by_m(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["m"]), []).append(row)
+
+    summary = []
+    for m, group in sorted(grouped.items()):
+        speedups = [float(row["speedup"]) for row in group]
+        regrets = [100.0 * (speedup - 1.0) for speedup in speedups]
+        summary.append(
+            {
+                "m": m,
+                "shape_count": len(group),
+                "geomean_speedup": _geomean(speedups),
+                "regret_pct_p50": _percentile(regrets, 50.0),
+                "regret_pct_p90": _percentile(regrets, 90.0),
+                "max_regret_pct": max(regrets),
+                "different_tactic_rate": sum(not row["same_tactic"] for row in group)
+                / len(group),
+            }
+        )
+    return summary
+
+
 def _complete_run(root: Path, kind: str) -> Path:
     markers = sorted((root / "serving" / kind).glob("*/COMPLETE"))
     if len(markers) != 1:
@@ -162,6 +186,7 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         "regret_pct_p50": _percentile(regrets, 50.0),
         "regret_pct_p90": _percentile(regrets, 90.0),
         "regret_pct_p99": _percentile(regrets, 99.0),
+        "regret_by_m": _regret_by_m(rows),
         "minimum_oracle_cosine_similarity": min(
             float(row["oracle_cosine_similarity"]) for row in rows
         ),
@@ -196,12 +221,24 @@ def _summarize_lookup(root: Path) -> dict[str, Any]:
         )
     hit_count = sum(next(iter(value)) == "offline_lookup" for value in sources.values())
     miss_count = len(sources) - hit_count
+    coverage_by_m = []
+    for m in sorted({key[0] for key in sources}):
+        group = [value for key, value in sources.items() if key[0] == m]
+        group_hits = sum(next(iter(value)) == "offline_lookup" for value in group)
+        coverage_by_m.append(
+            {
+                "m": m,
+                "unique_dispatch_count": len(group),
+                "hit_rate": group_hits / len(group),
+            }
+        )
     return {
         "trace_process_count": len(trace_paths),
         "unique_dispatch_count": len(sources),
         "unique_hit_count": hit_count,
         "unique_miss_count": miss_count,
         "unique_hit_rate": hit_count / len(sources),
+        "coverage_by_m": coverage_by_m,
     }
 
 
