@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from experiments.ultra_mxfp8_all_observed_tactics import summarize_results
 from experiments.ultra_mxfp8_all_observed_tactics.summarize_results import (
+    _summarize_lookup,
     summarize_backend,
 )
 
@@ -58,7 +60,7 @@ def _write_metadata(path: Path, run_kind: str) -> None:
                 "container=/container.sqsh",
                 "container_sha256=container-sha",
                 "model=/model",
-                "tp=4",
+                "tp=1",
                 "linear_backend=flashinfer_cutedsl",
                 "trtllm_layout=8x4",
                 "moe_backend=flashinfer_trtllm",
@@ -121,6 +123,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                         "runner": "CuteRunner",
                         "selection_source": "offline_lookup",
                         "invocation_count": 3,
+                        "rank": "0",
                     }
                 ),
                 json.dumps(
@@ -131,6 +134,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                         "runner": "CuteRunner",
                         "selection_source": "default_autotuner",
                         "invocation_count": 1,
+                        "rank": "0",
                     }
                 ),
             ]
@@ -188,6 +192,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["e2e"]["workloads"][0]["duration_reduction_pct"] == pytest.approx(
         10.0
     )
+    assert len(summary["e2e"]["workloads"][0]["artifact_signature"]) == 64
     assert summary["oracle"]["shape_count"] == 2
     assert summary["oracle"]["geomean_speedup"] == pytest.approx(1.2**0.5)
     assert summary["oracle"]["different_tactic_count"] == 1
@@ -293,6 +298,96 @@ def test_summarize_backend_requires_matching_cudagraph_evidence(
 
     with pytest.raises(ValueError, match="metadata do not match"):
         summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_summarize_lookup_rejects_incomplete_expected_rank_coverage(
+    tmp_path: Path,
+) -> None:
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    traces = lookup / "traces"
+    traces.mkdir(parents=True)
+    (lookup / "COMPLETE").touch()
+    (traces / "counts.1.jsonl").write_text(
+        json.dumps(
+            {
+                "m": 1,
+                "n": 2304,
+                "k": 8192,
+                "runner": "CuteRunner",
+                "selection_source": "offline_lookup",
+                "invocation_count": 1,
+                "rank": "0",
+            }
+        )
+        + "\n"
+    )
+    (traces / "counts.1.complete").touch()
+
+    with pytest.raises(ValueError, match="incomplete lookup rank coverage"):
+        _summarize_lookup(tmp_path, expected_rank_count=2)
+
+
+def test_comparison_validation_rejects_cross_backend_provenance_mismatch(
+    tmp_path: Path,
+) -> None:
+    metadata_path = tmp_path / "metadata.txt"
+    _write_metadata(metadata_path, "baseline")
+    metadata = dict(
+        line.split("=", 1) for line in metadata_path.read_text().splitlines()
+    )
+
+    def summary(backend: str, model: str) -> dict:
+        backend_metadata = {**metadata, "backend_name": backend, "model": model}
+        return {
+            "backend": backend,
+            "e2e": {
+                "metadata": backend_metadata,
+                "workloads": [
+                    {
+                        "isl": 1000,
+                        "osl": 1000,
+                        "concurrency": 1,
+                        "artifact_signature": "same",
+                    }
+                ],
+            },
+        }
+
+    with pytest.raises(ValueError, match="cross-backend provenance mismatch"):
+        summarize_results.validate_comparison_summaries(
+            [summary("cute-dsl", "/model-a"), summary("cutlass", "/model-b")]
+        )
+
+
+def test_comparison_validation_rejects_cross_backend_artifact_mismatch(
+    tmp_path: Path,
+) -> None:
+    metadata_path = tmp_path / "metadata.txt"
+    _write_metadata(metadata_path, "baseline")
+    metadata = dict(
+        line.split("=", 1) for line in metadata_path.read_text().splitlines()
+    )
+
+    def summary(backend: str, signature: str) -> dict:
+        return {
+            "backend": backend,
+            "e2e": {
+                "metadata": {**metadata, "backend_name": backend},
+                "workloads": [
+                    {
+                        "isl": 1000,
+                        "osl": 1000,
+                        "concurrency": 1,
+                        "artifact_signature": signature,
+                    }
+                ],
+            },
+        }
+
+    with pytest.raises(ValueError, match="cross-backend artifact mismatch"):
+        summarize_results.validate_comparison_summaries(
+            [summary("cute-dsl", "one"), summary("cutlass", "two")]
+        )
 
 
 def test_summarize_backend_rejects_generated_text_mismatch(tmp_path: Path) -> None:

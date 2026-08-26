@@ -8,10 +8,47 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
 from typing import Any
+
+_CROSS_BACKEND_METADATA = (
+    "source_commit",
+    "flashinfer_commit",
+    "expected_vllm_version",
+    "flashinfer",
+    "flashinfer_file",
+    "vllm_version",
+    "vllm_file",
+    "gpu_name",
+    "driver_version",
+    "container",
+    "container_sha256",
+    "model",
+    "tp",
+    "moe_backend",
+    "attention_backend",
+    "kv_cache_dtype",
+    "max_model_len",
+    "max_num_batched_tokens",
+    "max_num_seqs",
+    "gpu_memory_utilization",
+    "enable_chunked_prefill",
+    "enable_prefix_caching",
+    "mamba_cache_mode",
+    "mamba_ssm_cache_dtype",
+    "enforce_eager",
+    "cudagraph_capture_sizes",
+    "cudagraph_configured",
+    "cudagraph_capture_status",
+    "cudagraph_capture_evidence",
+    "cudagraph_capture_marker",
+    "workloads",
+    "concurrencies",
+    "prompt_multiplier",
+)
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -111,6 +148,22 @@ def _result_files(run_dir: Path) -> dict[tuple[int, int, int], Path]:
         )
         results[key] = path
     return results
+
+
+def _artifact_signature(result: dict[str, Any]) -> str:
+    payload = {
+        key: result[key]
+        for key in (
+            "completed",
+            "total_input_tokens",
+            "total_output_tokens",
+            "input_lens",
+            "output_lens",
+            "generated_texts",
+        )
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _summarize_e2e(root: Path) -> dict[str, Any]:
@@ -275,6 +328,7 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
                 "completed": lookup["completed"],
                 "total_input_tokens": lookup["total_input_tokens"],
                 "total_output_tokens": lookup["total_output_tokens"],
+                "artifact_signature": _artifact_signature(lookup),
                 "baseline_output_throughput": baseline_metrics["output_throughput"],
                 "lookup_output_throughput": lookup_metrics["output_throughput"],
                 "output_throughput_speedup": (
@@ -315,6 +369,56 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
         ),
         "workloads": workloads,
     }
+
+
+def validate_comparison_summaries(summaries: list[dict[str, Any]]) -> None:
+    if not summaries:
+        raise ValueError("comparison requires at least one backend summary")
+
+    backends = [str(summary["backend"]) for summary in summaries]
+    if len(set(backends)) != len(backends):
+        raise ValueError(f"duplicate backend summaries: {backends}")
+
+    reference = summaries[0]
+    reference_metadata = reference["e2e"]["metadata"]
+    reference_workloads = {
+        (row["isl"], row["osl"], row["concurrency"]): row["artifact_signature"]
+        for row in reference["e2e"]["workloads"]
+    }
+    for summary in summaries[1:]:
+        metadata = summary["e2e"]["metadata"]
+        mismatches = {
+            key: (reference_metadata.get(key), metadata.get(key))
+            for key in _CROSS_BACKEND_METADATA
+            if reference_metadata.get(key) != metadata.get(key)
+        }
+        if mismatches:
+            raise ValueError(
+                "cross-backend provenance mismatch: "
+                f"{reference['backend']} vs {summary['backend']}: {mismatches}"
+            )
+
+        workloads = {
+            (row["isl"], row["osl"], row["concurrency"]): row["artifact_signature"]
+            for row in summary["e2e"]["workloads"]
+        }
+        if workloads.keys() != reference_workloads.keys():
+            raise ValueError(
+                "cross-backend workload mismatch: "
+                f"{reference['backend']}={sorted(reference_workloads)}, "
+                f"{summary['backend']}={sorted(workloads)}"
+            )
+        artifact_mismatches = {
+            key: (reference_workloads[key], workloads[key])
+            for key in reference_workloads
+            if reference_workloads[key] != workloads[key]
+        }
+        if artifact_mismatches:
+            raise ValueError(
+                "cross-backend artifact mismatch: "
+                f"{reference['backend']} vs {summary['backend']}: "
+                f"{artifact_mismatches}"
+            )
 
 
 def _summarize_oracle(root: Path) -> dict[str, Any]:
@@ -405,10 +509,11 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
     }
 
 
-def _summarize_lookup(root: Path) -> dict[str, Any]:
+def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]:
     lookup_dir = _complete_run(root, "lookup")
     sources: dict[tuple[int, int, int, str], set[str]] = {}
     selection_call_counts: dict[tuple[int, int, int, str, str], int] = {}
+    ranks: set[str] = set()
     trace_dir = lookup_dir / "traces"
     count_paths = sorted(trace_dir.glob("counts.*.jsonl"))
     unfinished = [
@@ -437,11 +542,18 @@ def _summarize_lookup(root: Path) -> dict[str, Any]:
                 str(row["runner"]),
             )
             source = str(row["selection_source"])
+            ranks.add(str(row.get("rank", "unknown")))
             sources.setdefault(key, set()).add(source)
             count_key = (*key, source)
             selection_call_counts[count_key] = selection_call_counts.get(
                 count_key, 0
             ) + _positive_count(row, path)
+    expected_ranks = {str(rank) for rank in range(expected_rank_count)}
+    if ranks != expected_ranks:
+        raise ValueError(
+            "incomplete lookup rank coverage: "
+            f"expected={sorted(expected_ranks)}, actual={sorted(ranks)}"
+        )
     conflicts = {key: value for key, value in sources.items() if len(value) != 1}
     if conflicts:
         raise ValueError(
@@ -469,6 +581,7 @@ def _summarize_lookup(root: Path) -> dict[str, Any]:
         )
     return {
         "trace_process_count": len(trace_paths),
+        "ranks": sorted(ranks),
         "unique_dispatch_count": len(sources),
         "unique_hit_count": hit_count,
         "unique_miss_count": miss_count,
@@ -513,7 +626,7 @@ def summarize_backend(root: Path, backend: str) -> dict[str, Any]:
         "result_root": str(root),
         "e2e": e2e,
         "oracle": oracle,
-        "lookup": _summarize_lookup(root),
+        "lookup": _summarize_lookup(root, expected_rank_count=int(expected["tp"])),
     }
 
 
@@ -546,6 +659,7 @@ def main() -> None:
         if not separator:
             parser.error(f"invalid --result {value!r}; expected BACKEND=PATH")
         summaries.append(summarize_backend(Path(root), backend))
+    validate_comparison_summaries(summaries)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps({"backends": summaries}, indent=2) + "\n")
     _write_csv(args.output_csv, summaries)
