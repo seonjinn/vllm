@@ -14,7 +14,11 @@ readonly GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader)
 
 server_env=(
   env
-  "PYTHONPATH=${EXP_DIR}:${FLASHINFER_ROOT}:${PYTHONPATH:-}"
+  "PYTHONPATH=${EXP_DIR}:${SOURCE_ROOT}:${PYTHONPATH:-}"
+  "SOURCE_ROOT=${SOURCE_ROOT}"
+  "FLASHINFER_ROOT=${FLASHINFER_ROOT}"
+  "FLASHINFER_COMMIT=${FLASHINFER_COMMIT}"
+  "EXPECTED_CONTAINER_SHA256=${EXPECTED_CONTAINER_SHA256}"
   "EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}"
   "MXFP8_TACTIC_TRACE_DIR=${SCRATCH_ROOT}/traces"
   "MXFP8_TACTIC_TRACE_PHASE=${TRACE_PHASE}"
@@ -95,7 +99,7 @@ fi
   printf "\n"
   echo "vllm_version=$("${server_env[@]}" vllm --version)"
   "${server_env[@]}" uv run --no-project python -c \
-    'import flashinfer, vllm; print("vllm_file=" + vllm.__file__); print("flashinfer=" + flashinfer.__version__); print("flashinfer_file=" + flashinfer.__file__)'
+    'import flashinfer, vllm, vllm._C; print("vllm_file=" + vllm.__file__); print("vllm_compiled_file=" + vllm._C.__file__); print("flashinfer=" + flashinfer.__version__); print("flashinfer_file=" + flashinfer.__file__)'
   echo "gpu_name=${GPU_NAME}"
   echo "driver_version=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader)"
 } >"${RUN_DIR}/metadata.txt"

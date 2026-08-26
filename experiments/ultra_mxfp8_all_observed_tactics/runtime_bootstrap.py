@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Verify the container vLLM and configure the pinned FlashInfer overlay."""
+"""Join the pinned vLLM Python tree to the container's compiled runtime."""
 
 from __future__ import annotations
 
-import importlib.util
 import os
+import site
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -21,28 +21,40 @@ def _verify_import(module: ModuleType, root: Path, name: str) -> None:
         )
 
 
-def _configure_flashinfer_source_jit(root: Path) -> None:
-    helper_path = root / "benchmarks" / "bench_cutedsl_mxfp8_serving_shapes.py"
-    spec = importlib.util.spec_from_file_location(
-        "_mxfp8_flashinfer_source_jit", helper_path
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load FlashInfer JIT helper: {helper_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    module._configure_source_jit_paths()
+def _installed_package_path(name: str, source_root: Path) -> Path:
+    candidates = [Path(root) / name for root in site.getsitepackages()]
+    candidates.extend(Path(root) / name for root in sys.path if root)
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_dir() and not resolved.is_relative_to(source_root.resolve()):
+            return resolved
+    raise RuntimeError(f"cannot find installed {name} package outside {source_root}")
 
 
 def configure_runtime() -> None:
+    source_root = Path(os.environ["SOURCE_ROOT"])
     flashinfer_root = Path(os.environ["FLASHINFER_ROOT"])
+
+    import vllm
+
+    _verify_import(vllm, source_root, "vLLM")
+    installed_vllm = _installed_package_path("vllm", source_root)
+    installed_vllm_text = str(installed_vllm)
+    if installed_vllm_text not in vllm.__path__:
+        vllm.__path__.append(installed_vllm_text)
+
+    import vllm._C
+
+    _verify_import(vllm._C, installed_vllm, "vLLM compiled extension")
 
     import flashinfer
 
-    _verify_import(flashinfer, flashinfer_root, "FlashInfer")
-    _configure_flashinfer_source_jit(flashinfer_root)
-
-    import vllm
+    flashinfer_path = Path(flashinfer.__file__ or "").resolve()
+    if flashinfer_path.is_relative_to(flashinfer_root.resolve()):
+        raise RuntimeError(
+            "FlashInfer source overlay is incompatible with the container's "
+            f"compiled modules: {flashinfer_path}"
+        )
 
     expected_vllm_version = os.environ["EXPECTED_VLLM_VERSION"]
     if vllm.__version__ != expected_vllm_version:

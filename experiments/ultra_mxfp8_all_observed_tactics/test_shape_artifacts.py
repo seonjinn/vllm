@@ -237,6 +237,9 @@ def test_build_lookup_requires_complete_observed_shape_coverage(
                 "backend": "cute-dsl",
                 "scale_layout": "128x4",
                 "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/installed/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
                 "gpu": "NVIDIA GB200",
                 "shapes": [
                     {
@@ -270,6 +273,9 @@ def test_build_lookup_uses_observed_runner_and_oracle_tactic(tmp_path: Path) -> 
                 "backend": "cute-dsl",
                 "scale_layout": "128x4",
                 "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/installed/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
                 "gpu": "NVIDIA GB200",
                 "shapes": [
                     {
@@ -297,6 +303,8 @@ def test_build_lookup_uses_observed_runner_and_oracle_tactic(tmp_path: Path) -> 
     assert lookup["entry_count"] == 1
     assert lookup["backend"] == "cute-dsl"
     assert lookup["flashinfer_commit"] == "def456"
+    assert lookup["flashinfer_version"] == "0.6.18"
+    assert lookup["container_sha256"] == "container-sha"
     assert lookup["entries"][0]["runner"] == "CuteRunner"
     assert lookup["entries"][0]["tactic"] == [
         [128, 32],
@@ -317,6 +325,9 @@ def test_build_lookup_requires_explicit_correctness_fields(tmp_path: Path) -> No
                 "backend": "cute-dsl",
                 "scale_layout": "128x4",
                 "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/installed/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
                 "gpu": "NVIDIA GB200",
                 "shapes": [
                     {
@@ -352,6 +363,9 @@ def test_build_lookup_rejects_oracle_for_different_serving_tactic(
                 "backend": "cute-dsl",
                 "scale_layout": "128x4",
                 "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/installed/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
                 "gpu": "NVIDIA GB200",
                 "shapes": [
                     {

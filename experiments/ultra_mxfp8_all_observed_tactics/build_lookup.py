@@ -53,6 +53,9 @@ def build_lookup(
                 "backend": report.get("backend"),
                 "scale_layout": report.get("scale_layout"),
                 "flashinfer_commit": report.get("flashinfer_commit"),
+                "flashinfer_version": report.get("flashinfer_version"),
+                "flashinfer_file": report.get("flashinfer_file"),
+                "container_sha256": report.get("container_sha256"),
                 "gpu": report.get("gpu"),
             }
         )
@@ -116,21 +119,37 @@ def build_lookup(
     backends = {item["backend"] for item in metadata}
     layouts = {item["scale_layout"] for item in metadata}
     flashinfer_commits = {item["flashinfer_commit"] for item in metadata}
+    flashinfer_versions = {item["flashinfer_version"] for item in metadata}
+    flashinfer_files = {item["flashinfer_file"] for item in metadata}
+    container_hashes = {item["container_sha256"] for item in metadata}
     gpus = {item["gpu"] for item in metadata}
     if (
         len(backends) != 1
         or len(layouts) != 1
         or len(flashinfer_commits) != 1
+        or len(flashinfer_versions) != 1
+        or len(flashinfer_files) != 1
+        or len(container_hashes) != 1
         or len(gpus) != 1
         or any(
             value in (None, "")
-            for values in (backends, layouts, flashinfer_commits, gpus)
+            for values in (
+                backends,
+                layouts,
+                flashinfer_commits,
+                flashinfer_versions,
+                flashinfer_files,
+                container_hashes,
+                gpus,
+            )
             for value in values
         )
     ):
         raise ValueError(
-            "oracle reports must have one backend/layout/FlashInfer commit/GPU: "
-            f"{backends}, {layouts}, {flashinfer_commits}, {gpus}"
+            "oracle reports must have one backend/layout/FlashInfer runtime/"
+            "container/GPU: "
+            f"{backends}, {layouts}, {flashinfer_commits}, "
+            f"{flashinfer_versions}, {flashinfer_files}, {container_hashes}, {gpus}"
         )
     payload = {
         "format_version": 1,
@@ -138,6 +157,9 @@ def build_lookup(
         "backend": next(iter(backends)),
         "scale_layout": next(iter(layouts)),
         "flashinfer_commit": next(iter(flashinfer_commits)),
+        "flashinfer_version": next(iter(flashinfer_versions)),
+        "flashinfer_file": next(iter(flashinfer_files)),
+        "container_sha256": next(iter(container_hashes)),
         "gpu": next(iter(gpus)),
         "entry_count": len(entries),
         "observed_shapes": str(observed_path),

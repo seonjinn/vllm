@@ -59,5 +59,11 @@ Durable traces, lookup metadata, oracle reports, and benchmark JSON files are
 written below the printed Lustre result root. JIT, autotune, and Python caches
 are created under `/raid/scratch` and removed when each job exits.
 
+The server loads the pinned vLLM Python tree but resolves `vllm._C` from the
+SHA256-pinned v0.27.1 container. It always uses the container's installed
+FlashInfer package and compiled modules. The separate FlashInfer checkout pins
+only the offline-profiler scripts; workers copy those scripts to node-local
+scratch so the checkout cannot shadow the installed `flashinfer` package.
+
 Serving jobs use `gb200`. The longer exhaustive oracle defaults to the
 eight-hour `gb200-backfill` partition; override `ORACLE_PARTITION` when needed.

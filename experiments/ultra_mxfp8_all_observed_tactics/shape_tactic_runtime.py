@@ -82,6 +82,8 @@ class TacticLookup:
         expected_backend: str | None = None,
         expected_scale_layout: str | None = None,
         expected_flashinfer_commit: str | None = None,
+        expected_flashinfer_version: str | None = None,
+        expected_container_sha256: str | None = None,
         expected_gpu: str | None = None,
     ) -> TacticLookup:
         payload = json.loads(path.read_text())
@@ -109,6 +111,24 @@ class TacticLookup:
                 "lookup FlashInfer commit mismatch: "
                 f"expected={expected_flashinfer_commit}, "
                 f"actual={payload.get('flashinfer_commit')}"
+            )
+        if (
+            expected_flashinfer_version is not None
+            and payload.get("flashinfer_version") != expected_flashinfer_version
+        ):
+            raise ValueError(
+                "lookup FlashInfer version mismatch: "
+                f"expected={expected_flashinfer_version}, "
+                f"actual={payload.get('flashinfer_version')}"
+            )
+        if (
+            expected_container_sha256 is not None
+            and payload.get("container_sha256") != expected_container_sha256
+        ):
+            raise ValueError(
+                "lookup container SHA256 mismatch: "
+                f"expected={expected_container_sha256}, "
+                f"actual={payload.get('container_sha256')}"
             )
         if expected_gpu is not None and payload.get("gpu") != expected_gpu:
             raise ValueError(
@@ -279,10 +299,13 @@ def install_from_environment() -> None:
         )
     lookup = None
     if lookup_path_raw:
+        import flashinfer
+
         required = {
             "MXFP8_TACTIC_BACKEND": os.getenv("MXFP8_TACTIC_BACKEND"),
             "MXFP8_TACTIC_SCALE_LAYOUT": os.getenv("MXFP8_TACTIC_SCALE_LAYOUT"),
             "FLASHINFER_COMMIT": os.getenv("FLASHINFER_COMMIT"),
+            "EXPECTED_CONTAINER_SHA256": os.getenv("EXPECTED_CONTAINER_SHA256"),
             "MXFP8_TACTIC_GPU": os.getenv("MXFP8_TACTIC_GPU"),
         }
         missing = [name for name, value in required.items() if not value]
@@ -293,6 +316,8 @@ def install_from_environment() -> None:
             expected_backend=required["MXFP8_TACTIC_BACKEND"],
             expected_scale_layout=required["MXFP8_TACTIC_SCALE_LAYOUT"],
             expected_flashinfer_commit=required["FLASHINFER_COMMIT"],
+            expected_flashinfer_version=flashinfer.__version__,
+            expected_container_sha256=required["EXPECTED_CONTAINER_SHA256"],
             expected_gpu=required["MXFP8_TACTIC_GPU"],
         )
     AutoTuner.choose_one = make_dispatcher(AutoTuner.choose_one, lookup, trace)

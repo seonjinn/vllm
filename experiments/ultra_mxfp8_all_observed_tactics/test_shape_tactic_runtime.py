@@ -163,6 +163,27 @@ def test_lookup_rejects_flashinfer_commit_mismatch(tmp_path: Path) -> None:
         )
 
 
+def test_lookup_rejects_flashinfer_runtime_mismatch(tmp_path: Path) -> None:
+    lookup_path = tmp_path / "lookup.json"
+    lookup_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "flashinfer_version": "0.6.18",
+                "container_sha256": "container-sha",
+                "entries": [
+                    {"m": 1, "n": 2304, "k": 8192, "runner": "TrtRunner", "tactic": 7}
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="FlashInfer version mismatch"):
+        TacticLookup.load(lookup_path, expected_flashinfer_version="0.6.17")
+    with pytest.raises(ValueError, match="container SHA256 mismatch"):
+        TacticLookup.load(lookup_path, expected_container_sha256="different")
+
+
 def test_lookup_rejects_gpu_mismatch(tmp_path: Path) -> None:
     lookup_path = tmp_path / "lookup.json"
     lookup_path.write_text(
