@@ -101,8 +101,8 @@ if [[ "${pinned_flashinfer_sha}" != "${flashinfer_commit}" ]] || \
   echo "Pinned FlashInfer worktree is not clean at ${flashinfer_commit}: ${FLASHINFER_ROOT}" >&2
   exit 1
 fi
-container_sha=$(ssh "${CLUSTER}" awk -F= \
-  '$1 == "sha256" {print $2}' "${CONTAINER_IMAGE}.metadata.txt")
+container_sha=$(ssh "${CLUSTER}" cat "${CONTAINER_IMAGE}.metadata.txt" | \
+  awk -F= '$1 == "sha256" {print $2}')
 if [[ "${container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
   echo "Expected container ${EXPECTED_CONTAINER_SHA256}, got ${container_sha}" >&2
   exit 1
