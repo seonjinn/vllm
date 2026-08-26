@@ -3,15 +3,15 @@
 This experiment repeats the vLLM 0.20.2 all-observed workflow on vLLM 0.27.1.
 It does not assume that serving uses only power-of-two token counts. It records
 every exact dense MXFP8 `(M, N, K)` dispatched by the Ultra workload, profiles
-every valid CuTeDSL tactic for each shape under CUDA Graph replay and cold L2,
-then compares the generated lookup with the normal vLLM autotuner.
+every valid tactic for each shape under CUDA Graph replay and cold L2, then
+compares the generated lookup with the normal vLLM autotuner.
 
 ## Contract
 
 - Model: Nemotron 3 Ultra MXFP8
 - Hardware: one GB200 node
 - Parallelism: TP4, DP1, expert parallel enabled
-- Dense backend: vLLM `auto` (CuTeDSL on GB200)
+- Dense backend: CuTeDSL, FlashInfer CUTLASS, or FlashInfer TRTLLM
 - MoE backend: FlashInfer TRTLLM
 - Workloads: 1K/10K, 10K/1K, and 1K/1K ISL/OSL
 - Shape capture concurrency: 1, 2, 4, 8, 16, 32; ten request waves
@@ -36,8 +36,14 @@ Push this branch before submission, then initialize the remote source under
 `/home` and launch the dependency chain:
 
 ```bash
-./experiments/ultra_mxfp8_all_observed_tactics/submit_pipeline.sh
+BACKEND=cute-dsl ./experiments/ultra_mxfp8_all_observed_tactics/submit_pipeline.sh
+BACKEND=cutlass ./experiments/ultra_mxfp8_all_observed_tactics/submit_pipeline.sh
+BACKEND=trtllm ./experiments/ultra_mxfp8_all_observed_tactics/submit_pipeline.sh
 ```
+
+CuTeDSL and CUTLASS use the required `128x4` scale layout. The TRTLLM arm uses
+its fixed `8x4` default so that exact tactic selection is measured separately
+from adaptive scale-layout selection.
 
 Durable traces, lookup metadata, oracle reports, and benchmark JSON files are
 written below the printed Lustre result root. JIT, autotune, and Python caches

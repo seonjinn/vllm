@@ -16,6 +16,7 @@ server_env=(
   "PYTHONPATH=${EXP_DIR}:${PYTHONPATH:-}"
   "MXFP8_TACTIC_TRACE_DIR=${RUN_DIR}/traces"
   "MXFP8_TACTIC_TRACE_PHASE=${TRACE_PHASE}"
+  "VLLM_MXFP8_TRTLLM_LAYOUT=${TRTLLM_LAYOUT}"
 )
 if [[ "${USE_LOOKUP}" == 1 ]]; then
   server_env+=("MXFP8_TACTIC_LOOKUP=${LOOKUP_PATH}")
@@ -56,11 +57,13 @@ fi
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "job_id=${SLURM_JOB_ID}"
   echo "run_kind=${RUN_KIND}"
+  echo "backend_name=${BACKEND_NAME}"
   echo "source_commit=${SOURCE_COMMIT}"
   echo "container=${CONTAINER_IMAGE}"
   echo "model=${MODEL_PATH}"
   echo "tp=${TP}"
   echo "linear_backend=${LINEAR_BACKEND}"
+  echo "trtllm_layout=${TRTLLM_LAYOUT}"
   echo "moe_backend=${MOE_BACKEND}"
   echo "workloads=${WORKLOADS}"
   echo "concurrencies=${CONCURRENCIES}"

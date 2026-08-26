@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+readonly LOCAL_EXP_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+readonly BACKEND=${BACKEND:-cute-dsl}
+eval "$(python3 "${LOCAL_EXP_DIR}/backend_config.py" "${BACKEND}")"
+readonly BACKEND_NAME LINEAR_BACKEND ORACLE_BACKEND SCALE_LAYOUT TRTLLM_LAYOUT
 readonly CLUSTER=${CLUSTER:-sna-mfa@login-lyris}
 readonly ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
 readonly PARTITION=${PARTITION:-gb200}
@@ -12,7 +16,7 @@ readonly FLASHINFER_ROOT=${FLASHINFER_ROOT:-/home/sna/flashinfer-mxfp8-all-backe
 readonly CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64_20260813_2688476.sqsh}
 readonly MODEL_PATH=${MODEL_PATH:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8}
 readonly STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
-readonly RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/results/mxfp8_all_observed_tactics_${STAMP}}
+readonly RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/results/mxfp8_all_observed_tactics_${BACKEND_NAME}_${STAMP}}
 readonly SOURCE_COMMIT=${SOURCE_COMMIT:-$(git rev-parse HEAD)}
 readonly SERVER_TIME=${SERVER_TIME:-04:00:00}
 readonly ORACLE_TIME=${ORACLE_TIME:-08:00:00}
@@ -30,7 +34,7 @@ oracle_common=(
   --qos="${QOS}"
   --nodes=1
 )
-export_common="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},MODEL_PATH=${MODEL_PATH},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},FLASHINFER_ROOT=${FLASHINFER_ROOT},RESULT_ROOT=${RESULT_ROOT}"
+export_common="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},MODEL_PATH=${MODEL_PATH},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},FLASHINFER_ROOT=${FLASHINFER_ROOT},RESULT_ROOT=${RESULT_ROOT},BACKEND_NAME=${BACKEND_NAME},LINEAR_BACKEND=${LINEAR_BACKEND},ORACLE_BACKEND=${ORACLE_BACKEND},SCALE_LAYOUT=${SCALE_LAYOUT},TRTLLM_LAYOUT=${TRTLLM_LAYOUT}"
 
 ssh "${CLUSTER}" git -C "${SOURCE_ROOT}" pull --ff-only
 remote_sha=$(ssh "${CLUSTER}" git -C "${SOURCE_ROOT}" rev-parse HEAD)
@@ -51,19 +55,19 @@ ssh "${CLUSTER}" sbatch --test-only "${oracle_common[@]}" \
 
 eager_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
-  --job-name="${ACCOUNT}-mx.obs.eager" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.eager" \
   --output="${RESULT_ROOT}/slurm/capture-eager-%j.out" \
   --export="${export_common},RUN_KIND=capture-eager" \
   "${EXP_DIR}/run_server.sbatch")
 baseline_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
-  --job-name="${ACCOUNT}-mx.obs.baseline" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.base" \
   --output="${RESULT_ROOT}/slurm/baseline-%j.out" \
   --export="${export_common},RUN_KIND=baseline" \
   "${EXP_DIR}/run_server.sbatch")
 oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
-  --job-name="${ACCOUNT}-mx.obs.oracle" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.oracle" \
   --output="${RESULT_ROOT}/slurm/oracle-%j.out" \
   --dependency="afterok:${eager_job}:${baseline_job}" \
   --export="${export_common}" \
@@ -71,7 +75,7 @@ oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${oracle_common[@]}" \
 
 lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
-  --job-name="${ACCOUNT}-mx.obs.lookup" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.lookup" \
   --output="${RESULT_ROOT}/slurm/lookup-%j.out" \
   --dependency="afterok:${oracle_job}" \
   --export="${export_common},RUN_KIND=lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
@@ -81,5 +85,9 @@ echo "capture_eager_job=${eager_job}"
 echo "baseline_job=${baseline_job}"
 echo "oracle_job=${oracle_job}"
 echo "lookup_job=${lookup_job}"
+echo "backend=${BACKEND_NAME}"
+echo "linear_backend=${LINEAR_BACKEND}"
+echo "oracle_backend=${ORACLE_BACKEND}"
+echo "scale_layout=${SCALE_LAYOUT}"
 echo "oracle_partition=${ORACLE_PARTITION}"
 echo "result_root=${RESULT_ROOT}"

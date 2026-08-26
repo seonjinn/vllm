@@ -9,6 +9,8 @@ set -euo pipefail
 : "${SOURCE_ROOT:?Set SOURCE_ROOT}"
 : "${FLASHINFER_ROOT:?Set FLASHINFER_ROOT}"
 : "${RESULT_ROOT:?Set RESULT_ROOT}"
+: "${ORACLE_BACKEND:?Set ORACLE_BACKEND}"
+: "${SCALE_LAYOUT:?Set SCALE_LAYOUT}"
 
 export EXP_DIR="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
 export OBSERVED_DIR="${RESULT_ROOT}/observed"
@@ -16,6 +18,7 @@ export ORACLE_DIR="${RESULT_ROOT}/oracle"
 export SHARD_COUNT=${SHARD_COUNT:-4}
 export ROUNDS=${ROUNDS:-2}
 export REPEAT_ITERS=${REPEAT_ITERS:-10}
+export ORACLE_BACKEND SCALE_LAYOUT
 readonly mounts=/home/sna:/home/sna,/lustre:/lustre,/raid/scratch:/raid/scratch
 
 mkdir -p "${OBSERVED_DIR}" "${ORACLE_DIR}/shards"

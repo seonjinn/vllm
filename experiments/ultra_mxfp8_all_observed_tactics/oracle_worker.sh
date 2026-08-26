@@ -24,15 +24,15 @@ export FLASHINFER_GEN_SRC_DIR="${scratch}/generated"
 python3 "${EXP_DIR}/prepare_exact_cache.py" \
   --shapes "${shape_file}" \
   --output-dir "${output_dir}/cache" \
-  --backend cute-dsl \
-  --scale-layout 128x4
+  --backend "${ORACLE_BACKEND}" \
+  --scale-layout "${SCALE_LAYOUT}"
 python3 \
   "${FLASHINFER_ROOT}/benchmarks/bench_mxfp8_backend_tactic_oracle.py" \
   --shapes "${shape_file}" \
   --selected-cache-dir "${output_dir}/cache" \
   --output-dir "${output_dir}/oracle" \
-  --backend cute-dsl \
-  --scale-layout 128x4 \
+  --backend "${ORACLE_BACKEND}" \
+  --scale-layout "${SCALE_LAYOUT}" \
   --rounds "${ROUNDS}" \
   --dry-run-iters 3 \
   --repeat-iters "${REPEAT_ITERS}" \

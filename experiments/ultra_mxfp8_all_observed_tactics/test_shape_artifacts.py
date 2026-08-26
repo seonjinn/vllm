@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from experiments.ultra_mxfp8_all_observed_tactics.backend_config import (
+    resolve_backend,
+)
 from experiments.ultra_mxfp8_all_observed_tactics.build_lookup import build_lookup
 from experiments.ultra_mxfp8_all_observed_tactics.merge_shape_traces import (
     merge_traces,
@@ -17,6 +20,32 @@ from experiments.ultra_mxfp8_all_observed_tactics.shard_shapes import shard_shap
 def _read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+@pytest.mark.parametrize(
+    ("name", "linear_backend", "oracle_backend", "scale_layout"),
+    [
+        ("cute-dsl", "flashinfer_cutedsl", "cute-dsl", "128x4"),
+        ("cutlass", "flashinfer_cutlass", "cutlass", "128x4"),
+        ("trtllm", "flashinfer_trtllm", "trtllm", "8x4"),
+    ],
+)
+def test_resolve_backend_returns_matching_serving_and_oracle_config(
+    name: str,
+    linear_backend: str,
+    oracle_backend: str,
+    scale_layout: str,
+) -> None:
+    config = resolve_backend(name)
+
+    assert config.linear_backend == linear_backend
+    assert config.oracle_backend == oracle_backend
+    assert config.scale_layout == scale_layout
+
+
+def test_resolve_backend_rejects_unknown_backend() -> None:
+    with pytest.raises(ValueError, match="unsupported backend"):
+        resolve_backend("unknown")
 
 
 def test_merge_traces_deduplicates_workers_and_preserves_phases(
