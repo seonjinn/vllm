@@ -99,7 +99,7 @@ fi
   printf "\n"
   echo "vllm_version=$("${server_env[@]}" vllm --version)"
   "${server_env[@]}" uv run --no-project python -c \
-    'import flashinfer, vllm, vllm._C; print("vllm_file=" + vllm.__file__); print("vllm_compiled_file=" + vllm._C.__file__); print("flashinfer=" + flashinfer.__version__); print("flashinfer_file=" + flashinfer.__file__)'
+    'import flashinfer, vllm, vllm._C_stable_libtorch; print("vllm_file=" + vllm.__file__); print("vllm_compiled_file=" + vllm._C_stable_libtorch.__file__); print("flashinfer=" + flashinfer.__version__); print("flashinfer_file=" + flashinfer.__file__)'
   echo "gpu_name=${GPU_NAME}"
   echo "driver_version=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader)"
 } >"${RUN_DIR}/metadata.txt"

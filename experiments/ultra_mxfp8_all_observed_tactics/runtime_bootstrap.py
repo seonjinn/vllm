@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import os
 import site
 import sys
@@ -33,21 +35,35 @@ def _installed_package_path(name: str, excluded_roots: tuple[Path, ...]) -> Path
     raise RuntimeError(f"cannot find installed {name} package outside {excluded_roots}")
 
 
+def _load_vllm(source_root: Path, installed_root: Path) -> ModuleType:
+    source_package = source_root / "vllm"
+    spec = importlib.util.spec_from_file_location(
+        "vllm",
+        source_package / "__init__.py",
+        submodule_search_locations=[str(source_package), str(installed_root)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot build vLLM module spec from {source_package}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
 def configure_runtime() -> None:
     source_root = Path(os.environ["SOURCE_ROOT"])
     flashinfer_root = Path(os.environ["FLASHINFER_ROOT"])
 
-    import vllm
-
-    _verify_import(vllm, source_root, "vLLM")
     installed_vllm = _installed_package_path("vllm", (source_root,))
-    installed_vllm_text = str(installed_vllm)
-    if installed_vllm_text not in vllm.__path__:
-        vllm.__path__.append(installed_vllm_text)
+    vllm = _load_vllm(source_root, installed_vllm)
+    _verify_import(vllm, source_root, "vLLM")
 
-    import vllm._C
-
-    _verify_import(vllm._C, installed_vllm, "vLLM compiled extension")
+    compiled_extension = importlib.import_module("vllm._C_stable_libtorch")
+    _verify_import(compiled_extension, installed_vllm, "vLLM compiled extension")
 
     import flashinfer
 
