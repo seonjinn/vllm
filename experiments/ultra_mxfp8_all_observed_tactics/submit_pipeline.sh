@@ -13,6 +13,7 @@ readonly CLUSTER=${CLUSTER:-sna-mfa@login-lyris}
 readonly ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
 readonly PARTITION=${PARTITION:-gb200}
 readonly ORACLE_PARTITION=${ORACLE_PARTITION:-gb200-backfill}
+readonly PAIR_PARTITION=${PAIR_PARTITION:-${ORACLE_PARTITION}}
 readonly QOS=${QOS:-user-restrictions}
 readonly REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-/home/sna/vllm-v0271-mxfp8-all-observed-tactics}
 readonly FLASHINFER_REPO_ROOT=${FLASHINFER_REPO_ROOT:-/home/sna/flashinfer-mxfp8-serving-selected-oracle}
@@ -51,6 +52,12 @@ remote_common=(
 oracle_common=(
   --account="${ACCOUNT}"
   --partition="${ORACLE_PARTITION}"
+  --qos="${QOS}"
+  --nodes=1
+)
+pair_common=(
+  --account="${ACCOUNT}"
+  --partition="${PAIR_PARTITION}"
   --qos="${QOS}"
   --nodes=1
 )
@@ -117,7 +124,7 @@ if [[ "${actual_container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
   exit 1
 fi
 read -r container_size container_mtime < <(
-  ssh "${CLUSTER}" stat -c '%s %Y' "${CONTAINER_IMAGE}"
+  ssh "${CLUSTER}" "stat -c '%s %Y' '${CONTAINER_IMAGE}'"
 )
 model_config_sha=$(ssh "${CLUSTER}" sha256sum "${MODEL_PATH}/config.json" | awk '{print $1}')
 model_index_sha=$(ssh "${CLUSTER}" \
@@ -138,7 +145,7 @@ ssh "${CLUSTER}" sbatch --test-only "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
   --export="${export_common}" \
   "${EXP_DIR}/run_oracle.sbatch"
-ssh "${CLUSTER}" sbatch --test-only "${remote_common[@]}" \
+ssh "${CLUSTER}" sbatch --test-only "${pair_common[@]}" \
   --time="${PAIR_TIME}" \
   --export="${export_common},PAIR_ORDER=baseline-lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
   "${EXP_DIR}/run_pair.sbatch"
@@ -166,7 +173,7 @@ oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${oracle_common[@]}" \
   "${EXP_DIR}/run_oracle.sbatch")
 submitted_jobs+=("${oracle_job}")
 
-pair_baseline_lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+pair_baseline_lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${pair_common[@]}" \
   --time="${PAIR_TIME}" \
   --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.pair-bl" \
   --output="${RESULT_ROOT}/slurm/pair-baseline-lookup-%j.out" \
@@ -174,7 +181,7 @@ pair_baseline_lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@
   --export="${export_common},PAIR_ORDER=baseline-lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
   "${EXP_DIR}/run_pair.sbatch")
 submitted_jobs+=("${pair_baseline_lookup_job}")
-pair_lookup_baseline_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+pair_lookup_baseline_job=$(ssh "${CLUSTER}" sbatch --parsable "${pair_common[@]}" \
   --time="${PAIR_TIME}" \
   --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.pair-lb" \
   --output="${RESULT_ROOT}/slurm/pair-lookup-baseline-%j.out" \
@@ -199,6 +206,7 @@ model=${MODEL_PATH}
 model_config_sha256=${model_config_sha}
 model_index_sha256=${model_index_sha}
 model_weights_manifest_sha256=${model_weights_manifest_sha}
+pair_partition=${PAIR_PARTITION}
 capture_eager_job=${eager_job}
 graph_capture_job=${graph_capture_job}
 oracle_job=${oracle_job}
@@ -220,4 +228,5 @@ echo "oracle_backend=${ORACLE_BACKEND}"
 echo "scale_layout=${SCALE_LAYOUT}"
 echo "flashinfer_commit=${flashinfer_commit}"
 echo "oracle_partition=${ORACLE_PARTITION}"
+echo "pair_partition=${PAIR_PARTITION}"
 echo "result_root=${RESULT_ROOT}"

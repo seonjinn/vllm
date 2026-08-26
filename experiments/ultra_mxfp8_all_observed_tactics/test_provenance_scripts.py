@@ -426,6 +426,8 @@ def test_submit_pipeline_uses_order_balanced_pair_jobs() -> None:
 
     assert "PAIR_ORDER=baseline-lookup" in script
     assert "PAIR_ORDER=lookup-baseline" in script
+    assert "PAIR_PARTITION" in script
+    assert "pair_common" in script
     assert script.count("run_pair.sbatch") >= 3
     assert "pair_baseline_lookup_job=" in script
     assert "pair_lookup_baseline_job=" in script
@@ -442,6 +444,7 @@ def test_submit_pipeline_binds_container_and_model_bytes() -> None:
     script = SUBMIT_PIPELINE.read_text()
 
     assert 'sha256sum "${CONTAINER_IMAGE}"' in script
+    assert "\"stat -c '%s %Y' '${CONTAINER_IMAGE}'\"" in script
     assert 'sha256sum "${MODEL_PATH}/config.json"' in script
     assert 'sha256sum "${MODEL_PATH}/model.safetensors.index.json"' in script
     assert "EXPECTED_CONTAINER_SIZE=" in script
