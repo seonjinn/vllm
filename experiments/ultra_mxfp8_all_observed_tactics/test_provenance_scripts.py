@@ -458,3 +458,12 @@ def test_run_server_refuses_existing_run_directory() -> None:
 
     assert 'if [[ -e "${RUN_DIR}" ]]' in script
     assert "Refusing to reuse run directory" in script
+
+
+def test_lookup_manifest_is_validated_before_server_launch() -> None:
+    script = SERVER_ENTRYPOINT.read_text()
+
+    preflight = "validate_lookup_from_environment"
+    server_launch = 'setsid "${server_env[@]}" "${server_cmd[@]}"'
+    assert preflight in script
+    assert script.index(preflight) < script.index(server_launch)

@@ -241,6 +241,11 @@ fi
   echo "driver_version=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader)"
 } >"${RUN_DIR}/metadata.txt"
 
+if [[ "${USE_LOOKUP}" == 1 ]]; then
+  "${server_env[@]}" uv run --no-project python -c \
+    'from shape_tactic_runtime import validate_lookup_from_environment; validate_lookup_from_environment()'
+fi
+
 setsid "${server_env[@]}" "${server_cmd[@]}" >"${RUN_DIR}/server.log" 2>&1 &
 server_pid=$!
 server_group_alive() {

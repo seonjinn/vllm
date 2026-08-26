@@ -380,6 +380,36 @@ def make_dispatcher(
     return choose_one
 
 
+def validate_lookup_from_environment() -> TacticLookup | None:
+    """Load and validate the opt-in lookup against the active runtime."""
+    lookup_path_raw = os.getenv("MXFP8_TACTIC_LOOKUP")
+    if not lookup_path_raw:
+        return None
+
+    import flashinfer
+
+    required = {
+        "MXFP8_TACTIC_BACKEND": os.getenv("MXFP8_TACTIC_BACKEND"),
+        "MXFP8_TACTIC_SCALE_LAYOUT": os.getenv("MXFP8_TACTIC_SCALE_LAYOUT"),
+        "FLASHINFER_COMMIT": os.getenv("FLASHINFER_COMMIT"),
+        "EXPECTED_CONTAINER_SHA256": os.getenv("EXPECTED_CONTAINER_SHA256"),
+        "MXFP8_TACTIC_GPU": os.getenv("MXFP8_TACTIC_GPU"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(f"lookup provenance environment is missing: {missing}")
+    return TacticLookup.load(
+        Path(lookup_path_raw),
+        expected_backend=required["MXFP8_TACTIC_BACKEND"],
+        expected_scale_layout=required["MXFP8_TACTIC_SCALE_LAYOUT"],
+        expected_flashinfer_commit=required["FLASHINFER_COMMIT"],
+        expected_flashinfer_version=flashinfer.__version__,
+        expected_flashinfer_file=str(Path(flashinfer.__file__).resolve()),
+        expected_container_sha256=required["EXPECTED_CONTAINER_SHA256"],
+        expected_gpu=required["MXFP8_TACTIC_GPU"],
+    )
+
+
 def install_from_environment() -> None:
     """Install the opt-in tracing and exact lookup dispatch wrapper."""
     global _PATCHED
@@ -398,30 +428,7 @@ def install_from_environment() -> None:
         trace = ShapeTrace(
             Path(trace_dir_raw), os.getenv("MXFP8_TACTIC_TRACE_PHASE", "unknown")
         )
-    lookup = None
-    if lookup_path_raw:
-        import flashinfer
-
-        required = {
-            "MXFP8_TACTIC_BACKEND": os.getenv("MXFP8_TACTIC_BACKEND"),
-            "MXFP8_TACTIC_SCALE_LAYOUT": os.getenv("MXFP8_TACTIC_SCALE_LAYOUT"),
-            "FLASHINFER_COMMIT": os.getenv("FLASHINFER_COMMIT"),
-            "EXPECTED_CONTAINER_SHA256": os.getenv("EXPECTED_CONTAINER_SHA256"),
-            "MXFP8_TACTIC_GPU": os.getenv("MXFP8_TACTIC_GPU"),
-        }
-        missing = [name for name, value in required.items() if not value]
-        if missing:
-            raise ValueError(f"lookup provenance environment is missing: {missing}")
-        lookup = TacticLookup.load(
-            Path(lookup_path_raw),
-            expected_backend=required["MXFP8_TACTIC_BACKEND"],
-            expected_scale_layout=required["MXFP8_TACTIC_SCALE_LAYOUT"],
-            expected_flashinfer_commit=required["FLASHINFER_COMMIT"],
-            expected_flashinfer_version=flashinfer.__version__,
-            expected_flashinfer_file=str(Path(flashinfer.__file__).resolve()),
-            expected_container_sha256=required["EXPECTED_CONTAINER_SHA256"],
-            expected_gpu=required["MXFP8_TACTIC_GPU"],
-        )
+    lookup = validate_lookup_from_environment()
     AutoTuner.choose_one = make_dispatcher(AutoTuner.choose_one, lookup, trace)
     _PATCHED = True
     print(
