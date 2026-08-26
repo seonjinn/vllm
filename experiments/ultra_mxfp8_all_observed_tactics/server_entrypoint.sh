@@ -42,7 +42,8 @@ record_cudagraph_evidence() {
   } >>"${metadata_path}"
 
   if [[ "${capture_status}" != capture_completed ]] && \
-    [[ "${requested_run_kind}" == baseline || \
+    [[ "${requested_run_kind}" == capture-graph || \
+      "${requested_run_kind}" == baseline || \
       "${requested_run_kind}" == lookup ]]; then
     echo "${requested_run_kind} requires server.log marker: ${CUDAGRAPH_COMPLETION_MARKER}" \
       >&2
@@ -127,6 +128,14 @@ export XDG_CACHE_HOME="${SCRATCH_ROOT}/xdg"
 export PYTHONPYCACHEPREFIX="${SCRATCH_ROOT}/pycache"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 readonly GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader)
+lookup_path=not_applicable
+lookup_sha256=not_applicable
+if [[ "${USE_LOOKUP}" == 1 ]]; then
+  # shellcheck disable=SC2153  # Set by run_server.sbatch for lookup mode.
+  test -s "${LOOKUP_PATH}"
+  lookup_path=${LOOKUP_PATH}
+  lookup_sha256=$(sha256sum "${LOOKUP_PATH}" | awk '{print $1}')
+fi
 
 server_env=(
   env
@@ -181,7 +190,14 @@ fi
 {
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "job_id=${SLURM_JOB_ID}"
+  echo "run_instance=${RUN_INSTANCE}"
+  echo "compute_host=$(hostname)"
   echo "run_kind=${RUN_KIND}"
+  echo "pair_id=${PAIR_ID:-not_paired}"
+  echo "pair_order=${PAIR_ORDER:-not_paired}"
+  echo "pair_position=${PAIR_POSITION:-0}"
+  echo "lookup_path=${lookup_path}"
+  echo "lookup_sha256=${lookup_sha256}"
   echo "backend_name=${BACKEND_NAME}"
   echo "oracle_backend=${ORACLE_BACKEND}"
   echo "scale_layout=${SCALE_LAYOUT}"
@@ -190,7 +206,12 @@ fi
   echo "expected_vllm_version=${EXPECTED_VLLM_VERSION}"
   echo "container=${CONTAINER_IMAGE}"
   echo "container_sha256=${EXPECTED_CONTAINER_SHA256}"
+  echo "container_size=${EXPECTED_CONTAINER_SIZE}"
+  echo "container_mtime=${EXPECTED_CONTAINER_MTIME}"
   echo "model=${MODEL_PATH}"
+  echo "model_config_sha256=${EXPECTED_MODEL_CONFIG_SHA256}"
+  echo "model_index_sha256=${EXPECTED_MODEL_INDEX_SHA256}"
+  echo "model_weights_manifest_sha256=${EXPECTED_MODEL_WEIGHTS_MANIFEST_SHA256}"
   echo "tp=${TP}"
   echo "linear_backend=${LINEAR_BACKEND}"
   echo "trtllm_layout=${TRTLLM_LAYOUT}"
@@ -352,6 +373,14 @@ PY
   done
   workload_index=$((workload_index + 1))
 done
+
+if [[ "${USE_LOOKUP}" == 1 ]]; then
+  current_lookup_sha256=$(sha256sum "${LOOKUP_PATH}" | awk '{print $1}')
+  if [[ "${current_lookup_sha256}" != "${lookup_sha256}" ]]; then
+    echo "Lookup manifest changed during measurement" >&2
+    exit 1
+  fi
+fi
 
 request_trace_flush "${SCRATCH_ROOT}/traces" 30
 stop_server

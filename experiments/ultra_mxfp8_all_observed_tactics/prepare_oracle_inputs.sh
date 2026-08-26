@@ -71,7 +71,7 @@ validate_phase_cudagraph_metadata() {
 validate_cudagraph_metadata() {
   local results_path=$1
   validate_phase_cudagraph_metadata \
-    "${results_path}" baseline true capture_completed \
+    "${results_path}" capture-graph true capture_completed \
     server_log_completion_marker
   validate_phase_cudagraph_metadata \
     "${results_path}" capture-eager false disabled_eager not_applicable

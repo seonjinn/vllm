@@ -7,7 +7,12 @@ set -euo pipefail
 
 : "${CONTAINER_IMAGE:?Set CONTAINER_IMAGE}"
 : "${EXPECTED_CONTAINER_SHA256:?Set EXPECTED_CONTAINER_SHA256}"
+: "${EXPECTED_CONTAINER_SIZE:?Set EXPECTED_CONTAINER_SIZE}"
+: "${EXPECTED_CONTAINER_MTIME:?Set EXPECTED_CONTAINER_MTIME}"
 : "${MODEL_PATH:?Set MODEL_PATH}"
+: "${EXPECTED_MODEL_CONFIG_SHA256:?Set EXPECTED_MODEL_CONFIG_SHA256}"
+: "${EXPECTED_MODEL_INDEX_SHA256:?Set EXPECTED_MODEL_INDEX_SHA256}"
+: "${EXPECTED_MODEL_WEIGHTS_MANIFEST_SHA256:?Set EXPECTED_MODEL_WEIGHTS_MANIFEST_SHA256}"
 : "${SOURCE_ROOT:?Set SOURCE_ROOT}"
 : "${SOURCE_COMMIT:?Set SOURCE_COMMIT}"
 : "${FLASHINFER_ROOT:?Set FLASHINFER_ROOT}"
@@ -29,9 +34,10 @@ export MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
 export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.95}
 export BENCH_TIMEOUT_S=${BENCH_TIMEOUT_S:-7200}
 export PORT=${PORT:-$((18000 + SLURM_JOB_ID % 20000))}
+export RUN_INSTANCE=${RUN_INSTANCE:-${SLURM_JOB_ID}}
 export EXP_DIR="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
-export RUN_DIR="${RESULT_ROOT}/serving/${RUN_KIND}/${SLURM_JOB_ID}"
-export SCRATCH_ROOT="/raid/scratch/${USER}/mxfp8_all_observed/${SLURM_JOB_ID}"
+export RUN_DIR="${RESULT_ROOT}/serving/${RUN_KIND}/${RUN_INSTANCE}"
+export SCRATCH_ROOT="/raid/scratch/${USER}/mxfp8_all_observed/${SLURM_JOB_ID}/${RUN_INSTANCE}"
 
 for checkout in "${SOURCE_ROOT}:${SOURCE_COMMIT}:vLLM" \
   "${FLASHINFER_ROOT}:${FLASHINFER_COMMIT}:FlashInfer"; do
@@ -47,6 +53,24 @@ container_sha=$(awk -F= '$1 == "sha256" {print $2}' \
   "${CONTAINER_IMAGE}.metadata.txt")
 if [[ "${container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
   echo "Expected container ${EXPECTED_CONTAINER_SHA256}, got ${container_sha}" >&2
+  exit 1
+fi
+read -r container_size container_mtime < <(stat -c '%s %Y' "${CONTAINER_IMAGE}")
+if [[ "${container_size}" != "${EXPECTED_CONTAINER_SIZE}" ]] || \
+  [[ "${container_mtime}" != "${EXPECTED_CONTAINER_MTIME}" ]]; then
+  echo "Container changed after submission: size=${container_size}, mtime=${container_mtime}" >&2
+  exit 1
+fi
+model_config_sha=$(sha256sum "${MODEL_PATH}/config.json" | awk '{print $1}')
+model_index_sha=$(sha256sum \
+  "${MODEL_PATH}/model.safetensors.index.json" | awk '{print $1}')
+model_weights_manifest_sha=$(find "${MODEL_PATH}" -maxdepth 1 -type f \
+  -name '*.safetensors' -printf '%f\t%s\t%T@\n' | sort | sha256sum | awk '{print $1}')
+if [[ "${model_config_sha}" != "${EXPECTED_MODEL_CONFIG_SHA256}" ]] || \
+  [[ "${model_index_sha}" != "${EXPECTED_MODEL_INDEX_SHA256}" ]] || \
+  [[ "${model_weights_manifest_sha}" != \
+    "${EXPECTED_MODEL_WEIGHTS_MANIFEST_SHA256}" ]]; then
+  echo "Model manifest changed after submission" >&2
   exit 1
 fi
 
@@ -82,6 +106,10 @@ case "${RUN_KIND}" in
     ;;
 esac
 
+if [[ -e "${RUN_DIR}" ]]; then
+  echo "Refusing to reuse run directory: ${RUN_DIR}" >&2
+  exit 1
+fi
 mkdir -p "${RUN_DIR}" "${SCRATCH_ROOT}/traces"
 
 srun \

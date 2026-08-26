@@ -7,6 +7,8 @@ set -euo pipefail
 
 : "${CONTAINER_IMAGE:?Set CONTAINER_IMAGE}"
 : "${EXPECTED_CONTAINER_SHA256:?Set EXPECTED_CONTAINER_SHA256}"
+: "${EXPECTED_CONTAINER_SIZE:?Set EXPECTED_CONTAINER_SIZE}"
+: "${EXPECTED_CONTAINER_MTIME:?Set EXPECTED_CONTAINER_MTIME}"
 : "${SOURCE_ROOT:?Set SOURCE_ROOT}"
 : "${SOURCE_COMMIT:?Set SOURCE_COMMIT}"
 : "${FLASHINFER_ROOT:?Set FLASHINFER_ROOT}"
@@ -38,6 +40,12 @@ container_sha=$(awk -F= '$1 == "sha256" {print $2}' \
   "${CONTAINER_IMAGE}.metadata.txt")
 if [[ "${container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
   echo "Expected container ${EXPECTED_CONTAINER_SHA256}, got ${container_sha}" >&2
+  exit 1
+fi
+read -r container_size container_mtime < <(stat -c '%s %Y' "${CONTAINER_IMAGE}")
+if [[ "${container_size}" != "${EXPECTED_CONTAINER_SIZE}" ]] || \
+  [[ "${container_mtime}" != "${EXPECTED_CONTAINER_MTIME}" ]]; then
+  echo "Container changed after submission: size=${container_size}, mtime=${container_mtime}" >&2
   exit 1
 fi
 

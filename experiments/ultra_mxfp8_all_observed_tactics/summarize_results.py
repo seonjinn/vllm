@@ -27,7 +27,12 @@ _CROSS_BACKEND_METADATA = (
     "driver_version",
     "container",
     "container_sha256",
+    "container_size",
+    "container_mtime",
     "model",
+    "model_config_sha256",
+    "model_index_sha256",
+    "model_weights_manifest_sha256",
     "tp",
     "moe_backend",
     "attention_backend",
@@ -50,6 +55,15 @@ _CROSS_BACKEND_METADATA = (
     "concurrencies",
     "prompt_multiplier",
 )
+_ORACLE_TIMING_FIELDS = (
+    "cuda_graph",
+    "cold_l2_cache",
+    "rounds",
+    "dry_run_iters",
+    "repeat_iters",
+    "calls_per_graph",
+)
+_EXPECTED_BACKENDS = frozenset({"cute-dsl", "cutlass", "trtllm-128x4", "trtllm-8x4"})
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -167,7 +181,7 @@ def _artifact_signature(result: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _summarize_e2e(root: Path) -> dict[str, Any]:
+def _summarize_e2e_single(root: Path) -> dict[str, Any]:
     baseline_dir = _complete_run(root, "baseline")
     lookup_dir = _complete_run(root, "lookup")
     baseline_metadata = _load_metadata(baseline_dir / "metadata.txt")
@@ -188,7 +202,12 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
         "driver_version",
         "container",
         "container_sha256",
+        "container_size",
+        "container_mtime",
         "model",
+        "model_config_sha256",
+        "model_index_sha256",
+        "model_weights_manifest_sha256",
         "tp",
         "linear_backend",
         "trtllm_layout",
@@ -367,7 +386,220 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
     return {
         "baseline_run": str(baseline_dir),
         "lookup_run": str(lookup_dir),
+        "run_metadata": {
+            "baseline": baseline_metadata,
+            "lookup": lookup_metadata,
+        },
         "metadata": {key: baseline_metadata.get(key) for key in comparable_metadata},
+        "workload_count": len(workloads),
+        "geomean_output_throughput_speedup": _geomean(
+            [row["output_throughput_speedup"] for row in workloads]
+        ),
+        "geomean_total_token_throughput_speedup": _geomean(
+            [row["total_token_throughput_speedup"] for row in workloads]
+        ),
+        "workloads": workloads,
+    }
+
+
+def _summarize_e2e(root: Path) -> dict[str, Any]:
+    pair_orders = ("baseline-lookup", "lookup-baseline")
+    pair_roots = {order: root / "pairs" / order for order in pair_orders}
+    present_orders = [order for order, path in pair_roots.items() if path.is_dir()]
+    if not present_orders:
+        return _summarize_e2e_single(root)
+    if present_orders != list(pair_orders):
+        raise ValueError(
+            "order-balanced comparison requires both pair orders: "
+            f"found={present_orders}"
+        )
+
+    pairs = {order: _summarize_e2e_single(pair_roots[order]) for order in pair_orders}
+    canonical_lookup_path = (root / "oracle" / "lookup.json").resolve(strict=True)
+    canonical_lookup_sha256 = hashlib.sha256(
+        canonical_lookup_path.read_bytes()
+    ).hexdigest()
+    reference = pairs[pair_orders[0]]
+    reference_workloads = {
+        (row["isl"], row["osl"], row["concurrency"]): row
+        for row in reference["workloads"]
+    }
+    for order, pair in pairs.items():
+        baseline_metadata = pair["run_metadata"]["baseline"]
+        lookup_metadata = pair["run_metadata"]["lookup"]
+        hosts = {
+            baseline_metadata.get("compute_host"),
+            lookup_metadata.get("compute_host"),
+        }
+        if None in hosts or "" in hosts or len(hosts) != 1:
+            raise ValueError(
+                f"paired baseline and lookup must use the same compute host: {hosts}"
+            )
+        job_ids = {baseline_metadata.get("job_id"), lookup_metadata.get("job_id")}
+        if None in job_ids or "" in job_ids or len(job_ids) != 1:
+            raise ValueError(
+                f"paired runs must share the same SLURM allocation: {job_ids}"
+            )
+        job_id = next(iter(job_ids))
+        pair_ids = {baseline_metadata.get("pair_id"), lookup_metadata.get("pair_id")}
+        if None in pair_ids or "" in pair_ids or len(pair_ids) != 1:
+            raise ValueError(f"paired runs must share one pair_id: {pair_ids}")
+        expected_pair_id = f"{job_id}-{order}"
+        if pair_ids != {expected_pair_id}:
+            raise ValueError(
+                f"paired run pair_id must be {expected_pair_id}: {pair_ids}"
+            )
+        if {
+            baseline_metadata.get("pair_order"),
+            lookup_metadata.get("pair_order"),
+        } != {order}:
+            raise ValueError(f"paired run order metadata does not match {order}")
+        expected_positions = (
+            {"baseline": "1", "lookup": "2"}
+            if order == "baseline-lookup"
+            else {"baseline": "2", "lookup": "1"}
+        )
+        actual_positions = {
+            "baseline": baseline_metadata.get("pair_position"),
+            "lookup": lookup_metadata.get("pair_position"),
+        }
+        if actual_positions != expected_positions:
+            raise ValueError(
+                f"paired run positions do not match {order}: {actual_positions}"
+            )
+        baseline_has_lookup = (
+            baseline_metadata.get("lookup_path") != "not_applicable"
+            or baseline_metadata.get("lookup_sha256") != "not_applicable"
+        )
+        if baseline_has_lookup:
+            raise ValueError("baseline pair run must not bind a lookup manifest")
+        lookup_path_value = lookup_metadata.get("lookup_path")
+        lookup_sha256 = lookup_metadata.get("lookup_sha256")
+        if not lookup_path_value or not lookup_sha256:
+            raise ValueError("lookup pair run is missing lookup manifest provenance")
+        lookup_path = Path(lookup_path_value)
+        if not lookup_path.is_file():
+            raise ValueError(f"lookup manifest is missing: {lookup_path}")
+        if lookup_path.resolve() != canonical_lookup_path:
+            raise ValueError(
+                "measured lookup path is not the canonical lookup manifest: "
+                f"measured={lookup_path}, canonical={canonical_lookup_path}"
+            )
+        actual_lookup_sha256 = hashlib.sha256(lookup_path.read_bytes()).hexdigest()
+        if (
+            actual_lookup_sha256 != lookup_sha256
+            or lookup_sha256 != canonical_lookup_sha256
+        ):
+            raise ValueError(
+                "lookup manifest checksum does not match measured run: "
+                f"expected={lookup_sha256}, actual={actual_lookup_sha256}"
+            )
+        if pair["metadata"] != reference["metadata"]:
+            raise ValueError(f"paired execution metadata does not match for {order}")
+        workloads = {
+            (row["isl"], row["osl"], row["concurrency"]): row
+            for row in pair["workloads"]
+        }
+        if workloads.keys() != reference_workloads.keys():
+            raise ValueError(f"paired workloads do not match for {order}")
+        mismatched_artifacts = {
+            key
+            for key in workloads
+            if workloads[key]["artifact_signature"]
+            != reference_workloads[key]["artifact_signature"]
+        }
+        if mismatched_artifacts:
+            mismatches = sorted(mismatched_artifacts)
+            raise ValueError(f"paired workload artifacts do not match: {mismatches}")
+
+    workloads = []
+    for key in sorted(reference_workloads):
+        pair_rows = [
+            (
+                order,
+                next(
+                    row
+                    for row in pairs[order]["workloads"]
+                    if (row["isl"], row["osl"], row["concurrency"]) == key
+                ),
+            )
+            for order in pair_orders
+        ]
+        speedups = [row["output_throughput_speedup"] for _, row in pair_rows]
+        total_speedups = [row["total_token_throughput_speedup"] for _, row in pair_rows]
+        duration_ratios = [
+            row["lookup_duration_s"] / row["baseline_duration_s"]
+            for _, row in pair_rows
+        ]
+        first = pair_rows[0][1]
+        workloads.append(
+            {
+                **{
+                    field: first[field]
+                    for field in (
+                        "isl",
+                        "osl",
+                        "concurrency",
+                        "completed",
+                        "total_input_tokens",
+                        "total_output_tokens",
+                        "artifact_signature",
+                    )
+                },
+                "baseline_output_throughput": _geomean(
+                    [row["baseline_output_throughput"] for _, row in pair_rows]
+                ),
+                "lookup_output_throughput": _geomean(
+                    [row["lookup_output_throughput"] for _, row in pair_rows]
+                ),
+                "output_throughput_speedup": _geomean(speedups),
+                "output_throughput_speedup_min": min(speedups),
+                "output_throughput_speedup_max": max(speedups),
+                "baseline_total_token_throughput": _geomean(
+                    [row["baseline_total_token_throughput"] for _, row in pair_rows]
+                ),
+                "lookup_total_token_throughput": _geomean(
+                    [row["lookup_total_token_throughput"] for _, row in pair_rows]
+                ),
+                "total_token_throughput_speedup": _geomean(total_speedups),
+                "baseline_mean_ttft_ms": _geomean(
+                    [row["baseline_mean_ttft_ms"] for _, row in pair_rows]
+                ),
+                "lookup_mean_ttft_ms": _geomean(
+                    [row["lookup_mean_ttft_ms"] for _, row in pair_rows]
+                ),
+                "baseline_mean_tpot_ms": _geomean(
+                    [row["baseline_mean_tpot_ms"] for _, row in pair_rows]
+                ),
+                "lookup_mean_tpot_ms": _geomean(
+                    [row["lookup_mean_tpot_ms"] for _, row in pair_rows]
+                ),
+                "baseline_duration_s": _geomean(
+                    [row["baseline_duration_s"] for _, row in pair_rows]
+                ),
+                "lookup_duration_s": _geomean(
+                    [row["lookup_duration_s"] for _, row in pair_rows]
+                ),
+                "duration_reduction_pct": 100.0 * (1.0 - _geomean(duration_ratios)),
+                "paired_measurements": [
+                    {
+                        "pair_order": order,
+                        "compute_host": pairs[order]["run_metadata"]["baseline"][
+                            "compute_host"
+                        ],
+                        **row,
+                    }
+                    for order, row in pair_rows
+                ],
+            }
+        )
+
+    return {
+        "baseline_run": [pairs[order]["baseline_run"] for order in pair_orders],
+        "lookup_run": [pairs[order]["lookup_run"] for order in pair_orders],
+        "pair_count": len(pair_orders),
+        "pair_orders": list(pair_orders),
+        "metadata": reference["metadata"],
         "workload_count": len(workloads),
         "geomean_output_throughput_speedup": _geomean(
             [row["output_throughput_speedup"] for row in workloads]
@@ -386,6 +618,11 @@ def validate_comparison_summaries(summaries: list[dict[str, Any]]) -> None:
     backends = [str(summary["backend"]) for summary in summaries]
     if len(set(backends)) != len(backends):
         raise ValueError(f"duplicate backend summaries: {backends}")
+    if set(backends) != _EXPECTED_BACKENDS:
+        raise ValueError(
+            "comparison requires exactly these backend arms: "
+            f"expected={sorted(_EXPECTED_BACKENDS)}, actual={sorted(backends)}"
+        )
 
     reference = summaries[0]
     reference_metadata = reference["e2e"]["metadata"]
@@ -452,6 +689,45 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         )
         for report in reports
     }
+    timing_blocks = []
+    for path, report in zip(report_paths, reports):
+        timing = report.get("timing")
+        if not isinstance(timing, dict):
+            raise ValueError(f"oracle timing block is incomplete in {path}: {timing}")
+        missing_timing = [
+            field for field in _ORACLE_TIMING_FIELDS if field not in timing
+        ]
+        if missing_timing:
+            raise ValueError(
+                f"oracle timing block is incomplete in {path}: {missing_timing}"
+            )
+        timing_blocks.append(timing)
+    timing = timing_blocks[0]
+    mismatched_timing = [
+        str(path)
+        for path, block in zip(report_paths[1:], timing_blocks[1:])
+        if block != timing
+    ]
+    if mismatched_timing:
+        raise ValueError(
+            "oracle timing blocks do not match: "
+            f"reference={timing}, mismatched={mismatched_timing}"
+        )
+    if timing["cuda_graph"] is not True or timing["cold_l2_cache"] is not True:
+        raise ValueError(
+            f"oracle timing requires cuda_graph=true and cold_l2_cache=true: {timing}"
+        )
+    invalid_timing_counts = {
+        field: timing[field]
+        for field in _ORACLE_TIMING_FIELDS[2:]
+        if isinstance(timing[field], bool)
+        or not isinstance(timing[field], int)
+        or timing[field] <= 0
+    }
+    if invalid_timing_counts:
+        raise ValueError(
+            f"oracle timing counts must be positive integers: {invalid_timing_counts}"
+        )
     if (
         len(backends) != 1
         or len(layouts) != 1
@@ -546,6 +822,7 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         "flashinfer_file": next(iter(flashinfer_files)),
         "container_sha256": next(iter(container_hashes)),
         "gpu": next(iter(gpus)),
+        "timing": timing,
         "shape_count": len(rows),
         "geomean_speedup": _geomean(speedups),
         "max_speedup": max(speedups),
@@ -571,11 +848,14 @@ def _summarize_oracle(root: Path) -> dict[str, Any]:
         "measured_candidate_gpu_s": sum(measured_candidate_gpu_times),
         "profiling_wall_s_estimate": max(profiling_wall_times),
         "top_regrets": top_regrets,
+        "shapes": rows,
         "reports": [str(path) for path in report_paths],
     }
 
 
-def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]:
+def _summarize_lookup_single(
+    root: Path, *, expected_rank_count: int, manifest_root: Path
+) -> dict[str, Any]:
     lookup_dir = _complete_run(root, "lookup")
     sources: dict[tuple[int, int, int, str], set[str]] = {}
     selection_call_counts: dict[tuple[int, int, int, str, str], int] = {}
@@ -634,6 +914,11 @@ def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]
             f"lookup source changed for the same dispatch key: {conflicts}"
         )
     hit_count = sum(next(iter(value)) == "offline_lookup" for value in sources.values())
+    if hit_count == 0:
+        raise ValueError(
+            "lookup run has zero offline_lookup hits; no lookup performance "
+            "comparison is valid"
+        )
     miss_count = len(sources) - hit_count
     selection_call_hit_count = sum(
         count
@@ -651,7 +936,20 @@ def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]
         for source in sorted(allowed_sources)
         if any(key[-1] == source for key in selection_call_counts)
     }
-    lookup_path = root / "oracle" / "lookup.json"
+    dispatches = []
+    for (m, n, k, runner), source_values in sorted(sources.items()):
+        source = next(iter(source_values))
+        dispatches.append(
+            {
+                "m": m,
+                "n": n,
+                "k": k,
+                "runner": runner,
+                "selection_source": source,
+                "invocation_count": selection_call_counts[(m, n, k, runner, source)],
+            }
+        )
+    lookup_path = manifest_root / "oracle" / "lookup.json"
     if not lookup_path.is_file():
         raise ValueError(f"lookup manifest is missing: {lookup_path}")
     lookup_bytes = lookup_path.read_bytes()
@@ -693,12 +991,101 @@ def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]
         "selection_call_weighted_hit_rate": selection_call_hit_count
         / selection_call_count,
         "selection_source_counts": selection_source_counts,
+        "dispatches": dispatches,
         "manifest": {
             "path": str(lookup_path),
             "sha256": hashlib.sha256(lookup_bytes).hexdigest(),
             **{key: lookup_payload[key] for key in manifest_fields},
         },
         "coverage_by_m": coverage_by_m,
+    }
+
+
+def _summarize_lookup(root: Path, *, expected_rank_count: int) -> dict[str, Any]:
+    pair_orders = ("baseline-lookup", "lookup-baseline")
+    pair_roots = {order: root / "pairs" / order for order in pair_orders}
+    present_orders = [order for order, path in pair_roots.items() if path.is_dir()]
+    if not present_orders:
+        return _summarize_lookup_single(
+            root, expected_rank_count=expected_rank_count, manifest_root=root
+        )
+    if present_orders != list(pair_orders):
+        raise ValueError(
+            f"lookup summary requires both pair orders: found={present_orders}"
+        )
+
+    pairs = {
+        order: _summarize_lookup_single(
+            pair_roots[order],
+            expected_rank_count=expected_rank_count,
+            manifest_root=root,
+        )
+        for order in pair_orders
+    }
+    reference = pairs[pair_orders[0]]
+    dispatch_sources = {
+        (row["m"], row["n"], row["k"], row["runner"]): row["selection_source"]
+        for row in reference["dispatches"]
+    }
+    for order, pair in pairs.items():
+        observed_sources = {
+            (row["m"], row["n"], row["k"], row["runner"]): row["selection_source"]
+            for row in pair["dispatches"]
+        }
+        if observed_sources != dispatch_sources:
+            raise ValueError(f"lookup dispatch coverage differs for {order}")
+        if pair["manifest"] != reference["manifest"]:
+            raise ValueError(f"lookup manifest differs for {order}")
+
+    combined_dispatches = []
+    for key, source in sorted(dispatch_sources.items()):
+        invocation_count = 0
+        for pair in pairs.values():
+            row = next(
+                row
+                for row in pair["dispatches"]
+                if (row["m"], row["n"], row["k"], row["runner"]) == key
+            )
+            invocation_count += int(row["invocation_count"])
+        m, n, k, runner = key
+        combined_dispatches.append(
+            {
+                "m": m,
+                "n": n,
+                "k": k,
+                "runner": runner,
+                "selection_source": source,
+                "invocation_count": invocation_count,
+            }
+        )
+
+    selection_call_count = sum(pair["selection_call_count"] for pair in pairs.values())
+    selection_call_hit_count = sum(
+        pair["selection_call_hit_count"] for pair in pairs.values()
+    )
+    return {
+        **reference,
+        "pair_count": len(pair_orders),
+        "trace_process_count": sum(
+            pair["trace_process_count"] for pair in pairs.values()
+        ),
+        "selection_call_count": selection_call_count,
+        "selection_call_hit_count": selection_call_hit_count,
+        "selection_call_miss_count": selection_call_count - selection_call_hit_count,
+        "selection_call_weighted_hit_rate": selection_call_hit_count
+        / selection_call_count,
+        "selection_source_counts": {
+            source: sum(
+                pair["selection_source_counts"].get(source, 0)
+                for pair in pairs.values()
+            )
+            for source in {
+                source
+                for pair in pairs.values()
+                for source in pair["selection_source_counts"]
+            }
+        },
+        "dispatches": combined_dispatches,
     }
 
 

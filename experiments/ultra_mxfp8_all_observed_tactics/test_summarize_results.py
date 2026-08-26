@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,6 +14,15 @@ from experiments.ultra_mxfp8_all_observed_tactics.summarize_results import (
     _summarize_oracle,
     summarize_backend,
 )
+
+ORACLE_TIMING = {
+    "cuda_graph": True,
+    "cold_l2_cache": True,
+    "rounds": 3,
+    "dry_run_iters": 5,
+    "repeat_iters": 20,
+    "calls_per_graph": 4,
+}
 
 
 def _write_result(
@@ -62,7 +72,12 @@ def _write_metadata(path: Path, run_kind: str) -> None:
                 "driver_version=590.00",
                 "container=/container.sqsh",
                 "container_sha256=container-sha",
+                "container_size=1234",
+                "container_mtime=5678",
                 "model=/model",
+                "model_config_sha256=model-config-sha",
+                "model_index_sha256=model-index-sha",
+                "model_weights_manifest_sha256=model-weights-manifest-sha",
                 "tp=1",
                 "linear_backend=flashinfer_cutedsl",
                 "trtllm_layout=8x4",
@@ -90,6 +105,259 @@ def _write_metadata(path: Path, run_kind: str) -> None:
         )
         + "\n"
     )
+
+
+def _write_paired_run(
+    pair_root: Path,
+    *,
+    pair_order: str,
+    run_kind: str,
+    position: int,
+    output_tps: float,
+    host: str,
+    job_id: str = "42",
+) -> None:
+    lookup_path = pair_root.parents[1] / "oracle" / "lookup.json"
+    lookup_path.parent.mkdir(exist_ok=True)
+    if not lookup_path.exists():
+        lookup_path.write_text("{}\n")
+    lookup_sha256 = hashlib.sha256(lookup_path.read_bytes()).hexdigest()
+    run_dir = pair_root / "serving" / run_kind / f"{pair_order}-{run_kind}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "COMPLETE").touch()
+    _write_metadata(run_dir / "metadata.txt", run_kind)
+    with (run_dir / "metadata.txt").open("a") as handle:
+        handle.write(
+            f"compute_host={host}\n"
+            f"job_id={job_id}\n"
+            f"pair_id={job_id}-{pair_order}\n"
+            f"pair_order={pair_order}\n"
+            f"pair_position={position}\n"
+            f"lookup_path={lookup_path if run_kind == 'lookup' else 'not_applicable'}\n"
+            "lookup_sha256="
+            f"{lookup_sha256 if run_kind == 'lookup' else 'not_applicable'}\n"
+        )
+    _write_result(
+        run_dir / "result_isl1000_osl1000_c1.json",
+        output_tps=output_tps,
+        duration=20_000.0 / output_tps,
+    )
+
+
+def test_summarize_e2e_aggregates_order_balanced_node_matched_pairs(
+    tmp_path: Path,
+) -> None:
+    baseline_lookup = tmp_path / "pairs" / "baseline-lookup"
+    _write_paired_run(
+        baseline_lookup,
+        pair_order="baseline-lookup",
+        run_kind="baseline",
+        position=1,
+        output_tps=100.0,
+        host="node-a",
+    )
+    _write_paired_run(
+        baseline_lookup,
+        pair_order="baseline-lookup",
+        run_kind="lookup",
+        position=2,
+        output_tps=110.0,
+        host="node-a",
+    )
+    lookup_baseline = tmp_path / "pairs" / "lookup-baseline"
+    _write_paired_run(
+        lookup_baseline,
+        pair_order="lookup-baseline",
+        run_kind="lookup",
+        position=1,
+        output_tps=120.0,
+        host="node-b",
+    )
+    _write_paired_run(
+        lookup_baseline,
+        pair_order="lookup-baseline",
+        run_kind="baseline",
+        position=2,
+        output_tps=100.0,
+        host="node-b",
+    )
+
+    summary = _summarize_e2e(tmp_path)
+
+    workload = summary["workloads"][0]
+    assert summary["pair_count"] == 2
+    assert summary["pair_orders"] == ["baseline-lookup", "lookup-baseline"]
+    assert workload["output_throughput_speedup"] == pytest.approx((1.1 * 1.2) ** 0.5)
+    assert workload["output_throughput_speedup_min"] == pytest.approx(1.1)
+    assert workload["output_throughput_speedup_max"] == pytest.approx(1.2)
+    assert [row["pair_order"] for row in workload["paired_measurements"]] == [
+        "baseline-lookup",
+        "lookup-baseline",
+    ]
+
+    (tmp_path / "oracle" / "lookup.json").write_text('{"changed": true}\n')
+    with pytest.raises(ValueError, match="checksum"):
+        _summarize_e2e(tmp_path)
+
+
+def test_summarize_e2e_rejects_cross_node_pair(tmp_path: Path) -> None:
+    pair_root = tmp_path / "pairs" / "baseline-lookup"
+    _write_paired_run(
+        pair_root,
+        pair_order="baseline-lookup",
+        run_kind="baseline",
+        position=1,
+        output_tps=100.0,
+        host="node-a",
+    )
+    _write_paired_run(
+        pair_root,
+        pair_order="baseline-lookup",
+        run_kind="lookup",
+        position=2,
+        output_tps=110.0,
+        host="node-b",
+    )
+    reverse_root = tmp_path / "pairs" / "lookup-baseline"
+    _write_paired_run(
+        reverse_root,
+        pair_order="lookup-baseline",
+        run_kind="lookup",
+        position=1,
+        output_tps=110.0,
+        host="node-c",
+    )
+    _write_paired_run(
+        reverse_root,
+        pair_order="lookup-baseline",
+        run_kind="baseline",
+        position=2,
+        output_tps=100.0,
+        host="node-c",
+    )
+
+    with pytest.raises(ValueError, match="same compute host"):
+        _summarize_e2e(tmp_path)
+
+
+def test_summarize_e2e_rejects_cross_allocation_pair(tmp_path: Path) -> None:
+    pair_root = tmp_path / "pairs" / "baseline-lookup"
+    _write_paired_run(
+        pair_root,
+        pair_order="baseline-lookup",
+        run_kind="baseline",
+        position=1,
+        output_tps=100.0,
+        host="node-a",
+        job_id="41",
+    )
+    _write_paired_run(
+        pair_root,
+        pair_order="baseline-lookup",
+        run_kind="lookup",
+        position=2,
+        output_tps=110.0,
+        host="node-a",
+        job_id="42",
+    )
+    reverse_root = tmp_path / "pairs" / "lookup-baseline"
+    for kind, position in (("lookup", 1), ("baseline", 2)):
+        _write_paired_run(
+            reverse_root,
+            pair_order="lookup-baseline",
+            run_kind=kind,
+            position=position,
+            output_tps=110.0 if kind == "lookup" else 100.0,
+            host="node-b",
+            job_id="43",
+        )
+
+    with pytest.raises(ValueError, match="same SLURM allocation"):
+        _summarize_e2e(tmp_path)
+
+
+def test_summarize_e2e_rejects_noncanonical_lookup_path(tmp_path: Path) -> None:
+    for order, job_id in (
+        ("baseline-lookup", "42"),
+        ("lookup-baseline", "43"),
+    ):
+        pair_root = tmp_path / "pairs" / order
+        positions = (
+            {"baseline": 1, "lookup": 2}
+            if order == "baseline-lookup"
+            else {"baseline": 2, "lookup": 1}
+        )
+        for kind in ("baseline", "lookup"):
+            _write_paired_run(
+                pair_root,
+                pair_order=order,
+                run_kind=kind,
+                position=positions[kind],
+                output_tps=100.0 if kind == "baseline" else 110.0,
+                host=f"node-{job_id}",
+                job_id=job_id,
+            )
+    canonical = tmp_path / "oracle" / "lookup.json"
+    alternate = tmp_path / "alternate-lookup.json"
+    alternate.write_text(canonical.read_text())
+    lookup_metadata = next(
+        (tmp_path / "pairs" / "baseline-lookup" / "serving" / "lookup").glob(
+            "*/metadata.txt"
+        )
+    )
+    lookup_metadata.write_text(
+        lookup_metadata.read_text().replace(str(canonical), str(alternate))
+    )
+
+    with pytest.raises(ValueError, match="canonical lookup manifest"):
+        _summarize_e2e(tmp_path)
+
+
+def test_summarize_lookup_combines_both_pair_orders(tmp_path: Path) -> None:
+    for order in ("baseline-lookup", "lookup-baseline"):
+        lookup = tmp_path / "pairs" / order / "serving" / "lookup" / order
+        traces = lookup / "traces"
+        traces.mkdir(parents=True)
+        (lookup / "COMPLETE").touch()
+        (traces / "counts.1.jsonl").write_text(
+            json.dumps(
+                {
+                    "m": 1,
+                    "n": 2304,
+                    "k": 8192,
+                    "runner": "CuteRunner",
+                    "selection_source": "offline_lookup",
+                    "invocation_count": 3,
+                    "rank": "0",
+                }
+            )
+            + "\n"
+        )
+        (traces / "counts.1.complete").write_text("token\n")
+    oracle = tmp_path / "oracle"
+    oracle.mkdir()
+    (oracle / "lookup.json").write_text(
+        json.dumps(
+            {
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
+                "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
+                "gpu": "NVIDIA GB200",
+                "entry_count": 1,
+            }
+        )
+    )
+
+    summary = _summarize_lookup(tmp_path, expected_rank_count=1)
+
+    assert summary["pair_count"] == 2
+    assert summary["unique_hit_count"] == 1
+    assert summary["selection_call_count"] == 6
+    assert summary["selection_call_hit_count"] == 6
+    assert summary["selection_call_weighted_hit_rate"] == 1.0
 
 
 def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
@@ -178,6 +446,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                     "rtol": 0.02,
                     "atol": 0.1,
                 },
+                "timing": ORACLE_TIMING,
                 "profiling_wall_s": 12.5,
                 "measured_candidate_gpu_s": 15.0,
                 "shapes": [
@@ -230,6 +499,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["oracle"]["flashinfer_version"] == "0.6.18"
     assert summary["oracle"]["flashinfer_file"] == "/flashinfer/__init__.py"
     assert summary["oracle"]["container_sha256"] == "container-sha"
+    assert summary["oracle"]["timing"] == ORACLE_TIMING
     assert summary["oracle"]["correctness"] == {
         "minimum_cosine_similarity_required": pytest.approx(0.98),
         "rtol": pytest.approx(0.02),
@@ -283,6 +553,24 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
         "default_autotuner": 1,
         "offline_lookup": 3,
     }
+    assert summary["lookup"]["dispatches"] == [
+        {
+            "m": 1,
+            "n": 2304,
+            "k": 8192,
+            "runner": "CuteRunner",
+            "selection_source": "offline_lookup",
+            "invocation_count": 3,
+        },
+        {
+            "m": 2,
+            "n": 2304,
+            "k": 8192,
+            "runner": "CuteRunner",
+            "selection_source": "default_autotuner",
+            "invocation_count": 1,
+        },
+    ]
     assert summary["lookup"]["manifest"]["backend"] == "cute-dsl"
     assert len(summary["lookup"]["manifest"]["sha256"]) == 64
     assert summary["lookup"]["coverage_by_m"] == [
@@ -365,6 +653,7 @@ def test_summarize_oracle_rejects_incomplete_correctness(tmp_path: Path) -> None
                     "rtol": 0.02,
                     "atol": 0.1,
                 },
+                "timing": ORACLE_TIMING,
                 "profiling_wall_s": 1.0,
                 "measured_candidate_gpu_s": 1.0,
                 "shapes": [
@@ -477,6 +766,117 @@ def test_summarize_lookup_rejects_unexpected_selection_source(tmp_path: Path) ->
         _summarize_lookup(tmp_path, expected_rank_count=1)
 
 
+def test_summarize_lookup_rejects_zero_offline_lookup_hits(tmp_path: Path) -> None:
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    traces = lookup / "traces"
+    traces.mkdir(parents=True)
+    (lookup / "COMPLETE").touch()
+    (traces / "counts.1.jsonl").write_text(
+        json.dumps(
+            {
+                "m": 1,
+                "n": 2304,
+                "k": 8192,
+                "runner": "CuteRunner",
+                "selection_source": "default_autotuner",
+                "invocation_count": 4,
+                "rank": "0",
+            }
+        )
+        + "\n"
+    )
+    (traces / "counts.1.complete").touch()
+
+    with pytest.raises(ValueError, match="zero offline_lookup hits"):
+        _summarize_lookup(tmp_path, expected_rank_count=1)
+
+
+def _write_oracle_report(path: Path, timing: dict) -> None:
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
+                "flashinfer_commit": "def456",
+                "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/flashinfer/__init__.py",
+                "container_sha256": "container-sha",
+                "gpu": "NVIDIA GB200",
+                "correctness": {
+                    "minimum_cosine_similarity": 0.98,
+                    "rtol": 0.02,
+                    "atol": 0.1,
+                },
+                "timing": timing,
+                "profiling_wall_s": 1.0,
+                "measured_candidate_gpu_s": 1.0,
+                "shapes": [
+                    {
+                        "m": 1,
+                        "n": 2304,
+                        "k": 8192,
+                        "speedup": 1.0,
+                        "selected_ms": 1.0,
+                        "oracle_ms": 1.0,
+                        "candidate_count": 1,
+                        "same_tactic": True,
+                        "selected_tactic": 3,
+                        "oracle_tactic": 3,
+                        "oracle_cosine_similarity": 0.99,
+                        "oracle_finite": True,
+                        "oracle_matches_selected": True,
+                    }
+                ],
+            }
+        )
+    )
+
+
+def test_summarize_oracle_rejects_incomplete_timing_block(tmp_path: Path) -> None:
+    timing = dict(ORACLE_TIMING)
+    del timing["calls_per_graph"]
+    _write_oracle_report(
+        tmp_path / "oracle" / "shards" / "0" / "oracle" / "report.json",
+        timing,
+    )
+
+    with pytest.raises(ValueError, match="oracle timing block is incomplete"):
+        _summarize_oracle(tmp_path)
+
+
+def test_summarize_oracle_rejects_timing_mismatch_across_shards(
+    tmp_path: Path,
+) -> None:
+    _write_oracle_report(
+        tmp_path / "oracle" / "shards" / "0" / "oracle" / "report.json",
+        dict(ORACLE_TIMING),
+    )
+    different_timing = {**ORACLE_TIMING, "repeat_iters": 21}
+    _write_oracle_report(
+        tmp_path / "oracle" / "shards" / "1" / "oracle" / "report.json",
+        different_timing,
+    )
+
+    with pytest.raises(ValueError, match="oracle timing blocks do not match"):
+        _summarize_oracle(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["cuda_graph", "cold_l2_cache"])
+def test_summarize_oracle_requires_cuda_graph_and_cold_l2(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    timing = {**ORACLE_TIMING, field: False}
+    _write_oracle_report(
+        tmp_path / "oracle" / "shards" / "0" / "oracle" / "report.json",
+        timing,
+    )
+
+    with pytest.raises(ValueError, match="oracle timing requires"):
+        _summarize_oracle(tmp_path)
+
+
 def test_comparison_validation_rejects_cross_backend_provenance_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -505,7 +905,22 @@ def test_comparison_validation_rejects_cross_backend_provenance_mismatch(
 
     with pytest.raises(ValueError, match="cross-backend provenance mismatch"):
         summarize_results.validate_comparison_summaries(
-            [summary("cute-dsl", "/model-a"), summary("cutlass", "/model-b")]
+            [
+                summary("cute-dsl", "/model-a"),
+                summary("cutlass", "/model-b"),
+                summary("trtllm-128x4", "/model-a"),
+                summary("trtllm-8x4", "/model-a"),
+            ]
+        )
+
+
+def test_comparison_validation_requires_all_four_backend_arms() -> None:
+    with pytest.raises(ValueError, match="requires exactly these backend arms"):
+        summarize_results.validate_comparison_summaries(
+            [
+                {"backend": "cute-dsl", "e2e": {}},
+                {"backend": "cutlass", "e2e": {}},
+            ]
         )
 
 
@@ -536,7 +951,12 @@ def test_comparison_validation_rejects_cross_backend_artifact_mismatch(
 
     with pytest.raises(ValueError, match="cross-backend artifact mismatch"):
         summarize_results.validate_comparison_summaries(
-            [summary("cute-dsl", "one"), summary("cutlass", "two")]
+            [
+                summary("cute-dsl", "one"),
+                summary("cutlass", "two"),
+                summary("trtllm-128x4", "one"),
+                summary("trtllm-8x4", "one"),
+            ]
         )
 
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# shellcheck disable=SC2029  # Paths and job IDs intentionally expand locally.
+
 set -Eeuo pipefail
 
 readonly LOCAL_EXP_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -25,6 +27,7 @@ readonly SOURCE_ROOT=${SOURCE_ROOT:-/home/sna/vllm-v0271-mxfp8-pins/${SOURCE_COM
 readonly FLASHINFER_ROOT=${FLASHINFER_ROOT:-/home/sna/flashinfer-mxfp8-pins/${EXPECTED_FLASHINFER_COMMIT}}
 readonly SERVER_TIME=${SERVER_TIME:-04:00:00}
 readonly ORACLE_TIME=${ORACLE_TIME:-08:00:00}
+readonly PAIR_TIME=${PAIR_TIME:-08:00:00}
 readonly TP=${TP:-4}
 readonly EXP_DIR="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
 submitted_jobs=()
@@ -108,7 +111,20 @@ if [[ "${container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
   echo "Expected container ${EXPECTED_CONTAINER_SHA256}, got ${container_sha}" >&2
   exit 1
 fi
-export_common="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},EXPECTED_CONTAINER_SHA256=${EXPECTED_CONTAINER_SHA256},MODEL_PATH=${MODEL_PATH},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},FLASHINFER_ROOT=${FLASHINFER_ROOT},FLASHINFER_COMMIT=${flashinfer_commit},RESULT_ROOT=${RESULT_ROOT},BACKEND_NAME=${BACKEND_NAME},LINEAR_BACKEND=${LINEAR_BACKEND},ORACLE_BACKEND=${ORACLE_BACKEND},SCALE_LAYOUT=${SCALE_LAYOUT},TRTLLM_LAYOUT=${TRTLLM_LAYOUT},TP=${TP}"
+actual_container_sha=$(ssh "${CLUSTER}" sha256sum "${CONTAINER_IMAGE}" | awk '{print $1}')
+if [[ "${actual_container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
+  echo "Container bytes do not match ${EXPECTED_CONTAINER_SHA256}: ${actual_container_sha}" >&2
+  exit 1
+fi
+read -r container_size container_mtime < <(
+  ssh "${CLUSTER}" stat -c '%s %Y' "${CONTAINER_IMAGE}"
+)
+model_config_sha=$(ssh "${CLUSTER}" sha256sum "${MODEL_PATH}/config.json" | awk '{print $1}')
+model_index_sha=$(ssh "${CLUSTER}" \
+  sha256sum "${MODEL_PATH}/model.safetensors.index.json" | awk '{print $1}')
+model_weights_manifest_sha=$(ssh "${CLUSTER}" \
+  "find '${MODEL_PATH}' -maxdepth 1 -type f -name '*.safetensors' -printf '%f\\t%s\\t%T@\\n' | sort | sha256sum" | awk '{print $1}')
+export_common="ALL,RUN_SERVER_SCRIPT=,ALLOW_RUN_SERVER_SCRIPT_TEST_HOOK=0,CONTAINER_IMAGE=${CONTAINER_IMAGE},EXPECTED_CONTAINER_SHA256=${EXPECTED_CONTAINER_SHA256},EXPECTED_CONTAINER_SIZE=${container_size},EXPECTED_CONTAINER_MTIME=${container_mtime},MODEL_PATH=${MODEL_PATH},EXPECTED_MODEL_CONFIG_SHA256=${model_config_sha},EXPECTED_MODEL_INDEX_SHA256=${model_index_sha},EXPECTED_MODEL_WEIGHTS_MANIFEST_SHA256=${model_weights_manifest_sha},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},FLASHINFER_ROOT=${FLASHINFER_ROOT},FLASHINFER_COMMIT=${flashinfer_commit},RESULT_ROOT=${RESULT_ROOT},BACKEND_NAME=${BACKEND_NAME},LINEAR_BACKEND=${LINEAR_BACKEND},ORACLE_BACKEND=${ORACLE_BACKEND},SCALE_LAYOUT=${SCALE_LAYOUT},TRTLLM_LAYOUT=${TRTLLM_LAYOUT},TP=${TP}"
 
 ssh "${CLUSTER}" mkdir -p "$(dirname "${RESULT_ROOT}")"
 ssh "${CLUSTER}" mkdir "${RESULT_ROOT}"
@@ -122,6 +138,10 @@ ssh "${CLUSTER}" sbatch --test-only "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
   --export="${export_common}" \
   "${EXP_DIR}/run_oracle.sbatch"
+ssh "${CLUSTER}" sbatch --test-only "${remote_common[@]}" \
+  --time="${PAIR_TIME}" \
+  --export="${export_common},PAIR_ORDER=baseline-lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
+  "${EXP_DIR}/run_pair.sbatch"
 
 eager_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
@@ -130,32 +150,41 @@ eager_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --export="${export_common},RUN_KIND=capture-eager" \
   "${EXP_DIR}/run_server.sbatch")
 submitted_jobs+=("${eager_job}")
-baseline_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+graph_capture_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
   --time="${SERVER_TIME}" \
-  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.base" \
-  --output="${RESULT_ROOT}/slurm/baseline-%j.out" \
-  --export="${export_common},RUN_KIND=baseline" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.graph" \
+  --output="${RESULT_ROOT}/slurm/capture-graph-%j.out" \
+  --export="${export_common},RUN_KIND=capture-graph" \
   "${EXP_DIR}/run_server.sbatch")
-submitted_jobs+=("${baseline_job}")
+submitted_jobs+=("${graph_capture_job}")
 oracle_job=$(ssh "${CLUSTER}" sbatch --parsable "${oracle_common[@]}" \
   --time="${ORACLE_TIME}" \
   --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.oracle" \
   --output="${RESULT_ROOT}/slurm/oracle-%j.out" \
-  --dependency="afterok:${eager_job}:${baseline_job}" \
+  --dependency="afterok:${eager_job}:${graph_capture_job}" \
   --export="${export_common}" \
   "${EXP_DIR}/run_oracle.sbatch")
 submitted_jobs+=("${oracle_job}")
 
-lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
-  --time="${SERVER_TIME}" \
-  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.lookup" \
-  --output="${RESULT_ROOT}/slurm/lookup-%j.out" \
+pair_baseline_lookup_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+  --time="${PAIR_TIME}" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.pair-bl" \
+  --output="${RESULT_ROOT}/slurm/pair-baseline-lookup-%j.out" \
   --dependency="afterok:${oracle_job}" \
-  --export="${export_common},RUN_KIND=lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
-  "${EXP_DIR}/run_server.sbatch")
-submitted_jobs+=("${lookup_job}")
+  --export="${export_common},PAIR_ORDER=baseline-lookup,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
+  "${EXP_DIR}/run_pair.sbatch")
+submitted_jobs+=("${pair_baseline_lookup_job}")
+pair_lookup_baseline_job=$(ssh "${CLUSTER}" sbatch --parsable "${remote_common[@]}" \
+  --time="${PAIR_TIME}" \
+  --job-name="${ACCOUNT}-mx.${BACKEND_NAME}.pair-lb" \
+  --output="${RESULT_ROOT}/slurm/pair-lookup-baseline-%j.out" \
+  --dependency="afterok:${oracle_job}" \
+  --export="${export_common},PAIR_ORDER=lookup-baseline,LOOKUP_PATH=${RESULT_ROOT}/oracle/lookup.json" \
+  "${EXP_DIR}/run_pair.sbatch")
+submitted_jobs+=("${pair_lookup_baseline_job}")
 
 manifest_tmp="${RESULT_ROOT}/pipeline_manifest.txt.tmp.$$"
+# shellcheck disable=SC2087  # Manifest values intentionally expand locally.
 ssh "${CLUSTER}" tee "${manifest_tmp}" >/dev/null <<EOF
 backend=${BACKEND_NAME}
 source_root=${SOURCE_ROOT}
@@ -164,20 +193,27 @@ flashinfer_root=${FLASHINFER_ROOT}
 flashinfer_commit=${flashinfer_commit}
 container=${CONTAINER_IMAGE}
 container_sha256=${EXPECTED_CONTAINER_SHA256}
+container_size=${container_size}
+container_mtime=${container_mtime}
 model=${MODEL_PATH}
+model_config_sha256=${model_config_sha}
+model_index_sha256=${model_index_sha}
+model_weights_manifest_sha256=${model_weights_manifest_sha}
 capture_eager_job=${eager_job}
-baseline_job=${baseline_job}
+graph_capture_job=${graph_capture_job}
 oracle_job=${oracle_job}
-lookup_job=${lookup_job}
+pair_baseline_lookup_job=${pair_baseline_lookup_job}
+pair_lookup_baseline_job=${pair_lookup_baseline_job}
 EOF
 ssh "${CLUSTER}" mv "${manifest_tmp}" "${RESULT_ROOT}/pipeline_manifest.txt"
 submission_complete=1
 trap - EXIT
 
 echo "capture_eager_job=${eager_job}"
-echo "baseline_job=${baseline_job}"
+echo "graph_capture_job=${graph_capture_job}"
 echo "oracle_job=${oracle_job}"
-echo "lookup_job=${lookup_job}"
+echo "pair_baseline_lookup_job=${pair_baseline_lookup_job}"
+echo "pair_lookup_baseline_job=${pair_lookup_baseline_job}"
 echo "backend=${BACKEND_NAME}"
 echo "linear_backend=${LINEAR_BACKEND}"
 echo "oracle_backend=${ORACLE_BACKEND}"
