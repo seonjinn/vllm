@@ -165,6 +165,8 @@ backend rather than the common attention backend or the rest of the model.
   `/Users/sna/MXFP8_generation/deliverables/bf16_moe_backend_ntrace_20260825/rayv2_decode`
 - Combined one-page HTML:
   `/Users/sna/MXFP8_generation/deliverables/bf16_moe_backend_ntrace_20260825/bf16_moe_backend_comparison.html`
+- English execution-time breakdown HTML:
+  `/Users/sna/MXFP8_generation/deliverables/bf16_moe_backend_ntrace_20260825/execution_time_breakdown.html`
 - Per-arm interactive hierarchy:
   `<artifact root>/<backend>/breakdown/silicon_breakdown.html`
 - Per-arm trace files: records, stacks, graph nodes, and memops Parquet
