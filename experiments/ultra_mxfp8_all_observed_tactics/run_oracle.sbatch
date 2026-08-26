@@ -54,7 +54,7 @@ srun \
   --ntasks-per-node="${SHARD_COUNT}" \
   --container-image="${CONTAINER_IMAGE}" \
   --container-mounts="${mounts}" \
-  --container-workdir="${FLASHINFER_ROOT}" \
+  --container-workdir=/tmp \
   --mpi=pmix \
   bash "${EXP_DIR}/oracle_worker.sh"
 

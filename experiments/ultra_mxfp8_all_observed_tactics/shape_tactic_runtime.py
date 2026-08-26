@@ -83,6 +83,7 @@ class TacticLookup:
         expected_scale_layout: str | None = None,
         expected_flashinfer_commit: str | None = None,
         expected_flashinfer_version: str | None = None,
+        expected_flashinfer_file: str | None = None,
         expected_container_sha256: str | None = None,
         expected_gpu: str | None = None,
     ) -> TacticLookup:
@@ -121,6 +122,18 @@ class TacticLookup:
                 f"expected={expected_flashinfer_version}, "
                 f"actual={payload.get('flashinfer_version')}"
             )
+        if expected_flashinfer_file is not None:
+            actual_flashinfer_file = payload.get("flashinfer_file")
+            if (
+                actual_flashinfer_file is None
+                or Path(actual_flashinfer_file).resolve()
+                != Path(expected_flashinfer_file).resolve()
+            ):
+                raise ValueError(
+                    "lookup FlashInfer file mismatch: "
+                    f"expected={expected_flashinfer_file}, "
+                    f"actual={actual_flashinfer_file}"
+                )
         if (
             expected_container_sha256 is not None
             and payload.get("container_sha256") != expected_container_sha256
@@ -317,6 +330,7 @@ def install_from_environment() -> None:
             expected_scale_layout=required["MXFP8_TACTIC_SCALE_LAYOUT"],
             expected_flashinfer_commit=required["FLASHINFER_COMMIT"],
             expected_flashinfer_version=flashinfer.__version__,
+            expected_flashinfer_file=str(Path(flashinfer.__file__).resolve()),
             expected_container_sha256=required["EXPECTED_CONTAINER_SHA256"],
             expected_gpu=required["MXFP8_TACTIC_GPU"],
         )

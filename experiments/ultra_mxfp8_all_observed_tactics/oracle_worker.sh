@@ -20,7 +20,7 @@ cp "${FLASHINFER_ROOT}/benchmarks/bench_mxfp8_backend_tactic_oracle.py" \
   "${harness_root}/benchmarks/"
 touch "${harness_root}/benchmarks/__init__.py"
 
-export PYTHONPATH="${harness_root}:${PYTHONPATH:-}"
+export PYTHONPATH="${harness_root}"
 export CUDA_VISIBLE_DEVICES="${gpu_index}"
 export FLASHINFER_CUDA_ARCH_LIST=10.0a
 export XDG_CACHE_HOME="${scratch}/xdg"
@@ -29,10 +29,20 @@ export FLASHINFER_GEN_SRC_DIR="${scratch}/generated"
 export CONTAINER_SHA256="${EXPECTED_CONTAINER_SHA256}"
 
 python3 - <<'PY' >"${output_dir}/provenance.txt"
+import os
+import site
+from pathlib import Path
+
 import flashinfer
 
+module_path = Path(flashinfer.__file__).resolve()
+installed_roots = [Path(root, "flashinfer").resolve() for root in site.getsitepackages()]
+if not any(module_path.is_relative_to(root) for root in installed_roots):
+    raise RuntimeError(f"FlashInfer is not from site-packages: {module_path}")
+if module_path.is_relative_to(Path(os.environ["FLASHINFER_ROOT"]).resolve()):
+    raise RuntimeError(f"FlashInfer source checkout shadowed the runtime: {module_path}")
 print(f"flashinfer_version={flashinfer.__version__}")
-print(f"flashinfer_file={flashinfer.__file__}")
+print(f"flashinfer_file={module_path}")
 PY
 echo "flashinfer_commit=${FLASHINFER_COMMIT}" >>"${output_dir}/provenance.txt"
 python3 \

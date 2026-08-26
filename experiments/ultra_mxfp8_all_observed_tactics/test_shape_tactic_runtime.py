@@ -170,6 +170,7 @@ def test_lookup_rejects_flashinfer_runtime_mismatch(tmp_path: Path) -> None:
             {
                 "format_version": 1,
                 "flashinfer_version": "0.6.18",
+                "flashinfer_file": "/installed/flashinfer/__init__.py",
                 "container_sha256": "container-sha",
                 "entries": [
                     {"m": 1, "n": 2304, "k": 8192, "runner": "TrtRunner", "tactic": 7}
@@ -180,6 +181,11 @@ def test_lookup_rejects_flashinfer_runtime_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="FlashInfer version mismatch"):
         TacticLookup.load(lookup_path, expected_flashinfer_version="0.6.17")
+    with pytest.raises(ValueError, match="FlashInfer file mismatch"):
+        TacticLookup.load(
+            lookup_path,
+            expected_flashinfer_file="/other/flashinfer/__init__.py",
+        )
     with pytest.raises(ValueError, match="container SHA256 mismatch"):
         TacticLookup.load(lookup_path, expected_container_sha256="different")
 

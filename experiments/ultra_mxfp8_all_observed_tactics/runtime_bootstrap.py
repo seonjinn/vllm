@@ -21,14 +21,16 @@ def _verify_import(module: ModuleType, root: Path, name: str) -> None:
         )
 
 
-def _installed_package_path(name: str, source_root: Path) -> Path:
+def _installed_package_path(name: str, excluded_roots: tuple[Path, ...]) -> Path:
     candidates = [Path(root) / name for root in site.getsitepackages()]
     candidates.extend(Path(root) / name for root in sys.path if root)
     for candidate in candidates:
         resolved = candidate.resolve()
-        if resolved.is_dir() and not resolved.is_relative_to(source_root.resolve()):
+        if resolved.is_dir() and not any(
+            resolved.is_relative_to(root.resolve()) for root in excluded_roots
+        ):
             return resolved
-    raise RuntimeError(f"cannot find installed {name} package outside {source_root}")
+    raise RuntimeError(f"cannot find installed {name} package outside {excluded_roots}")
 
 
 def configure_runtime() -> None:
@@ -38,7 +40,7 @@ def configure_runtime() -> None:
     import vllm
 
     _verify_import(vllm, source_root, "vLLM")
-    installed_vllm = _installed_package_path("vllm", source_root)
+    installed_vllm = _installed_package_path("vllm", (source_root,))
     installed_vllm_text = str(installed_vllm)
     if installed_vllm_text not in vllm.__path__:
         vllm.__path__.append(installed_vllm_text)
@@ -49,12 +51,10 @@ def configure_runtime() -> None:
 
     import flashinfer
 
-    flashinfer_path = Path(flashinfer.__file__ or "").resolve()
-    if flashinfer_path.is_relative_to(flashinfer_root.resolve()):
-        raise RuntimeError(
-            "FlashInfer source overlay is incompatible with the container's "
-            f"compiled modules: {flashinfer_path}"
-        )
+    installed_flashinfer = _installed_package_path(
+        "flashinfer", (source_root, flashinfer_root)
+    )
+    _verify_import(flashinfer, installed_flashinfer, "FlashInfer")
 
     expected_vllm_version = os.environ["EXPECTED_VLLM_VERSION"]
     if vllm.__version__ != expected_vllm_version:

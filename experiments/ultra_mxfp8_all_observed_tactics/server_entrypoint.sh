@@ -14,7 +14,7 @@ readonly GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader)
 
 server_env=(
   env
-  "PYTHONPATH=${EXP_DIR}:${SOURCE_ROOT}:${PYTHONPATH:-}"
+  "PYTHONPATH=${EXP_DIR}:${SOURCE_ROOT}"
   "SOURCE_ROOT=${SOURCE_ROOT}"
   "FLASHINFER_ROOT=${FLASHINFER_ROOT}"
   "FLASHINFER_COMMIT=${FLASHINFER_COMMIT}"
