@@ -93,10 +93,12 @@ python experiments/ultra_mxfp8_all_observed_tactics/summarize_results.py \
   --output-csv=/path/to/e2e.csv
 ```
 
-The unsupported status has this exact outer and failure schema. Evidence paths
-may be absolute or relative to the status JSON directory; every referenced file
-must exist and match its lowercase SHA256 digest. Canonical output records use
-the resolved absolute evidence paths.
+The unsupported status has this exact outer and failure schema. Every attempt
+must use a unique job ID and have at least one evidence record linked by the
+same `job_id` and `mode`. Evidence paths must be unique and may be absolute or
+relative to the status JSON directory; every referenced file must exist and
+match its lowercase SHA256 digest. Canonical output records use the resolved
+absolute evidence paths.
 
 ```json
 {
@@ -152,7 +154,18 @@ the resolved absolute evidence paths.
       {"job_id": "124", "mode": "cuda_graph", "outcome": "failed"}
     ],
     "evidence": [
-      {"path": "logs/123.stderr", "sha256": "<64 lowercase hex characters>"}
+      {
+        "job_id": "123",
+        "mode": "eager",
+        "path": "logs/123.stderr",
+        "sha256": "<64 lowercase hex characters>"
+      },
+      {
+        "job_id": "124",
+        "mode": "cuda_graph",
+        "path": "logs/124.stderr",
+        "sha256": "<64 lowercase hex characters>"
+      }
     ]
   }
 }
@@ -167,11 +180,12 @@ a completed serving run. Final A/B `workloads`, `concurrencies`, and
 may retain their observed capture-attempt values instead.
 
 The failure stage must be `server_startup` or `serving_capture`. Attempts must
-cover both `eager` and `cuda_graph` modes and use a failure outcome such as
-`failed`, `timed_out`, `cancelled_after_stall`, `engine_dead`, `out_of_memory`,
-or `initialization_error`. Provenance accepts only the stable fields above plus
-the optional observed-attempt fields `enforce_eager`, `workloads`, and
-`concurrencies`.
+cover both `eager` and `cuda_graph` modes, use unique job IDs, and use a failure
+outcome such as `failed`, `timed_out`, `cancelled_after_stall`, `engine_dead`,
+`out_of_memory`, or `initialization_error`. Every attempt must be covered by a
+distinct checksummed evidence path. Provenance accepts only the stable fields
+above plus the optional observed-attempt fields `enforce_eager`, `workloads`,
+and `concurrencies`.
 
 The canonical JSON keeps four full records in expected backend order under
 `backends`. Measured records have `status: measured`; the unsupported record has

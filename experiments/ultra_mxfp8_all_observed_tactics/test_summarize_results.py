@@ -186,8 +186,10 @@ def _write_unsupported_status(
     backend: str = "cutlass",
     extra: dict | None = None,
 ) -> Path:
-    evidence_path = tmp_path / f"{backend}.stderr"
-    evidence_path.write_text("backend compilation failed\n")
+    eager_evidence_path = tmp_path / f"{backend}-eager.stderr"
+    graph_evidence_path = tmp_path / f"{backend}-cuda-graph.stderr"
+    eager_evidence_path.write_text("eager backend compilation failed\n")
+    graph_evidence_path.write_text("cuda graph backend compilation failed\n")
     provenance = {key: metadata[key] for key in UNSUPPORTED_PROVENANCE_FIELDS}
     provenance.update(
         {
@@ -217,9 +219,21 @@ def _write_unsupported_status(
             ],
             "evidence": [
                 {
-                    "path": evidence_path.name,
-                    "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
-                }
+                    "job_id": "100",
+                    "mode": "eager",
+                    "path": eager_evidence_path.name,
+                    "sha256": hashlib.sha256(
+                        eager_evidence_path.read_bytes()
+                    ).hexdigest(),
+                },
+                {
+                    "job_id": "101",
+                    "mode": "cuda_graph",
+                    "path": graph_evidence_path.name,
+                    "sha256": hashlib.sha256(
+                        graph_evidence_path.read_bytes()
+                    ).hexdigest(),
+                },
             ],
         },
         **(extra or {}),
@@ -1456,6 +1470,58 @@ def test_unsupported_status_requires_nonempty_attempt_objects(tmp_path: Path) ->
     status_path.write_text(json.dumps(payload))
 
     with pytest.raises(ValueError, match="attempts must contain non-empty objects"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_requires_unique_attempt_job_ids(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["attempts"][1]["job_id"] = "100"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="attempt job_id values must be unique"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_links_evidence_to_each_attempt(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["evidence"][1]["job_id"] = "100"
+    payload["failure"]["evidence"][1]["mode"] = "eager"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="evidence must cover every attempt"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_requires_unique_evidence_paths(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["evidence"][1]["path"] = payload["failure"]["evidence"][0][
+        "path"
+    ]
+    payload["failure"]["evidence"][1]["sha256"] = payload["failure"]["evidence"][0][
+        "sha256"
+    ]
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="evidence paths must be unique"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_validates_optional_provenance_values(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["provenance"]["workloads"] = []
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="unsupported provenance workloads"):
         summarize_results.summarize_unsupported_backend(status_path, "cutlass")
 
 

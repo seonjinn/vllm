@@ -238,6 +238,9 @@ def _validate_unsupported_record(
         )
     for key in _UNSUPPORTED_PROVENANCE_METADATA:
         _nonempty_string(provenance, key, "unsupported provenance")
+    for key in ("enforce_eager", "workloads", "concurrencies"):
+        if key in provenance:
+            _nonempty_string(provenance, key, "unsupported provenance")
 
     failure = payload.get("failure")
     if not isinstance(failure, dict):
@@ -266,6 +269,8 @@ def _validate_unsupported_record(
     if not all(isinstance(attempt, dict) and attempt for attempt in attempts):
         raise ValueError("unsupported failure attempts must contain non-empty objects")
     observed_modes = set()
+    attempt_links = set()
+    job_ids = set()
     for index, attempt in enumerate(attempts):
         missing_fields = _REQUIRED_UNSUPPORTED_ATTEMPT_FIELDS - attempt.keys()
         unexpected_fields = attempt.keys() - _ALLOWED_UNSUPPORTED_ATTEMPT_FIELDS
@@ -283,7 +288,12 @@ def _validate_unsupported_record(
             raise ValueError(f"unsupported attempt mode at {index}: {mode!r}")
         if outcome not in _ALLOWED_UNSUPPORTED_ATTEMPT_OUTCOMES:
             raise ValueError(f"unsupported attempt outcome at {index}: {outcome!r}")
+        job_id = attempt["job_id"]
+        if job_id in job_ids:
+            raise ValueError("unsupported attempt job_id values must be unique")
+        job_ids.add(job_id)
         observed_modes.add(mode)
+        attempt_links.add((job_id, mode))
     if observed_modes != _ALLOWED_UNSUPPORTED_ATTEMPT_MODES:
         raise ValueError(
             "unsupported failure must include eager and cuda_graph attempts: "
@@ -293,15 +303,29 @@ def _validate_unsupported_record(
     evidence = failure.get("evidence")
     if not isinstance(evidence, list) or not evidence:
         raise ValueError("unsupported evidence must be a non-empty list")
+    evidence_links = set()
+    evidence_paths = set()
     for index, entry in enumerate(evidence):
         if not isinstance(entry, dict):
             raise ValueError(f"unsupported evidence entry {index} must be an object")
-        expected_evidence_fields = {"path", "sha256"}
+        expected_evidence_fields = {"job_id", "mode", "path", "sha256"}
         if entry.keys() != expected_evidence_fields:
             raise ValueError(
                 f"unsupported evidence entry fields do not match schema at {index}: "
                 f"missing={sorted(expected_evidence_fields - entry.keys())}, "
                 f"unexpected={sorted(entry.keys() - expected_evidence_fields)}"
+            )
+        evidence_job_id = _nonempty_string(
+            entry, "job_id", f"unsupported evidence entry {index}"
+        )
+        evidence_mode = _nonempty_string(
+            entry, "mode", f"unsupported evidence entry {index}"
+        )
+        evidence_link = (evidence_job_id, evidence_mode)
+        if evidence_link not in attempt_links:
+            raise ValueError(
+                f"unsupported evidence entry {index} does not match an attempt: "
+                f"{evidence_link}"
             )
         evidence_value = _nonempty_string(
             entry, "path", f"unsupported evidence entry {index}"
@@ -319,6 +343,11 @@ def _validate_unsupported_record(
         if not evidence_path.is_file():
             raise ValueError(f"evidence file does not exist: {evidence_path}")
         evidence_path = evidence_path.resolve(strict=True)
+        if evidence_path in evidence_paths:
+            raise ValueError(
+                f"unsupported evidence paths must be unique: {evidence_path}"
+            )
+        evidence_paths.add(evidence_path)
         actual_sha256 = _sha256(evidence_path)
         if actual_sha256 != expected_sha256:
             raise ValueError(
@@ -327,6 +356,12 @@ def _validate_unsupported_record(
                 f"actual={actual_sha256}"
             )
         entry["path"] = str(evidence_path)
+        evidence_links.add(evidence_link)
+    if evidence_links != attempt_links:
+        missing_links = sorted(attempt_links - evidence_links)
+        raise ValueError(
+            f"unsupported evidence must cover every attempt: missing={missing_links}"
+        )
 
 
 def summarize_unsupported_backend(status_path: Path, backend: str) -> dict[str, Any]:
