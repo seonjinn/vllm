@@ -35,8 +35,15 @@ _BACKENDS = {
         scale_layout="128x4",
         trtllm_layout="8x4",
     ),
-    "trtllm": BackendConfig(
-        name="trtllm",
+    "trtllm-128x4": BackendConfig(
+        name="trtllm-128x4",
+        linear_backend="flashinfer_trtllm",
+        oracle_backend="trtllm",
+        scale_layout="128x4",
+        trtllm_layout="128x4",
+    ),
+    "trtllm-8x4": BackendConfig(
+        name="trtllm-8x4",
         linear_backend="flashinfer_trtllm",
         oracle_backend="trtllm",
         scale_layout="8x4",

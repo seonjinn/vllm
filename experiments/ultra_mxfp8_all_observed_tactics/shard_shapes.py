@@ -36,16 +36,17 @@ def shard_shapes(observed_path: Path, output_dir: Path, shard_count: int) -> lis
 
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = []
-    fieldnames = ("m", "n", "k")
+    fieldnames = tuple(rows[0])
     for index, shard in enumerate(shards):
         path = output_dir / f"shard_{index}.csv"
         with path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for row in sorted(
-                shard, key=lambda item: tuple(int(item[name]) for name in fieldnames)
+                shard,
+                key=lambda item: tuple(int(item[name]) for name in ("m", "n", "k")),
             ):
-                writer.writerow({name: row[name] for name in fieldnames})
+                writer.writerow(row)
         outputs.append(path)
     return outputs
 

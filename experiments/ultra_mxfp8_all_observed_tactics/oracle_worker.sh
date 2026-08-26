@@ -21,15 +21,17 @@ export XDG_CACHE_HOME="${scratch}/xdg"
 export FLASHINFER_JIT_DIR="${scratch}/jit"
 export FLASHINFER_GEN_SRC_DIR="${scratch}/generated"
 
-python3 "${EXP_DIR}/prepare_exact_cache.py" \
-  --shapes "${shape_file}" \
-  --output-dir "${output_dir}/cache" \
-  --backend "${ORACLE_BACKEND}" \
-  --scale-layout "${SCALE_LAYOUT}"
+python3 - <<'PY' >"${output_dir}/provenance.txt"
+import flashinfer
+
+print(f"flashinfer_version={flashinfer.__version__}")
+print(f"flashinfer_file={flashinfer.__file__}")
+PY
+echo "flashinfer_commit=${FLASHINFER_COMMIT}" >>"${output_dir}/provenance.txt"
 python3 \
   "${FLASHINFER_ROOT}/benchmarks/bench_mxfp8_backend_tactic_oracle.py" \
   --shapes "${shape_file}" \
-  --selected-cache-dir "${output_dir}/cache" \
+  --selected-tactics "${shape_file}" \
   --output-dir "${output_dir}/oracle" \
   --backend "${ORACLE_BACKEND}" \
   --scale-layout "${SCALE_LAYOUT}" \

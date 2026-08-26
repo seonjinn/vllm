@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from experiments.ultra_mxfp8_all_observed_tactics.shape_tactic_runtime import (
+    ShapeTrace,
     TacticLookup,
     extract_mnk,
     make_dispatcher,
@@ -25,6 +26,25 @@ class CuteRunner:
 
 class TrtRunner:
     pass
+
+
+def test_shape_trace_counts_repeated_dispatches_without_repeating_trace_rows(
+    tmp_path: Path,
+) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    runner = CuteRunner()
+
+    trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
+    trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
+    trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
+    trace.finalize()
+
+    trace_rows = (tmp_path / f"trace.{trace.pid}.jsonl").read_text().splitlines()
+    count_rows = (tmp_path / f"counts.{trace.pid}.jsonl").read_text().splitlines()
+    assert len(trace_rows) == 1
+    assert len(count_rows) == 1
+    assert json.loads(count_rows[0])["invocation_count"] == 3
+    assert (tmp_path / f"counts.{trace.pid}.complete").is_file()
 
 
 def test_extract_mnk_flattens_all_activation_batch_dimensions() -> None:
@@ -58,6 +78,8 @@ def test_lookup_returns_only_exact_shape_and_runner_match(tmp_path: Path) -> Non
         json.dumps(
             {
                 "format_version": 1,
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
                 "entries": [
                     {
                         "m": 1001,
@@ -95,12 +117,76 @@ def test_lookup_rejects_duplicate_shape_entries(tmp_path: Path) -> None:
         TacticLookup.load(lookup_path)
 
 
+def test_lookup_rejects_backend_or_layout_mismatch(tmp_path: Path) -> None:
+    lookup_path = tmp_path / "lookup.json"
+    lookup_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "backend": "trtllm",
+                "scale_layout": "8x4",
+                "entries": [
+                    {"m": 1, "n": 2304, "k": 8192, "runner": "TrtRunner", "tactic": 7}
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="lookup backend mismatch"):
+        TacticLookup.load(
+            lookup_path, expected_backend="cute-dsl", expected_scale_layout="128x4"
+        )
+
+
+def test_lookup_rejects_flashinfer_commit_mismatch(tmp_path: Path) -> None:
+    lookup_path = tmp_path / "lookup.json"
+    lookup_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "backend": "trtllm",
+                "scale_layout": "8x4",
+                "flashinfer_commit": "def456",
+                "entries": [
+                    {"m": 1, "n": 2304, "k": 8192, "runner": "TrtRunner", "tactic": 7}
+                ],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="FlashInfer commit mismatch"):
+        TacticLookup.load(
+            lookup_path,
+            expected_backend="trtllm",
+            expected_scale_layout="8x4",
+            expected_flashinfer_commit="different",
+        )
+
+
+def test_lookup_rejects_gpu_mismatch(tmp_path: Path) -> None:
+    lookup_path = tmp_path / "lookup.json"
+    lookup_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "gpu": "NVIDIA GB200",
+                "entries": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="lookup GPU mismatch"):
+        TacticLookup.load(lookup_path, expected_gpu="NVIDIA H100")
+
+
 def test_dispatcher_uses_lookup_hit_without_calling_default(tmp_path: Path) -> None:
     lookup_path = tmp_path / "lookup.json"
     lookup_path.write_text(
         json.dumps(
             {
                 "format_version": 1,
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
                 "entries": [
                     {
                         "m": 1001,
@@ -140,6 +226,8 @@ def test_dispatcher_delegates_lookup_miss_to_default(tmp_path: Path) -> None:
         json.dumps(
             {
                 "format_version": 1,
+                "backend": "cute-dsl",
+                "scale_layout": "128x4",
                 "entries": [
                     {
                         "m": 1001,

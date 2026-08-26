@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -74,10 +75,46 @@ class TacticLookup:
         self._entries = entries
 
     @classmethod
-    def load(cls, path: Path) -> TacticLookup:
+    def load(
+        cls,
+        path: Path,
+        *,
+        expected_backend: str | None = None,
+        expected_scale_layout: str | None = None,
+        expected_flashinfer_commit: str | None = None,
+        expected_gpu: str | None = None,
+    ) -> TacticLookup:
         payload = json.loads(path.read_text())
         if payload.get("format_version") != 1:
             raise ValueError(f"unsupported lookup format: {path}")
+        if expected_backend is not None and payload.get("backend") != expected_backend:
+            raise ValueError(
+                "lookup backend mismatch: "
+                f"expected={expected_backend}, actual={payload.get('backend')}"
+            )
+        if (
+            expected_scale_layout is not None
+            and payload.get("scale_layout") != expected_scale_layout
+        ):
+            raise ValueError(
+                "lookup scale-layout mismatch: "
+                f"expected={expected_scale_layout}, "
+                f"actual={payload.get('scale_layout')}"
+            )
+        if (
+            expected_flashinfer_commit is not None
+            and payload.get("flashinfer_commit") != expected_flashinfer_commit
+        ):
+            raise ValueError(
+                "lookup FlashInfer commit mismatch: "
+                f"expected={expected_flashinfer_commit}, "
+                f"actual={payload.get('flashinfer_commit')}"
+            )
+        if expected_gpu is not None and payload.get("gpu") != expected_gpu:
+            raise ValueError(
+                "lookup GPU mismatch: "
+                f"expected={expected_gpu}, actual={payload.get('gpu')}"
+            )
 
         entries: dict[tuple[int, int, int, str], LookupEntry] = {}
         for row in payload.get("entries", []):
@@ -111,10 +148,37 @@ class ShapeTrace:
 
     def __init__(self, directory: Path, phase: str) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        self._path = directory / f"trace.{os.getpid()}.jsonl"
+        self.pid = os.getpid()
+        self._path = directory / f"trace.{self.pid}.jsonl"
+        self._count_path = directory / f"counts.{self.pid}.jsonl"
+        self._complete_path = directory / f"counts.{self.pid}.complete"
         self._phase = phase
-        self._seen: set[tuple[Shape, str, str]] = set()
+        self._seen: set[tuple[Shape, str, str, str]] = set()
+        self._counts: dict[tuple[Shape, str, str, str], dict[str, Any]] = {}
+        self._calls_since_flush = 0
         self._lock = threading.Lock()
+        atexit.register(self.finalize)
+
+    def flush(self) -> None:
+        with self._lock:
+            rows = [
+                {**record, "invocation_count": record["invocation_count"]}
+                for _, record in sorted(
+                    self._counts.items(), key=lambda item: str(item[0])
+                )
+            ]
+            if not rows:
+                return
+            temporary = self._count_path.with_suffix(".tmp")
+            temporary.write_text(
+                "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+            )
+            temporary.replace(self._count_path)
+            self._calls_since_flush = 0
+
+    def finalize(self) -> None:
+        self.flush()
+        self._complete_path.touch()
 
     def record(
         self,
@@ -124,26 +188,37 @@ class ShapeTrace:
         selection_source: str,
     ) -> None:
         runner_name = runner.__class__.__name__
-        key = (shape, runner_name, selection_source)
+        tactic_json = json.dumps(_jsonable(tactic), separators=(",", ":"))
+        key = (shape, runner_name, selection_source, tactic_json)
         with self._lock:
+            record = self._counts.get(key)
+            if record is None:
+                m, n, k = shape
+                record = {
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "runner": runner_name,
+                    "tactic": _jsonable(tactic),
+                    "selection_source": selection_source,
+                    "phase": self._phase,
+                    "pid": self.pid,
+                    "rank": os.getenv("RANK", os.getenv("SLURM_PROCID", "unknown")),
+                    "host": socket.gethostname(),
+                    "invocation_count": 0,
+                }
+                self._counts[key] = record
+            record["invocation_count"] += 1
+            self._calls_since_flush += 1
             if key in self._seen:
-                return
-            self._seen.add(key)
-            m, n, k = shape
-            row = {
-                "m": m,
-                "n": n,
-                "k": k,
-                "runner": runner_name,
-                "tactic": _jsonable(tactic),
-                "selection_source": selection_source,
-                "phase": self._phase,
-                "pid": os.getpid(),
-                "rank": os.getenv("RANK", os.getenv("SLURM_PROCID", "unknown")),
-                "host": socket.gethostname(),
-            }
-            with self._path.open("a") as handle:
-                handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+                should_flush = self._calls_since_flush >= 4096
+            else:
+                self._seen.add(key)
+                with self._path.open("a") as handle:
+                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+                should_flush = self._calls_since_flush >= 4096
+        if should_flush:
+            self.flush()
 
 
 _PATCHED = False
@@ -202,7 +277,24 @@ def install_from_environment() -> None:
         trace = ShapeTrace(
             Path(trace_dir_raw), os.getenv("MXFP8_TACTIC_TRACE_PHASE", "unknown")
         )
-    lookup = TacticLookup.load(Path(lookup_path_raw)) if lookup_path_raw else None
+    lookup = None
+    if lookup_path_raw:
+        required = {
+            "MXFP8_TACTIC_BACKEND": os.getenv("MXFP8_TACTIC_BACKEND"),
+            "MXFP8_TACTIC_SCALE_LAYOUT": os.getenv("MXFP8_TACTIC_SCALE_LAYOUT"),
+            "FLASHINFER_COMMIT": os.getenv("FLASHINFER_COMMIT"),
+            "MXFP8_TACTIC_GPU": os.getenv("MXFP8_TACTIC_GPU"),
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"lookup provenance environment is missing: {missing}")
+        lookup = TacticLookup.load(
+            Path(lookup_path_raw),
+            expected_backend=required["MXFP8_TACTIC_BACKEND"],
+            expected_scale_layout=required["MXFP8_TACTIC_SCALE_LAYOUT"],
+            expected_flashinfer_commit=required["FLASHINFER_COMMIT"],
+            expected_gpu=required["MXFP8_TACTIC_GPU"],
+        )
     AutoTuner.choose_one = make_dispatcher(AutoTuner.choose_one, lookup, trace)
     _PATCHED = True
     print(

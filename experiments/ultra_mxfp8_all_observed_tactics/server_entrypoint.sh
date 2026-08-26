@@ -10,12 +10,17 @@ export FLASHINFER_WORKSPACE_BASE="${SCRATCH_ROOT}/flashinfer"
 export XDG_CACHE_HOME="${SCRATCH_ROOT}/xdg"
 export PYTHONPYCACHEPREFIX="${SCRATCH_ROOT}/pycache"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+readonly GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader)
 
 server_env=(
   env
-  "PYTHONPATH=${EXP_DIR}:${PYTHONPATH:-}"
-  "MXFP8_TACTIC_TRACE_DIR=${RUN_DIR}/traces"
+  "PYTHONPATH=${EXP_DIR}:${FLASHINFER_ROOT}:${PYTHONPATH:-}"
+  "EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}"
+  "MXFP8_TACTIC_TRACE_DIR=${SCRATCH_ROOT}/traces"
   "MXFP8_TACTIC_TRACE_PHASE=${TRACE_PHASE}"
+  "MXFP8_TACTIC_BACKEND=${ORACLE_BACKEND}"
+  "MXFP8_TACTIC_SCALE_LAYOUT=${SCALE_LAYOUT}"
+  "MXFP8_TACTIC_GPU=${GPU_NAME}"
   "VLLM_MXFP8_TRTLLM_LAYOUT=${TRTLLM_LAYOUT}"
 )
 if [[ "${USE_LOOKUP}" == 1 ]]; then
@@ -58,37 +63,107 @@ fi
   echo "job_id=${SLURM_JOB_ID}"
   echo "run_kind=${RUN_KIND}"
   echo "backend_name=${BACKEND_NAME}"
+  echo "oracle_backend=${ORACLE_BACKEND}"
+  echo "scale_layout=${SCALE_LAYOUT}"
   echo "source_commit=${SOURCE_COMMIT}"
+  echo "flashinfer_commit=${FLASHINFER_COMMIT}"
+  echo "expected_vllm_version=${EXPECTED_VLLM_VERSION}"
   echo "container=${CONTAINER_IMAGE}"
+  echo "container_sha256=${EXPECTED_CONTAINER_SHA256}"
   echo "model=${MODEL_PATH}"
   echo "tp=${TP}"
   echo "linear_backend=${LINEAR_BACKEND}"
   echo "trtllm_layout=${TRTLLM_LAYOUT}"
   echo "moe_backend=${MOE_BACKEND}"
+  echo "attention_backend=FLASHINFER"
+  echo "kv_cache_dtype=auto"
+  echo "max_model_len=${MAX_MODEL_LEN}"
+  echo "max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS}"
+  echo "max_num_seqs=${MAX_NUM_SEQS}"
+  echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
+  echo "enable_chunked_prefill=true"
+  echo "enable_prefix_caching=true"
+  echo "mamba_cache_mode=all"
+  echo "mamba_ssm_cache_dtype=float32"
+  echo "enforce_eager=${ENFORCE_EAGER}"
+  echo "cudagraph_capture_sizes=1,2,4,8,16,32"
   echo "workloads=${WORKLOADS}"
   echo "concurrencies=${CONCURRENCIES}"
   echo "prompt_multiplier=${PROMPT_MULTIPLIER}"
   printf "server_command="
   printf "%q " "${server_env[@]}" "${server_cmd[@]}"
   printf "\n"
-  vllm --version
-  uv run --no-project python -c \
-    'import flashinfer; print("flashinfer=" + flashinfer.__version__)'
-  nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+  echo "vllm_version=$("${server_env[@]}" vllm --version)"
+  "${server_env[@]}" uv run --no-project python -c \
+    'import flashinfer, vllm; print("vllm_file=" + vllm.__file__); print("flashinfer=" + flashinfer.__version__); print("flashinfer_file=" + flashinfer.__file__)'
+  echo "gpu_name=${GPU_NAME}"
+  echo "driver_version=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader)"
 } >"${RUN_DIR}/metadata.txt"
 
-"${server_env[@]}" "${server_cmd[@]}" >"${RUN_DIR}/server.log" 2>&1 &
+setsid "${server_env[@]}" "${server_cmd[@]}" >"${RUN_DIR}/server.log" 2>&1 &
 server_pid=$!
-cleanup() {
-  kill "${server_pid}" 2>/dev/null || true
+server_group_alive() {
+  kill -0 -- "-${server_pid}" 2>/dev/null
+}
+signal_server_group() {
+  local signal=$1
+  local attempts=$2
+  kill "-${signal}" -- "-${server_pid}" 2>/dev/null || true
+  for _ in $(seq 1 "${attempts}"); do
+    server_group_alive || return 0
+    sleep 1
+  done
+  return 1
+}
+stop_server() {
+  if server_group_alive; then
+    signal_server_group INT 60 || \
+      signal_server_group TERM 30 || \
+      signal_server_group KILL 10 || {
+        echo "vLLM process group ${server_pid} did not stop" >&2
+        return 1
+      }
+  fi
   wait "${server_pid}" 2>/dev/null || true
+}
+publish_traces() {
+  local trace pid
+  local -a traces
+  shopt -s nullglob
+  traces=("${SCRATCH_ROOT}"/traces/trace.*.jsonl)
+  if ((${#traces[@]} == 0)); then
+    echo "No MXFP8 tactic traces were produced" >&2
+    return 1
+  fi
+  for trace in "${traces[@]}"; do
+    pid=$(basename "${trace}")
+    pid=${pid#trace.}
+    pid=${pid%.jsonl}
+    test -s "${SCRATCH_ROOT}/traces/counts.${pid}.jsonl"
+    test -f "${SCRATCH_ROOT}/traces/counts.${pid}.complete"
+  done
+  local stage="${RUN_DIR}/traces.tmp.${SLURM_JOB_ID}"
+  rm -rf "${stage}"
+  mkdir "${stage}"
+  cp -a "${SCRATCH_ROOT}/traces/." "${stage}/"
+  mv "${stage}" "${RUN_DIR}/traces"
+}
+cleanup() {
+  local status=$?
+  trap - EXIT
+  set +e
+  stop_server
+  mkdir -p "${RESULT_ROOT}/debug_traces/${RUN_KIND}/${SLURM_JOB_ID}"
+  cp -a "${SCRATCH_ROOT}/traces/." \
+    "${RESULT_ROOT}/debug_traces/${RUN_KIND}/${SLURM_JOB_ID}/" 2>/dev/null
   rm -rf "${SCRATCH_ROOT}"
+  exit "${status}"
 }
 trap cleanup EXIT
 
 deadline=$((SECONDS + 7200))
 until curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null; do
-  if ! kill -0 "${server_pid}" 2>/dev/null; then
+  if ! server_group_alive; then
     echo "Server exited before becoming healthy" >&2
     tail -200 "${RUN_DIR}/server.log" >&2
     exit 1
@@ -108,7 +183,7 @@ for workload in ${WORKLOADS}; do
     num_prompts=$((concurrency * PROMPT_MULTIPLIER))
     seed=$((workload_index * 1000 + concurrency))
     result_file="result_isl${isl}_osl${osl}_c${concurrency}.json"
-    timeout "${BENCH_TIMEOUT_S}" vllm bench serve \
+    "${server_env[@]}" timeout "${BENCH_TIMEOUT_S}" vllm bench serve \
       --backend vllm \
       --base-url "http://127.0.0.1:${PORT}" \
       --endpoint /v1/completions \
@@ -124,6 +199,7 @@ for workload in ${WORKLOADS}; do
       --request-rate inf \
       --max-concurrency "${concurrency}" \
       --ignore-eos \
+      --temperature 0 \
       --seed "${seed}" \
       --save-result \
       --save-detailed \
@@ -143,8 +219,13 @@ with open(path) as handle:
 assert result["completed"] == expected_requests, result
 assert result["failed"] == 0, result
 input_lens = result["input_lens"]
+output_lens = result["output_lens"]
+generated_texts = result["generated_texts"]
 assert len(input_lens) == expected_requests, result
+assert len(output_lens) == expected_requests, result
+assert len(generated_texts) == expected_requests, result
 assert all(isl <= length <= isl + 1 for length in input_lens), result
+assert all(length == osl for length in output_lens), result
 assert result["total_input_tokens"] == sum(input_lens), result
 assert result["total_output_tokens"] == expected_requests * osl, result
 PY
@@ -152,4 +233,8 @@ PY
   workload_index=$((workload_index + 1))
 done
 
+stop_server
+publish_traces
+rm -rf "${SCRATCH_ROOT}"
+trap - EXIT
 touch "${RUN_DIR}/COMPLETE"

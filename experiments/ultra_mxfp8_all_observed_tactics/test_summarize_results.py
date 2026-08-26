@@ -11,7 +11,13 @@ from experiments.ultra_mxfp8_all_observed_tactics.summarize_results import (
 )
 
 
-def _write_result(path: Path, *, output_tps: float, duration: float) -> None:
+def _write_result(
+    path: Path,
+    *,
+    output_tps: float,
+    duration: float,
+    generated_texts: list[str] | None = None,
+) -> None:
     path.write_text(
         json.dumps(
             {
@@ -19,6 +25,9 @@ def _write_result(path: Path, *, output_tps: float, duration: float) -> None:
                 "failed": 0,
                 "total_input_tokens": 10_000,
                 "total_output_tokens": 10_000,
+                "input_lens": [1_000] * 10,
+                "output_lens": [1_000] * 10,
+                "generated_texts": generated_texts or ["same"] * 10,
                 "output_throughput": output_tps,
                 "total_token_throughput": output_tps * 2,
                 "mean_ttft_ms": 100.0,
@@ -26,6 +35,51 @@ def _write_result(path: Path, *, output_tps: float, duration: float) -> None:
                 "duration": duration,
             }
         )
+    )
+
+
+def _write_metadata(path: Path, run_kind: str) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                f"run_kind={run_kind}",
+                "backend_name=cute-dsl",
+                "oracle_backend=cute-dsl",
+                "scale_layout=128x4",
+                "source_commit=abc123",
+                "flashinfer_commit=def456",
+                "expected_vllm_version=0.27.1",
+                "flashinfer=0.6.18",
+                "flashinfer_file=/flashinfer/__init__.py",
+                "vllm_version=0.27.1",
+                "vllm_file=/vllm/__init__.py",
+                "gpu_name=NVIDIA GB200",
+                "driver_version=590.00",
+                "container=/container.sqsh",
+                "container_sha256=container-sha",
+                "model=/model",
+                "tp=4",
+                "linear_backend=flashinfer_cutedsl",
+                "trtllm_layout=8x4",
+                "moe_backend=flashinfer_trtllm",
+                "attention_backend=FLASHINFER",
+                "kv_cache_dtype=auto",
+                "max_model_len=12024",
+                "max_num_batched_tokens=16384",
+                "max_num_seqs=32",
+                "gpu_memory_utilization=0.95",
+                "enable_chunked_prefill=true",
+                "enable_prefix_caching=true",
+                "mamba_cache_mode=all",
+                "mamba_ssm_cache_dtype=float32",
+                "enforce_eager=0",
+                "cudagraph_capture_sizes=1,2,4,8,16,32",
+                "workloads=1000:1000",
+                "concurrencies=1",
+                "prompt_multiplier=10",
+            ]
+        )
+        + "\n"
     )
 
 
@@ -38,6 +92,8 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     lookup.mkdir(parents=True)
     (baseline / "COMPLETE").touch()
     (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
     _write_result(
         baseline / "result_isl1000_osl1000_c1.json",
         output_tps=100.0,
@@ -50,7 +106,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     )
     traces = lookup / "traces"
     traces.mkdir()
-    (traces / "trace.1.jsonl").write_text(
+    (traces / "counts.1.jsonl").write_text(
         "\n".join(
             [
                 json.dumps(
@@ -60,6 +116,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                         "k": 8192,
                         "runner": "CuteRunner",
                         "selection_source": "offline_lookup",
+                        "invocation_count": 3,
                     }
                 ),
                 json.dumps(
@@ -69,12 +126,14 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
                         "k": 8192,
                         "runner": "CuteRunner",
                         "selection_source": "default_autotuner",
+                        "invocation_count": 1,
                     }
                 ),
             ]
         )
         + "\n"
     )
+    (traces / "counts.1.complete").touch()
     report_dir = tmp_path / "oracle" / "shards" / "0" / "oracle"
     report_dir.mkdir(parents=True)
     (report_dir / "report.json").write_text(
@@ -82,6 +141,10 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
             {
                 "backend": "cute-dsl",
                 "scale_layout": "128x4",
+                "flashinfer_commit": "def456",
+                "gpu": "NVIDIA GB200",
+                "profiling_wall_s": 12.5,
+                "measured_candidate_gpu_s": 15.0,
                 "shapes": [
                     {
                         "m": 1,
@@ -113,17 +176,6 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
             }
         )
     )
-    cache_dir = tmp_path / "oracle" / "shards" / "0" / "cache"
-    cache_dir.mkdir(parents=True)
-    (cache_dir / "exact_cache_metadata.json").write_text(
-        json.dumps({"tuning_time_s": 12.5})
-    )
-    second_cache_dir = tmp_path / "oracle" / "shards" / "1" / "cache"
-    second_cache_dir.mkdir(parents=True)
-    (second_cache_dir / "exact_cache_metadata.json").write_text(
-        json.dumps({"tuning_time_s": 2.5})
-    )
-
     summary = summarize_backend(tmp_path, "cute-dsl")
 
     assert summary["e2e"]["workloads"][0]["output_throughput_speedup"] == pytest.approx(
@@ -135,8 +187,8 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["oracle"]["shape_count"] == 2
     assert summary["oracle"]["geomean_speedup"] == pytest.approx(1.2**0.5)
     assert summary["oracle"]["different_tactic_count"] == 1
-    assert summary["oracle"]["cache_tuning_gpu_s"] == pytest.approx(15.0)
-    assert summary["oracle"]["cache_tuning_wall_s_estimate"] == pytest.approx(12.5)
+    assert summary["oracle"]["measured_candidate_gpu_s"] == pytest.approx(15.0)
+    assert summary["oracle"]["profiling_wall_s_estimate"] == pytest.approx(12.5)
     assert summary["oracle"]["candidate_count_min"] == 2
     assert summary["oracle"]["candidate_count_max"] == 4
     assert summary["oracle"]["regret_pct_p50"] == pytest.approx(10.0)
@@ -175,6 +227,7 @@ def test_summarize_backend_combines_e2e_oracle_and_lookup_coverage(
     assert summary["lookup"]["unique_hit_count"] == 1
     assert summary["lookup"]["unique_miss_count"] == 1
     assert summary["lookup"]["unique_hit_rate"] == pytest.approx(0.5)
+    assert summary["lookup"]["selection_call_weighted_hit_rate"] == pytest.approx(0.75)
     assert summary["lookup"]["coverage_by_m"] == [
         {"m": 1, "unique_dispatch_count": 1, "hit_rate": pytest.approx(1.0)},
         {"m": 2, "unique_dispatch_count": 1, "hit_rate": pytest.approx(0.0)},
@@ -188,6 +241,8 @@ def test_summarize_backend_requires_matched_result_files(tmp_path: Path) -> None
     lookup.mkdir(parents=True)
     (baseline / "COMPLETE").touch()
     (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
     _write_result(
         baseline / "result_isl1000_osl1000_c1.json",
         output_tps=100.0,
@@ -200,4 +255,74 @@ def test_summarize_backend_requires_matched_result_files(tmp_path: Path) -> None
     )
 
     with pytest.raises(ValueError, match="result files do not match"):
+        summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_summarize_backend_rejects_generated_text_mismatch(tmp_path: Path) -> None:
+    baseline = tmp_path / "serving" / "baseline" / "11"
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    baseline.mkdir(parents=True)
+    lookup.mkdir(parents=True)
+    (baseline / "COMPLETE").touch()
+    (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
+    _write_result(
+        baseline / "result_isl1000_osl1000_c1.json",
+        output_tps=100.0,
+        duration=200.0,
+        generated_texts=["baseline"] * 10,
+    )
+    _write_result(
+        lookup / "result_isl1000_osl1000_c1.json",
+        output_tps=110.0,
+        duration=180.0,
+        generated_texts=["lookup"] * 10,
+    )
+
+    with pytest.raises(ValueError, match="generated text mismatch"):
+        summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_summarize_backend_rejects_execution_metadata_mismatch(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "serving" / "baseline" / "11"
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    baseline.mkdir(parents=True)
+    lookup.mkdir(parents=True)
+    (baseline / "COMPLETE").touch()
+    (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
+    lookup_metadata = lookup / "metadata.txt"
+    lookup_metadata.write_text(
+        lookup_metadata.read_text().replace(
+            "flashinfer_commit=def456", "flashinfer_commit=different"
+        )
+    )
+
+    with pytest.raises(ValueError, match="metadata do not match"):
+        summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_summarize_backend_requires_generated_texts(tmp_path: Path) -> None:
+    baseline = tmp_path / "serving" / "baseline" / "11"
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    baseline.mkdir(parents=True)
+    lookup.mkdir(parents=True)
+    (baseline / "COMPLETE").touch()
+    (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
+    baseline_result = baseline / "result_isl1000_osl1000_c1.json"
+    lookup_result = lookup / "result_isl1000_osl1000_c1.json"
+    _write_result(baseline_result, output_tps=100.0, duration=200.0)
+    _write_result(lookup_result, output_tps=110.0, duration=180.0)
+    for path in (baseline_result, lookup_result):
+        result = json.loads(path.read_text())
+        del result["generated_texts"]
+        path.write_text(json.dumps(result))
+
+    with pytest.raises(ValueError, match="missing generated texts"):
         summarize_backend(tmp_path, "cute-dsl")

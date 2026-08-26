@@ -6,16 +6,22 @@
 set -euo pipefail
 
 : "${CONTAINER_IMAGE:?Set CONTAINER_IMAGE}"
+: "${EXPECTED_CONTAINER_SHA256:?Set EXPECTED_CONTAINER_SHA256}"
 : "${MODEL_PATH:?Set MODEL_PATH}"
 : "${SOURCE_ROOT:?Set SOURCE_ROOT}"
 : "${SOURCE_COMMIT:?Set SOURCE_COMMIT}"
+: "${FLASHINFER_ROOT:?Set FLASHINFER_ROOT}"
+: "${FLASHINFER_COMMIT:?Set FLASHINFER_COMMIT}"
 : "${RESULT_ROOT:?Set RESULT_ROOT}"
 : "${RUN_KIND:?Set RUN_KIND}"
 : "${BACKEND_NAME:?Set BACKEND_NAME}"
 : "${LINEAR_BACKEND:?Set LINEAR_BACKEND}"
+: "${ORACLE_BACKEND:?Set ORACLE_BACKEND}"
+: "${SCALE_LAYOUT:?Set SCALE_LAYOUT}"
 : "${TRTLLM_LAYOUT:?Set TRTLLM_LAYOUT}"
 
 export TP=${TP:-4}
+export EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION:-0.27.1}
 export MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
 export MAX_MODEL_LEN=${MAX_MODEL_LEN:-12024}
 export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
@@ -26,6 +32,23 @@ export PORT=${PORT:-$((18000 + SLURM_JOB_ID % 20000))}
 export EXP_DIR="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
 export RUN_DIR="${RESULT_ROOT}/serving/${RUN_KIND}/${SLURM_JOB_ID}"
 export SCRATCH_ROOT="/raid/scratch/${USER}/mxfp8_all_observed/${SLURM_JOB_ID}"
+
+for checkout in "${SOURCE_ROOT}:${SOURCE_COMMIT}:vLLM" \
+  "${FLASHINFER_ROOT}:${FLASHINFER_COMMIT}:FlashInfer"; do
+  IFS=: read -r root expected name <<<"${checkout}"
+  actual=$(git -C "${root}" rev-parse HEAD)
+  if [[ "${actual}" != "${expected}" ]] || \
+    [[ -n $(git -C "${root}" status --porcelain) ]]; then
+    echo "${name} checkout is not clean at ${expected}: ${root}" >&2
+    exit 1
+  fi
+done
+container_sha=$(awk -F= '$1 == "sha256" {print $2}' \
+  "${CONTAINER_IMAGE}.metadata.txt")
+if [[ "${container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
+  echo "Expected container ${EXPECTED_CONTAINER_SHA256}, got ${container_sha}" >&2
+  exit 1
+fi
 
 case "${RUN_KIND}" in
   capture-eager)
@@ -59,7 +82,7 @@ case "${RUN_KIND}" in
     ;;
 esac
 
-mkdir -p "${RUN_DIR}/traces" "${SCRATCH_ROOT}"
+mkdir -p "${RUN_DIR}" "${SCRATCH_ROOT}/traces"
 
 srun \
   --container-image="${CONTAINER_IMAGE}" \
