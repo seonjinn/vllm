@@ -201,6 +201,7 @@ class ShapeTrace:
         self._phase = phase
         self._seen: set[tuple[Shape, str, str, str]] = set()
         self._counts: dict[tuple[Shape, str, str, str], dict[str, Any]] = {}
+        self._invocation_index = 0
         self._calls_since_flush = 0
         self._rank: str | None = None
         self._lock = threading.Lock()
@@ -238,6 +239,7 @@ class ShapeTrace:
         tactic_json = json.dumps(_jsonable(tactic), separators=(",", ":"))
         key = (shape, runner_name, selection_source, tactic_json)
         with self._lock:
+            self._invocation_index += 1
             record = self._counts.get(key)
             if record is None:
                 if self._rank is None:
@@ -255,9 +257,12 @@ class ShapeTrace:
                     "rank": self._rank,
                     "host": socket.gethostname(),
                     "invocation_count": 0,
+                    "first_invocation_index": self._invocation_index,
+                    "last_invocation_index": self._invocation_index,
                 }
                 self._counts[key] = record
             record["invocation_count"] += 1
+            record["last_invocation_index"] = self._invocation_index
             self._calls_since_flush += 1
             if key in self._seen:
                 should_flush = self._calls_since_flush >= 4096

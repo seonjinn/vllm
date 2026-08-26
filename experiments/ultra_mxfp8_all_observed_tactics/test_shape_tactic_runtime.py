@@ -68,8 +68,31 @@ def test_shape_trace_counts_repeated_dispatches_without_repeating_trace_rows(
     count_rows = (tmp_path / f"counts.{trace.pid}.jsonl").read_text().splitlines()
     assert len(trace_rows) == 1
     assert len(count_rows) == 1
-    assert json.loads(count_rows[0])["invocation_count"] == 3
+    count = json.loads(count_rows[0])
+    assert count["invocation_count"] == 3
+    assert count["first_invocation_index"] == 1
+    assert count["last_invocation_index"] == 3
     assert (tmp_path / f"counts.{trace.pid}.complete").is_file()
+
+
+def test_shape_trace_orders_fallback_before_tuned_tactic(tmp_path: Path) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    runner = CuteRunner()
+
+    trace.record((2, 2048, 8192), runner, -1, "default_autotuner")
+    trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
+    trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
+    trace.finalize()
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / f"counts.{trace.pid}.jsonl").read_text().splitlines()
+    ]
+    by_tactic = {row["tactic"]: row for row in rows}
+    assert by_tactic[-1]["first_invocation_index"] == 1
+    assert by_tactic[-1]["last_invocation_index"] == 1
+    assert by_tactic[5]["first_invocation_index"] == 2
+    assert by_tactic[5]["last_invocation_index"] == 3
 
 
 def test_extract_mnk_flattens_all_activation_batch_dimensions() -> None:

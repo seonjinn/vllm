@@ -136,6 +136,60 @@ def test_merge_traces_rejects_conflicting_tactics_in_selected_phase(
         merge_traces(trace_dir, tmp_path / "observed.csv", tmp_path / "summary.json")
 
 
+def test_merge_traces_uses_final_tactic_after_startup_fallback(
+    tmp_path: Path,
+) -> None:
+    trace_dir = tmp_path / "traces"
+    trace_dir.mkdir()
+    for rank in range(2):
+        pid = rank + 10
+        rows = [
+            {
+                "m": 2,
+                "n": 2048,
+                "k": 8192,
+                "runner": "CutlassRunner",
+                "phase": "baseline",
+                "tactic": -1,
+                "selection_source": "default_autotuner",
+                "invocation_count": 3,
+                "first_invocation_index": 1,
+                "last_invocation_index": 3,
+                "pid": pid,
+                "rank": str(rank),
+            },
+            {
+                "m": 2,
+                "n": 2048,
+                "k": 8192,
+                "runner": "CutlassRunner",
+                "phase": "baseline",
+                "tactic": 5,
+                "selection_source": "default_autotuner",
+                "invocation_count": 7,
+                "first_invocation_index": 4,
+                "last_invocation_index": 10,
+                "pid": pid,
+                "rank": str(rank),
+            },
+        ]
+        payload = "".join(json.dumps(row) + "\n" for row in rows)
+        (trace_dir / f"trace.{pid}.jsonl").write_text(payload)
+        (trace_dir / f"counts.{pid}.jsonl").write_text(payload)
+        (trace_dir / f"counts.{pid}.complete").touch()
+
+    output = tmp_path / "observed.csv"
+    merge_traces(
+        trace_dir,
+        output,
+        tmp_path / "summary.json",
+        expected_rank_count=2,
+    )
+
+    assert _read_csv(output)[0]["selected_tactic"] == "5"
+    assert _read_csv(output)[0]["selection_call_count"] == "14"
+
+
 def test_merge_traces_rejects_incomplete_expected_rank_coverage(
     tmp_path: Path,
 ) -> None:

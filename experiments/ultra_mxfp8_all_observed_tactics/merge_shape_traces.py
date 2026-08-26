@@ -28,6 +28,28 @@ def _positive_count(row: dict[str, Any], path: Path, line_number: int) -> int:
     return value
 
 
+def _invocation_range(
+    row: dict[str, Any], path: Path, line_number: int
+) -> tuple[int, int] | None:
+    first = row.get("first_invocation_index")
+    last = row.get("last_invocation_index")
+    if first is None and last is None:
+        return None
+    if (
+        isinstance(first, bool)
+        or not isinstance(first, int)
+        or isinstance(last, bool)
+        or not isinstance(last, int)
+        or first <= 0
+        or last < first
+    ):
+        raise ValueError(
+            f"invalid invocation range first={first!r}, last={last!r} "
+            f"at {path}:{line_number}"
+        )
+    return first, last
+
+
 def merge_traces(
     trace_dir: Path,
     output_csv: Path,
@@ -41,6 +63,7 @@ def merge_traces(
             "processes": set(),
             "ranks": set(),
             "tactics_by_phase": defaultdict(lambda: defaultdict(int)),
+            "ordered_tactics_by_phase": defaultdict(list),
         }
     )
     ranks_by_phase: defaultdict[str, set[str]] = defaultdict(set)
@@ -92,9 +115,8 @@ def merge_traces(
             rank = str(row.get("rank", "unknown"))
             records[key]["phases"].add(phase)
             relative_parent = path.parent.relative_to(trace_dir)
-            records[key]["processes"].add(
-                f"{relative_parent}:{row.get('pid', 'unknown')}"
-            )
+            process = f"{relative_parent}:{row.get('pid', 'unknown')}"
+            records[key]["processes"].add(process)
             records[key]["ranks"].add(rank)
             ranks_by_phase[phase].add(rank)
             if row.get("selection_source", "default_autotuner") == "default_autotuner":
@@ -102,6 +124,15 @@ def merge_traces(
                 tactic = json.dumps(row["tactic"], separators=(",", ":"))
                 count = _positive_count(row, path, line_number)
                 records[key]["tactics_by_phase"][phase][tactic] += count
+                invocation_range = _invocation_range(row, path, line_number)
+                records[key]["ordered_tactics_by_phase"][phase].append(
+                    {
+                        "process": process,
+                        "tactic": tactic,
+                        "count": count,
+                        "invocation_range": invocation_range,
+                    }
+                )
 
     if expected_rank_count is not None:
         if expected_rank_count <= 0:
@@ -144,7 +175,26 @@ def merge_traces(
             )
             if selected_phase is None:
                 selected_phase = min(available_phases)
-            tactics = available_phases[selected_phase]
+            observations = provenance["ordered_tactics_by_phase"][selected_phase]
+            if observations and all(
+                observation["invocation_range"] is not None
+                for observation in observations
+            ):
+                latest_by_process: dict[str, dict[str, Any]] = {}
+                for observation in observations:
+                    process = observation["process"]
+                    previous = latest_by_process.get(process)
+                    if (
+                        previous is None
+                        or observation["invocation_range"][1]
+                        > (previous["invocation_range"][1])
+                    ):
+                        latest_by_process[process] = observation
+                tactics: defaultdict[str, int] = defaultdict(int)
+                for observation in latest_by_process.values():
+                    tactics[observation["tactic"]] += observation["count"]
+            else:
+                tactics = available_phases[selected_phase]
             if len(tactics) != 1:
                 raise ValueError(
                     "conflicting serving tactics for "
