@@ -78,6 +78,111 @@ Aggregation fails unless all four arms have common invariant metadata, matching
 workloads and generated outputs, complete two-order pairs, complete rank
 coverage, a content-bound lookup manifest, and positive lookup hits.
 
+An arm that fails empirically before producing valid serving, oracle, and lookup
+artifacts can be represented by an evidence-backed status JSON instead of a
+`--result`. At most one arm may use this status; the other three must be measured.
+The four expected arm names are still required:
+
+```bash
+python experiments/ultra_mxfp8_all_observed_tactics/summarize_results.py \
+  --result cute-dsl=/path/to/cute-dsl-result \
+  --unsupported cutlass=/path/to/cutlass-status.json \
+  --result trtllm-128x4=/path/to/trtllm-128x4-result \
+  --result trtllm-8x4=/path/to/trtllm-8x4-result \
+  --output-json=/path/to/summary.json \
+  --output-csv=/path/to/e2e.csv
+```
+
+The unsupported status has this exact outer and failure schema. Evidence paths
+may be absolute or relative to the status JSON directory; every referenced file
+must exist and match its lowercase SHA256 digest. Canonical output records use
+the resolved absolute evidence paths.
+
+```json
+{
+  "backend": "cutlass",
+  "status": "empirically_unsupported",
+  "recipe": {
+    "backend_name": "cutlass",
+    "linear_backend": "flashinfer_cutlass",
+    "oracle_backend": "cutlass",
+    "scale_layout": "128x4",
+    "trtllm_layout": "8x4"
+  },
+  "provenance": {
+    "source_commit": "...",
+    "flashinfer_commit": "...",
+    "expected_vllm_version": "...",
+    "flashinfer": "...",
+    "flashinfer_file": "...",
+    "vllm_version": "...",
+    "vllm_file": "...",
+    "vllm_compiled_file": "...",
+    "gpu_name": "...",
+    "driver_version": "...",
+    "container": "...",
+    "container_sha256": "...",
+    "container_size": "...",
+    "container_mtime": "...",
+    "model": "...",
+    "model_config_sha256": "...",
+    "model_index_sha256": "...",
+    "model_weights_manifest_sha256": "...",
+    "tp": "...",
+    "moe_backend": "...",
+    "attention_backend": "...",
+    "kv_cache_dtype": "...",
+    "max_model_len": "...",
+    "max_num_batched_tokens": "...",
+    "max_num_seqs": "...",
+    "gpu_memory_utilization": "...",
+    "enable_chunked_prefill": "...",
+    "enable_prefix_caching": "...",
+    "mamba_cache_mode": "...",
+    "mamba_ssm_cache_dtype": "...",
+    "cudagraph_capture_sizes": "...",
+    "prompt_multiplier": "..."
+  },
+  "failure": {
+    "stage": "server_startup",
+    "reason_code": "backend_initialization_failed",
+    "message": "Observed failure message",
+    "attempts": [
+      {"job_id": "123", "mode": "eager", "outcome": "failed"},
+      {"job_id": "124", "mode": "cuda_graph", "outcome": "failed"}
+    ],
+    "evidence": [
+      {"path": "logs/123.stderr", "sha256": "<64 lowercase hex characters>"}
+    ]
+  }
+}
+```
+
+Unsupported provenance is compared with measured arms only for the stable
+source, runtime, container, model, GPU, and recipe fields shown above. It must
+not contain `cudagraph_configured`, `cudagraph_capture_status`,
+`cudagraph_capture_evidence`, or `cudagraph_capture_marker`; those fields imply
+a completed serving run. Final A/B `workloads`, `concurrencies`, and
+`enforce_eager` are not required or compared for an unsupported arm; the status
+may retain their observed capture-attempt values instead.
+
+The failure stage must be `server_startup` or `serving_capture`. Attempts must
+cover both `eager` and `cuda_graph` modes and use a failure outcome such as
+`failed`, `timed_out`, `cancelled_after_stall`, `engine_dead`, `out_of_memory`,
+or `initialization_error`. Provenance accepts only the stable fields above plus
+the optional observed-attempt fields `enforce_eager`, `workloads`, and
+`concurrencies`.
+
+The canonical JSON keeps four full records in expected backend order under
+`backends`. Measured records have `status: measured`; the unsupported record has
+no `e2e`, `oracle`, or `lookup` sections. A partial study reports
+`study_status: complete_with_unsupported_arm`, ordered `measured_backends` and
+`unsupported_backends` name lists, and `metric_comparison_status: partial`.
+The E2E CSV contains measured arms only. A four-measured study remains
+backward compatible with the original `{"backends": [...]}` JSON and E2E CSV
+schema. `build_study_summary()` still exposes `study_status: complete` for
+callers that explicitly request the richer in-memory representation.
+
 Durable traces, lookup metadata, oracle reports, and benchmark JSON files are
 written below the printed Lustre result root. JIT, autotune, and Python caches
 are created under `/raid/scratch` and removed when each job exits.

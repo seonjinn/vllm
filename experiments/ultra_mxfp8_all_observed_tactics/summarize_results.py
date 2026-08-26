@@ -63,11 +63,278 @@ _ORACLE_TIMING_FIELDS = (
     "repeat_iters",
     "calls_per_graph",
 )
-_EXPECTED_BACKENDS = frozenset({"cute-dsl", "cutlass", "trtllm-128x4", "trtllm-8x4"})
+_EXPECTED_RECIPES = {
+    "cute-dsl": {
+        "backend_name": "cute-dsl",
+        "linear_backend": "flashinfer_cutedsl",
+        "oracle_backend": "cute-dsl",
+        "scale_layout": "128x4",
+        "trtllm_layout": "8x4",
+    },
+    "cutlass": {
+        "backend_name": "cutlass",
+        "linear_backend": "flashinfer_cutlass",
+        "oracle_backend": "cutlass",
+        "scale_layout": "128x4",
+        "trtllm_layout": "8x4",
+    },
+    "trtllm-128x4": {
+        "backend_name": "trtllm-128x4",
+        "linear_backend": "flashinfer_trtllm",
+        "oracle_backend": "trtllm",
+        "scale_layout": "128x4",
+        "trtllm_layout": "128x4",
+    },
+    "trtllm-8x4": {
+        "backend_name": "trtllm-8x4",
+        "linear_backend": "flashinfer_trtllm",
+        "oracle_backend": "trtllm",
+        "scale_layout": "8x4",
+        "trtllm_layout": "8x4",
+    },
+}
+_EXPECTED_BACKENDS = tuple(_EXPECTED_RECIPES)
+_UNSUPPORTED_PROVENANCE_METADATA = (
+    "source_commit",
+    "flashinfer_commit",
+    "expected_vllm_version",
+    "flashinfer",
+    "flashinfer_file",
+    "vllm_version",
+    "vllm_file",
+    "vllm_compiled_file",
+    "gpu_name",
+    "driver_version",
+    "container",
+    "container_sha256",
+    "container_size",
+    "container_mtime",
+    "model",
+    "model_config_sha256",
+    "model_index_sha256",
+    "model_weights_manifest_sha256",
+    "tp",
+    "moe_backend",
+    "attention_backend",
+    "kv_cache_dtype",
+    "max_model_len",
+    "max_num_batched_tokens",
+    "max_num_seqs",
+    "gpu_memory_utilization",
+    "enable_chunked_prefill",
+    "enable_prefix_caching",
+    "mamba_cache_mode",
+    "mamba_ssm_cache_dtype",
+    "cudagraph_capture_sizes",
+    "prompt_multiplier",
+)
+_UNSUPPORTED_COMPLETED_RUN_METADATA = frozenset(
+    {
+        "cudagraph_configured",
+        "cudagraph_capture_status",
+        "cudagraph_capture_evidence",
+        "cudagraph_capture_marker",
+    }
+)
+_ALLOWED_UNSUPPORTED_PROVENANCE_METADATA = frozenset(
+    (*_UNSUPPORTED_PROVENANCE_METADATA, "enforce_eager", "workloads", "concurrencies")
+)
+_ALLOWED_UNSUPPORTED_STAGES = frozenset({"server_startup", "serving_capture"})
+_ALLOWED_UNSUPPORTED_ATTEMPT_MODES = frozenset({"eager", "cuda_graph"})
+_ALLOWED_UNSUPPORTED_ATTEMPT_OUTCOMES = frozenset(
+    {
+        "failed",
+        "timed_out",
+        "cancelled_after_stall",
+        "engine_dead",
+        "out_of_memory",
+        "initialization_error",
+    }
+)
+_REQUIRED_UNSUPPORTED_ATTEMPT_FIELDS = frozenset({"job_id", "mode", "outcome"})
+_ALLOWED_UNSUPPORTED_ATTEMPT_FIELDS = frozenset(
+    {*_REQUIRED_UNSUPPORTED_ATTEMPT_FIELDS, "node", "elapsed"}
+)
+_METRIC_SECTIONS = frozenset({"e2e", "oracle", "lookup"})
 
 
 def _load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _nonempty_string(mapping: dict[str, Any], key: str, label: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} {key} must be a non-empty string")
+    return value
+
+
+def _validate_unsupported_record(
+    payload: dict[str, Any],
+    backend: str,
+    evidence_root: Path | None,
+) -> None:
+    if backend not in _EXPECTED_RECIPES:
+        raise ValueError(f"unexpected unsupported backend: {backend}")
+    metric_sections = sorted(_METRIC_SECTIONS & payload.keys())
+    if metric_sections:
+        raise ValueError(
+            f"unsupported status must not contain metric sections: {metric_sections}"
+        )
+    expected_fields = {"backend", "status", "recipe", "provenance", "failure"}
+    if payload.keys() != expected_fields:
+        raise ValueError(
+            "unsupported status fields do not match schema: "
+            f"missing={sorted(expected_fields - payload.keys())}, "
+            f"unexpected={sorted(payload.keys() - expected_fields)}"
+        )
+    if payload.get("backend") != backend:
+        raise ValueError(
+            "unsupported backend label mismatch: "
+            f"expected={backend}, actual={payload.get('backend')}"
+        )
+    if payload.get("status") != "empirically_unsupported":
+        raise ValueError(
+            "unsupported status must identify status=empirically_unsupported"
+        )
+
+    recipe = payload.get("recipe")
+    if not isinstance(recipe, dict):
+        raise ValueError("unsupported recipe must be a JSON object")
+    expected_recipe = _EXPECTED_RECIPES[backend]
+    recipe_mismatches = {
+        key: (expected, recipe.get(key))
+        for key, expected in expected_recipe.items()
+        if recipe.get(key) != expected
+    }
+    if recipe.keys() != expected_recipe.keys() or recipe_mismatches:
+        raise ValueError(f"unsupported recipe mismatch: {recipe_mismatches}")
+
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("unsupported provenance must be a JSON object")
+    completed_run_metadata = sorted(
+        _UNSUPPORTED_COMPLETED_RUN_METADATA & provenance.keys()
+    )
+    if completed_run_metadata:
+        raise ValueError(
+            "unsupported status contains completed-run provenance: "
+            f"{completed_run_metadata}"
+        )
+    unexpected_provenance = sorted(
+        provenance.keys() - _ALLOWED_UNSUPPORTED_PROVENANCE_METADATA
+    )
+    if unexpected_provenance:
+        raise ValueError(
+            f"unexpected unsupported provenance fields: {unexpected_provenance}"
+        )
+    for key in _UNSUPPORTED_PROVENANCE_METADATA:
+        _nonempty_string(provenance, key, "unsupported provenance")
+
+    failure = payload.get("failure")
+    if not isinstance(failure, dict):
+        raise ValueError("unsupported failure must be a JSON object")
+    expected_failure_fields = {
+        "stage",
+        "reason_code",
+        "message",
+        "attempts",
+        "evidence",
+    }
+    if failure.keys() != expected_failure_fields:
+        raise ValueError(
+            "unsupported failure fields do not match schema: "
+            f"missing={sorted(expected_failure_fields - failure.keys())}, "
+            f"unexpected={sorted(failure.keys() - expected_failure_fields)}"
+        )
+    for key in ("reason_code", "message"):
+        _nonempty_string(failure, key, "unsupported failure")
+    stage = _nonempty_string(failure, "stage", "unsupported failure")
+    if stage not in _ALLOWED_UNSUPPORTED_STAGES:
+        raise ValueError(f"unsupported failure stage is not empirical: {stage!r}")
+    attempts = failure.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError("unsupported failure attempts must be a non-empty list")
+    if not all(isinstance(attempt, dict) and attempt for attempt in attempts):
+        raise ValueError("unsupported failure attempts must contain non-empty objects")
+    observed_modes = set()
+    for index, attempt in enumerate(attempts):
+        missing_fields = _REQUIRED_UNSUPPORTED_ATTEMPT_FIELDS - attempt.keys()
+        unexpected_fields = attempt.keys() - _ALLOWED_UNSUPPORTED_ATTEMPT_FIELDS
+        if missing_fields or unexpected_fields:
+            raise ValueError(
+                f"unsupported attempt schema mismatch at {index}: "
+                f"missing={sorted(missing_fields)}, "
+                f"unexpected={sorted(unexpected_fields)}"
+            )
+        for key in attempt:
+            _nonempty_string(attempt, key, f"unsupported attempt {index}")
+        mode = attempt["mode"]
+        outcome = attempt["outcome"]
+        if mode not in _ALLOWED_UNSUPPORTED_ATTEMPT_MODES:
+            raise ValueError(f"unsupported attempt mode at {index}: {mode!r}")
+        if outcome not in _ALLOWED_UNSUPPORTED_ATTEMPT_OUTCOMES:
+            raise ValueError(f"unsupported attempt outcome at {index}: {outcome!r}")
+        observed_modes.add(mode)
+    if observed_modes != _ALLOWED_UNSUPPORTED_ATTEMPT_MODES:
+        raise ValueError(
+            "unsupported failure must include eager and cuda_graph attempts: "
+            f"{sorted(observed_modes)}"
+        )
+
+    evidence = failure.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError("unsupported evidence must be a non-empty list")
+    for index, entry in enumerate(evidence):
+        if not isinstance(entry, dict):
+            raise ValueError(f"unsupported evidence entry {index} must be an object")
+        expected_evidence_fields = {"path", "sha256"}
+        if entry.keys() != expected_evidence_fields:
+            raise ValueError(
+                f"unsupported evidence entry fields do not match schema at {index}: "
+                f"missing={sorted(expected_evidence_fields - entry.keys())}, "
+                f"unexpected={sorted(entry.keys() - expected_evidence_fields)}"
+            )
+        evidence_value = _nonempty_string(
+            entry, "path", f"unsupported evidence entry {index}"
+        )
+        expected_sha256 = _nonempty_string(
+            entry, "sha256", f"unsupported evidence entry {index}"
+        )
+        if len(expected_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in expected_sha256
+        ):
+            raise ValueError(f"unsupported evidence entry {index} has invalid sha256")
+        evidence_path = Path(evidence_value)
+        if not evidence_path.is_absolute():
+            evidence_path = (evidence_root or Path.cwd()) / evidence_path
+        if not evidence_path.is_file():
+            raise ValueError(f"evidence file does not exist: {evidence_path}")
+        evidence_path = evidence_path.resolve(strict=True)
+        actual_sha256 = _sha256(evidence_path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "evidence checksum mismatch: "
+                f"path={evidence_path}, expected={expected_sha256}, "
+                f"actual={actual_sha256}"
+            )
+        entry["path"] = str(evidence_path)
+
+
+def summarize_unsupported_backend(status_path: Path, backend: str) -> dict[str, Any]:
+    payload = _load(status_path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"unsupported status must be a JSON object: {status_path}")
+    _validate_unsupported_record(payload, backend, status_path.parent)
+    return dict(payload)
 
 
 def _load_metadata(path: Path) -> dict[str, str]:
@@ -611,18 +878,47 @@ def _summarize_e2e(root: Path) -> dict[str, Any]:
     }
 
 
-def validate_comparison_summaries(summaries: list[dict[str, Any]]) -> None:
+def validate_comparison_summaries(
+    summaries: list[dict[str, Any]],
+    unsupported_summaries: list[dict[str, Any]] | None = None,
+) -> None:
     if not summaries:
-        raise ValueError("comparison requires at least one backend summary")
+        raise ValueError("comparison requires at least one measured backend summary")
 
-    backends = [str(summary["backend"]) for summary in summaries]
-    if len(set(backends)) != len(backends):
-        raise ValueError(f"duplicate backend summaries: {backends}")
-    if set(backends) != _EXPECTED_BACKENDS:
+    unsupported_summaries = unsupported_summaries or []
+    if len(unsupported_summaries) > 1:
+        raise ValueError("comparison supports at most one unsupported backend arm")
+    for summary in unsupported_summaries:
+        backend = summary.get("backend")
+        if not isinstance(backend, str):
+            raise ValueError(f"unsupported backend must be a string: {backend!r}")
+        _validate_unsupported_record(summary, backend, None)
+    measured_backends = [str(summary["backend"]) for summary in summaries]
+    unsupported_backends = [
+        str(summary["backend"]) for summary in unsupported_summaries
+    ]
+    all_backends = measured_backends + unsupported_backends
+    if len(set(measured_backends)) != len(measured_backends):
+        raise ValueError(f"duplicate measured backend summaries: {measured_backends}")
+    if len(set(unsupported_backends)) != len(unsupported_backends):
+        raise ValueError(
+            f"duplicate unsupported backend summaries: {unsupported_backends}"
+        )
+    if len(set(all_backends)) != len(all_backends):
+        raise ValueError(f"backend appears as measured and unsupported: {all_backends}")
+    if set(all_backends) != set(_EXPECTED_BACKENDS):
         raise ValueError(
             "comparison requires exactly these backend arms: "
-            f"expected={sorted(_EXPECTED_BACKENDS)}, actual={sorted(backends)}"
+            f"expected={sorted(_EXPECTED_BACKENDS)}, actual={sorted(all_backends)}"
         )
+
+    invalid_measured_statuses = {
+        summary["backend"]: summary.get("status")
+        for summary in summaries
+        if summary.get("status", "measured") != "measured"
+    }
+    if invalid_measured_statuses:
+        raise ValueError(f"invalid measured statuses: {invalid_measured_statuses}")
 
     reference = summaries[0]
     reference_metadata = reference["e2e"]["metadata"]
@@ -664,6 +960,52 @@ def validate_comparison_summaries(summaries: list[dict[str, Any]]) -> None:
                 f"{reference['backend']} vs {summary['backend']}: "
                 f"{artifact_mismatches}"
             )
+
+    for summary in unsupported_summaries:
+        provenance = summary["provenance"]
+        mismatches = {
+            key: (reference_metadata.get(key), provenance.get(key))
+            for key in _UNSUPPORTED_PROVENANCE_METADATA
+            if reference_metadata.get(key) != provenance.get(key)
+        }
+        if mismatches:
+            raise ValueError(
+                "unsupported provenance mismatch: "
+                f"{reference['backend']} vs {summary['backend']}: {mismatches}"
+            )
+
+
+def build_study_summary(
+    summaries: list[dict[str, Any]],
+    unsupported_summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    validate_comparison_summaries(summaries, unsupported_summaries)
+    measured_by_backend = {summary["backend"]: summary for summary in summaries}
+    unsupported_by_backend = {
+        summary["backend"]: summary for summary in unsupported_summaries
+    }
+    measured_backends = [
+        backend for backend in _EXPECTED_BACKENDS if backend in measured_by_backend
+    ]
+    unsupported_backends = [
+        backend for backend in _EXPECTED_BACKENDS if backend in unsupported_by_backend
+    ]
+    backends = []
+    for backend in _EXPECTED_BACKENDS:
+        if backend in measured_by_backend:
+            backends.append({**measured_by_backend[backend], "status": "measured"})
+        else:
+            backends.append(dict(unsupported_by_backend[backend]))
+    has_unsupported = bool(unsupported_backends)
+    return {
+        "study_status": (
+            "complete_with_unsupported_arm" if has_unsupported else "complete"
+        ),
+        "measured_backends": measured_backends,
+        "unsupported_backends": unsupported_backends,
+        "metric_comparison_status": "partial" if has_unsupported else "complete",
+        "backends": backends,
+    }
 
 
 def _summarize_oracle(root: Path) -> dict[str, Any]:
@@ -1153,8 +1495,12 @@ def summarize_backend(root: Path, backend: str) -> dict[str, Any]:
 def _write_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
     rows = []
     for summary in summaries:
+        if summary.get("status", "measured") != "measured":
+            continue
         for workload in summary["e2e"]["workloads"]:
             rows.append({"backend": summary["backend"], **workload})
+    if not rows:
+        raise ValueError("E2E CSV requires at least one measured workload")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -1167,8 +1513,14 @@ def main() -> None:
     parser.add_argument(
         "--result",
         action="append",
-        required=True,
+        default=[],
         metavar="BACKEND=PATH",
+    )
+    parser.add_argument(
+        "--unsupported",
+        action="append",
+        default=[],
+        metavar="BACKEND=STATUS_JSON",
     )
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-csv", type=Path, required=True)
@@ -1179,10 +1531,26 @@ def main() -> None:
         if not separator:
             parser.error(f"invalid --result {value!r}; expected BACKEND=PATH")
         summaries.append(summarize_backend(Path(root), backend))
-    validate_comparison_summaries(summaries)
+    unsupported_summaries = []
+    for value in args.unsupported:
+        backend, separator, status_path = value.partition("=")
+        if not separator:
+            parser.error(
+                f"invalid --unsupported {value!r}; expected BACKEND=STATUS_JSON"
+            )
+        unsupported_summaries.append(
+            summarize_unsupported_backend(Path(status_path), backend)
+        )
+    if unsupported_summaries:
+        output = build_study_summary(summaries, unsupported_summaries)
+        csv_records = output["backends"]
+    else:
+        validate_comparison_summaries(summaries)
+        output = {"backends": summaries}
+        csv_records = summaries
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
-    args.output_json.write_text(json.dumps({"backends": summaries}, indent=2) + "\n")
-    _write_csv(args.output_csv, summaries)
+    args.output_json.write_text(json.dumps(output, indent=2) + "\n")
+    _write_csv(args.output_csv, csv_records)
 
 
 if __name__ == "__main__":

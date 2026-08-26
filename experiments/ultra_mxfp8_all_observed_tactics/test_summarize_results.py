@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import csv
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,47 @@ ORACLE_TIMING = {
     "repeat_iters": 20,
     "calls_per_graph": 4,
 }
+
+EXPECTED_BACKENDS = (
+    "cute-dsl",
+    "cutlass",
+    "trtllm-128x4",
+    "trtllm-8x4",
+)
+UNSUPPORTED_PROVENANCE_FIELDS = (
+    "source_commit",
+    "flashinfer_commit",
+    "expected_vllm_version",
+    "flashinfer",
+    "flashinfer_file",
+    "vllm_version",
+    "vllm_file",
+    "vllm_compiled_file",
+    "container",
+    "container_sha256",
+    "container_size",
+    "container_mtime",
+    "model",
+    "model_config_sha256",
+    "model_index_sha256",
+    "model_weights_manifest_sha256",
+    "gpu_name",
+    "driver_version",
+    "tp",
+    "moe_backend",
+    "attention_backend",
+    "kv_cache_dtype",
+    "max_model_len",
+    "max_num_batched_tokens",
+    "max_num_seqs",
+    "gpu_memory_utilization",
+    "enable_chunked_prefill",
+    "enable_prefix_caching",
+    "mamba_cache_mode",
+    "mamba_ssm_cache_dtype",
+    "cudagraph_capture_sizes",
+    "prompt_multiplier",
+)
 
 
 def _write_result(
@@ -105,6 +148,85 @@ def _write_metadata(path: Path, run_kind: str) -> None:
         )
         + "\n"
     )
+
+
+def _comparison_metadata(tmp_path: Path) -> dict[str, str]:
+    path = tmp_path / "comparison_metadata.txt"
+    _write_metadata(path, "baseline")
+    return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
+
+def _comparison_summary(
+    backend: str,
+    metadata: dict[str, str],
+) -> dict:
+    return {
+        "backend": backend,
+        "e2e": {
+            "metadata": {**metadata, "backend_name": backend},
+            "workloads": [
+                {
+                    "isl": 1000,
+                    "osl": 1000,
+                    "concurrency": 1,
+                    "artifact_signature": "same",
+                    "output_throughput_speedup": 1.1,
+                }
+            ],
+        },
+        "oracle": {"shape_count": 1},
+        "lookup": {"entry_count": 1},
+    }
+
+
+def _write_unsupported_status(
+    tmp_path: Path,
+    metadata: dict[str, str],
+    *,
+    backend: str = "cutlass",
+    extra: dict | None = None,
+) -> Path:
+    evidence_path = tmp_path / f"{backend}.stderr"
+    evidence_path.write_text("backend compilation failed\n")
+    provenance = {key: metadata[key] for key in UNSUPPORTED_PROVENANCE_FIELDS}
+    provenance.update(
+        {
+            "enforce_eager": "1",
+            "workloads": "1000:64,10000:64",
+            "concurrencies": "1,2,4,8,16,32",
+        }
+    )
+    payload = {
+        "backend": backend,
+        "status": "empirically_unsupported",
+        "recipe": {
+            "backend_name": backend,
+            "linear_backend": "flashinfer_cutlass",
+            "oracle_backend": "cutlass",
+            "scale_layout": "128x4",
+            "trtllm_layout": "8x4",
+        },
+        "provenance": provenance,
+        "failure": {
+            "stage": "server_startup",
+            "reason_code": "backend_initialization_failed",
+            "message": "CUTLASS is unavailable for this model recipe",
+            "attempts": [
+                {"job_id": "100", "mode": "eager", "outcome": "failed"},
+                {"job_id": "101", "mode": "cuda_graph", "outcome": "failed"},
+            ],
+            "evidence": [
+                {
+                    "path": evidence_path.name,
+                    "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+                }
+            ],
+        },
+        **(extra or {}),
+    }
+    status_path = tmp_path / f"{backend}.status.json"
+    status_path.write_text(json.dumps(payload))
+    return status_path
 
 
 def _write_paired_run(
@@ -1028,3 +1150,365 @@ def test_summarize_backend_requires_generated_texts(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing generated texts"):
         summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_build_study_summary_preserves_four_measured_path(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    summaries = [
+        _comparison_summary(backend, metadata)
+        for backend in reversed(EXPECTED_BACKENDS)
+    ]
+
+    study = summarize_results.build_study_summary(summaries, [])
+
+    assert study["study_status"] == "complete"
+    assert study["measured_backends"] == list(EXPECTED_BACKENDS)
+    assert study["unsupported_backends"] == []
+    assert study["metric_comparison_status"] == "complete"
+    assert [record["backend"] for record in study["backends"]] == list(
+        EXPECTED_BACKENDS
+    )
+    assert {record["status"] for record in study["backends"]} == {"measured"}
+
+
+def test_main_emits_evidence_backed_partial_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    measured_backends = ("cute-dsl", "trtllm-128x4", "trtllm-8x4")
+    summaries = {
+        backend: _comparison_summary(backend, metadata) for backend in measured_backends
+    }
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    output_json = tmp_path / "summary.json"
+    output_csv = tmp_path / "e2e.csv"
+    monkeypatch.setattr(
+        summarize_results,
+        "summarize_backend",
+        lambda _root, backend: summaries[backend],
+    )
+    argv = ["summarize_results.py"]
+    for backend in reversed(measured_backends):
+        argv.extend(("--result", f"{backend}={tmp_path / backend}"))
+    argv.extend(
+        (
+            "--unsupported",
+            f"cutlass={status_path}",
+            "--output-json",
+            str(output_json),
+            "--output-csv",
+            str(output_csv),
+        )
+    )
+    monkeypatch.setattr(sys, "argv", argv)
+
+    summarize_results.main()
+
+    study = json.loads(output_json.read_text())
+    assert study["study_status"] == "complete_with_unsupported_arm"
+    assert study["measured_backends"] == [
+        "cute-dsl",
+        "trtllm-128x4",
+        "trtllm-8x4",
+    ]
+    assert study["unsupported_backends"] == ["cutlass"]
+    assert study["metric_comparison_status"] == "partial"
+    assert [record["backend"] for record in study["backends"]] == list(
+        EXPECTED_BACKENDS
+    )
+    unsupported = study["backends"][1]
+    assert unsupported["status"] == "empirically_unsupported"
+    assert set(unsupported) >= {
+        "backend",
+        "status",
+        "recipe",
+        "provenance",
+        "failure",
+    }
+    assert "evidence" not in unsupported
+    assert unsupported["failure"]["evidence"]
+    assert Path(unsupported["failure"]["evidence"][0]["path"]).is_absolute()
+    assert not {"e2e", "oracle", "lookup"} & unsupported.keys()
+    with output_csv.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["backend"] for row in rows] == list(study["measured_backends"])
+
+
+def test_main_preserves_legacy_four_measured_json_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    summaries = {
+        backend: _comparison_summary(backend, metadata) for backend in EXPECTED_BACKENDS
+    }
+    output_json = tmp_path / "summary.json"
+    output_csv = tmp_path / "e2e.csv"
+    monkeypatch.setattr(
+        summarize_results,
+        "summarize_backend",
+        lambda _root, backend: summaries[backend],
+    )
+    argv = ["summarize_results.py"]
+    for backend in reversed(EXPECTED_BACKENDS):
+        argv.extend(("--result", f"{backend}={tmp_path / backend}"))
+    argv.extend(
+        (
+            "--output-json",
+            str(output_json),
+            "--output-csv",
+            str(output_csv),
+        )
+    )
+    monkeypatch.setattr(sys, "argv", argv)
+
+    summarize_results.main()
+
+    payload = json.loads(output_json.read_text())
+    assert set(payload) == {"backends"}
+    assert [record["backend"] for record in payload["backends"]] == list(
+        reversed(EXPECTED_BACKENDS)
+    )
+    assert all("status" not in record for record in payload["backends"])
+
+
+def test_unsupported_status_rejects_metric_sections(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(
+        tmp_path,
+        metadata,
+        extra={"oracle": {"shape_count": 0}},
+    )
+
+    with pytest.raises(ValueError, match="metric sections"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_rejects_missing_evidence_file(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["evidence"][0]["path"] = "missing.stderr"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="evidence file does not exist"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_rejects_evidence_checksum_mismatch(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["evidence"][0]["sha256"] = "0" * 64
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="evidence checksum mismatch"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_requires_exact_evidence_entry_schema(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["evidence"][0]["kind"] = "stderr"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="evidence entry fields"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_rejects_recipe_identity_mismatch(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["recipe"]["backend_name"] = "cute-dsl"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="recipe mismatch"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_requires_matching_measured_provenance(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    unsupported = summarize_results.summarize_unsupported_backend(
+        status_path, "cutlass"
+    )
+    unsupported["provenance"]["gpu_name"] = "NVIDIA H100"
+    measured = [
+        _comparison_summary(backend, metadata)
+        for backend in ("cute-dsl", "trtllm-128x4", "trtllm-8x4")
+    ]
+
+    with pytest.raises(ValueError, match="unsupported provenance mismatch"):
+        summarize_results.build_study_summary(measured, [unsupported])
+
+
+def test_partial_comparison_still_requires_four_backend_arms(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    unsupported = summarize_results.summarize_unsupported_backend(
+        status_path, "cutlass"
+    )
+    measured = [
+        _comparison_summary(backend, metadata)
+        for backend in ("cute-dsl", "trtllm-128x4")
+    ]
+
+    with pytest.raises(ValueError, match="requires exactly these backend arms"):
+        summarize_results.build_study_summary(measured, [unsupported])
+
+
+def test_partial_comparison_supports_at_most_one_unsupported_arm(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    cutlass = summarize_results.summarize_unsupported_backend(
+        _write_unsupported_status(tmp_path, metadata, backend="cutlass"),
+        "cutlass",
+    )
+    trtllm_128x4_path = _write_unsupported_status(
+        tmp_path,
+        metadata,
+        backend="trtllm-128x4",
+    )
+    trtllm_128x4_payload = json.loads(trtllm_128x4_path.read_text())
+    trtllm_128x4_payload["recipe"] = {
+        "backend_name": "trtllm-128x4",
+        "linear_backend": "flashinfer_trtllm",
+        "oracle_backend": "trtllm",
+        "scale_layout": "128x4",
+        "trtllm_layout": "128x4",
+    }
+    trtllm_128x4_path.write_text(json.dumps(trtllm_128x4_payload))
+    trtllm_128x4 = summarize_results.summarize_unsupported_backend(
+        trtllm_128x4_path,
+        "trtllm-128x4",
+    )
+    measured = [
+        _comparison_summary(backend, metadata) for backend in ("cute-dsl", "trtllm-8x4")
+    ]
+
+    with pytest.raises(ValueError, match="at most one unsupported backend arm"):
+        summarize_results.build_study_summary(
+            measured,
+            [cutlass, trtllm_128x4],
+        )
+
+
+def test_unsupported_provenance_constant_is_stable_cross_backend_subset() -> None:
+    excluded = {
+        "enforce_eager",
+        "cudagraph_configured",
+        "cudagraph_capture_status",
+        "cudagraph_capture_evidence",
+        "cudagraph_capture_marker",
+        "workloads",
+        "concurrencies",
+    }
+
+    assert (
+        tuple(
+            key
+            for key in summarize_results._CROSS_BACKEND_METADATA
+            if key not in excluded
+        )
+        == summarize_results._UNSUPPORTED_PROVENANCE_METADATA
+    )
+
+
+def test_unsupported_status_rejects_completed_run_provenance(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["provenance"]["cudagraph_capture_status"] = "capture_completed"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="completed-run provenance"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_requires_nonempty_attempt_list(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["attempts"] = []
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="attempts must be a non-empty list"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_requires_nonempty_attempt_objects(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["failure"]["attempts"] = [None, {}]
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="attempts must contain non-empty objects"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (("stage", "success"), "unsupported failure stage"),
+        (("outcome", "passed"), "unsupported attempt outcome"),
+    ],
+)
+def test_unsupported_status_requires_empirical_failure_attempts(
+    tmp_path: Path,
+    mutation: tuple[str, str],
+    message: str,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    field, value = mutation
+    if field == "stage":
+        payload["failure"][field] = value
+    else:
+        payload["failure"]["attempts"][0][field] = value
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match=message):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_unsupported_status_rejects_unexpected_provenance_fields(
+    tmp_path: Path,
+) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    status_path = _write_unsupported_status(tmp_path, metadata)
+    payload = json.loads(status_path.read_text())
+    payload["provenance"]["backend_name"] = "cute-dsl"
+    status_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="unexpected unsupported provenance fields"):
+        summarize_results.summarize_unsupported_backend(status_path, "cutlass")
+
+
+def test_build_study_summary_revalidates_unsupported_schema(tmp_path: Path) -> None:
+    metadata = _comparison_metadata(tmp_path)
+    measured = [
+        _comparison_summary(backend, metadata)
+        for backend in ("cute-dsl", "trtllm-128x4", "trtllm-8x4")
+    ]
+    malformed = {
+        "backend": "cutlass",
+        "status": "empirically_unsupported",
+        "provenance": {key: metadata[key] for key in UNSUPPORTED_PROVENANCE_FIELDS},
+    }
+
+    with pytest.raises(ValueError, match="unsupported status fields"):
+        summarize_results.build_study_summary(measured, [malformed])
