@@ -285,7 +285,7 @@ def make_dispatcher(
             selected = original(
                 self, custom_op, runners, tuning_config, inputs, **kwargs
             )
-        if trace is not None and shape is not None:
+        if trace is not None and shape is not None and not self.is_tuning_mode:
             trace.record(shape, selected[0], selected[1], selection_source)
         return selected
 

@@ -28,6 +28,11 @@ class TrtRunner:
     pass
 
 
+class FakeTuner:
+    def __init__(self, *, is_tuning_mode: bool) -> None:
+        self.is_tuning_mode = is_tuning_mode
+
+
 def test_shape_trace_counts_repeated_dispatches_without_repeating_trace_rows(
     tmp_path: Path,
 ) -> None:
@@ -281,3 +286,25 @@ def test_dispatcher_delegates_lookup_miss_to_default(tmp_path: Path) -> None:
         object(),
         [FakeTensor((1002, 8192)), FakeTensor((8192, 2304))],
     ) == (default_runner, -1)
+
+
+def test_dispatcher_does_not_trace_autotuner_profiling_calls(tmp_path: Path) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    runner = CuteRunner()
+
+    def default(*args, **kwargs):
+        return runner, 7
+
+    dispatch = make_dispatcher(default, None, trace)
+    selected = dispatch(
+        FakeTuner(is_tuning_mode=True),
+        "mxfp8_gemm",
+        [runner],
+        object(),
+        [FakeTensor((1024, 8192)), FakeTensor((8192, 2304))],
+    )
+    trace.finalize()
+
+    assert selected == (runner, 7)
+    assert not (tmp_path / f"trace.{trace.pid}.jsonl").exists()
+    assert not (tmp_path / f"counts.{trace.pid}.jsonl").exists()
