@@ -66,17 +66,24 @@ request_trace_flush() {
     pid=${pid#trace.}
     pid=${pid%.jsonl}
     pids+=("${pid}")
-    if ! kill -USR1 "${pid}" 2>/dev/null; then
+  done
+  for pid in "${pids[@]}"; do
+    rm -f "${trace_dir}/counts.${pid}.complete" \
+      "${trace_dir}/flush.${pid}.request"
+    if ! kill -0 "${pid}" 2>/dev/null; then
       echo "MXFP8 trace worker ${pid} exited before flush" >&2
       return 1
     fi
+    touch "${trace_dir}/flush.${pid}.request"
   done
-
   local deadline=$((SECONDS + timeout_s))
   while true; do
     missing=()
     for pid in "${pids[@]}"; do
-      [[ -f "${trace_dir}/counts.${pid}.complete" ]] || missing+=("${pid}")
+      if [[ ! -s "${trace_dir}/counts.${pid}.jsonl" ]] || \
+        [[ ! -f "${trace_dir}/counts.${pid}.complete" ]]; then
+        missing+=("${pid}")
+      fi
     done
     ((${#missing[@]} == 0)) && return 0
     if ((SECONDS >= deadline)); then

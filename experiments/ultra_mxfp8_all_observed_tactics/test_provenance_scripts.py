@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ def test_request_trace_flush_finalizes_live_worker_without_stopping_it(
                 "from experiments.ultra_mxfp8_all_observed_tactics."
                 "shape_tactic_runtime import ShapeTrace\n"
                 "trace = ShapeTrace(Path(sys.argv[1]), 'baseline')\n"
+                "signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
                 "trace.record((2, 2048, 8192), object(), 5, "
                 "'default_autotuner')\n"
                 "print(os.getpid(), flush=True)\n"
@@ -61,7 +63,57 @@ def test_request_trace_flush_finalizes_live_worker_without_stopping_it(
 
         assert result.returncode == 0, result.stderr
         assert (tmp_path / f"counts.{pid}.complete").is_file()
+        count = json.loads((tmp_path / f"counts.{pid}.jsonl").read_text())
+        assert count["invocation_count"] == 1
         assert worker.poll() is None
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
+
+
+def test_request_trace_flush_rejects_stale_completion_marker(
+    tmp_path: Path,
+) -> None:
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, sys\n"
+                "from pathlib import Path\n"
+                "root = Path(sys.argv[1])\n"
+                "pid = os.getpid()\n"
+                "(root / f'trace.{pid}.jsonl').write_text('{}\\n')\n"
+                "(root / f'counts.{pid}.complete').touch()\n"
+                "signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
+                "print(pid, flush=True)\n"
+                "while True:\n"
+                "    signal.pause()\n"
+            ),
+            str(tmp_path),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert worker.stdout is not None
+        pid = int(worker.stdout.readline())
+        result = subprocess.run(
+            [
+                "bash",
+                str(SERVER_ENTRYPOINT),
+                "--request-trace-flush",
+                str(tmp_path),
+                "1",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert f"{pid}" in result.stderr
+        assert "Timed out" in result.stderr
     finally:
         worker.terminate()
         worker.wait(timeout=5)

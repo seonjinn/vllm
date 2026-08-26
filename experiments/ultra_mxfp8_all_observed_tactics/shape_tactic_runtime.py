@@ -9,10 +9,10 @@ import atexit
 import json
 import math
 import os
-import signal
 import socket
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,44 +195,68 @@ class ShapeTrace:
 
     def __init__(self, directory: Path, phase: str) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        self.pid = os.getpid()
-        self._path = directory / f"trace.{self.pid}.jsonl"
-        self._count_path = directory / f"counts.{self.pid}.jsonl"
-        self._complete_path = directory / f"counts.{self.pid}.complete"
+        self._directory = directory
         self._phase = phase
+        self._initialize_process_state()
+
+    def _initialize_process_state(self) -> None:
+        self.pid = os.getpid()
+        self._path = self._directory / f"trace.{self.pid}.jsonl"
+        self._count_path = self._directory / f"counts.{self.pid}.jsonl"
+        self._complete_path = self._directory / f"counts.{self.pid}.complete"
+        self._flush_request_path = self._directory / f"flush.{self.pid}.request"
         self._seen: set[tuple[Shape, str, str, str]] = set()
         self._counts: dict[tuple[Shape, str, str, str], dict[str, Any]] = {}
         self._invocation_index = 0
         self._calls_since_flush = 0
         self._rank: str | None = None
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
+        self._snapshot_thread = threading.Thread(
+            target=self._snapshot_loop,
+            name=f"mxfp8-trace-{self.pid}",
+            daemon=True,
+        )
+        self._snapshot_thread.start()
         atexit.register(self.finalize)
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGUSR1, self._handle_flush_signal)
 
-    def _handle_flush_signal(self, _signum: int, _frame: Any) -> None:
-        self.finalize()
+    def _ensure_process_state(self) -> None:
+        if self.pid != os.getpid():
+            self._initialize_process_state()
+
+    def _snapshot_loop(self) -> None:
+        while True:
+            try:
+                self._flush_request_path.unlink()
+            except FileNotFoundError:
+                time.sleep(0.05)
+                continue
+            self.finalize()
+
+    def _write_counts_locked(self) -> bool:
+        rows = [
+            {**record, "invocation_count": record["invocation_count"]}
+            for _, record in sorted(self._counts.items(), key=lambda item: str(item[0]))
+        ]
+        if not rows:
+            return False
+        temporary = self._count_path.with_suffix(".tmp")
+        temporary.write_text(
+            "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+        )
+        temporary.replace(self._count_path)
+        self._calls_since_flush = 0
+        return True
 
     def flush(self) -> None:
+        self._ensure_process_state()
         with self._lock:
-            rows = [
-                {**record, "invocation_count": record["invocation_count"]}
-                for _, record in sorted(
-                    self._counts.items(), key=lambda item: str(item[0])
-                )
-            ]
-            if not rows:
-                return
-            temporary = self._count_path.with_suffix(".tmp")
-            temporary.write_text(
-                "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
-            )
-            temporary.replace(self._count_path)
-            self._calls_since_flush = 0
+            self._write_counts_locked()
 
     def finalize(self) -> None:
-        self.flush()
-        self._complete_path.touch()
+        self._ensure_process_state()
+        with self._lock:
+            self._write_counts_locked()
+            self._complete_path.touch()
 
     def record(
         self,
@@ -241,10 +265,12 @@ class ShapeTrace:
         tactic: Any,
         selection_source: str,
     ) -> None:
+        self._ensure_process_state()
         runner_name = runner.__class__.__name__
         tactic_json = json.dumps(_jsonable(tactic), separators=(",", ":"))
         key = (shape, runner_name, selection_source, tactic_json)
         with self._lock:
+            self._complete_path.unlink(missing_ok=True)
             self._invocation_index += 1
             record = self._counts.get(key)
             if record is None:

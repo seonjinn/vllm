@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +35,13 @@ class TrtRunner:
 class FakeTuner:
     def __init__(self, *, is_tuning_mode: bool) -> None:
         self.is_tuning_mode = is_tuning_mode
+
+
+def _wait_for_path(path: Path, timeout_s: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not path.is_file() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.is_file()
 
 
 def test_resolve_rank_prefers_initialized_distributed_rank(
@@ -93,6 +102,69 @@ def test_shape_trace_orders_fallback_before_tuned_tactic(tmp_path: Path) -> None
     assert by_tactic[-1]["last_invocation_index"] == 1
     assert by_tactic[5]["first_invocation_index"] == 2
     assert by_tactic[5]["last_invocation_index"] == 3
+
+
+def test_shape_trace_invalidates_completed_snapshot_before_new_record(
+    tmp_path: Path,
+) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    runner = CuteRunner()
+    complete_path = tmp_path / f"counts.{trace.pid}.complete"
+
+    trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
+    trace.finalize()
+    assert complete_path.is_file()
+
+    trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
+
+    assert not complete_path.exists()
+    trace.finalize()
+    count = json.loads((tmp_path / f"counts.{trace.pid}.jsonl").read_text())
+    assert count["invocation_count"] == 2
+
+
+def test_shape_trace_flush_request_does_not_reenter_snapshot_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
+    original_replace = Path.replace
+    request_sent = False
+
+    def replace_and_request(path: Path, target: Path) -> Path:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            (tmp_path / f"flush.{trace.pid}.request").touch()
+            time.sleep(0.05)
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", replace_and_request)
+
+    trace.flush()
+
+    _wait_for_path(tmp_path / f"counts.{trace.pid}.complete")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_shape_trace_resets_process_local_state_after_fork(tmp_path: Path) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    parent_pid = trace.pid
+    child_pid = os.fork()
+    if child_pid == 0:
+        try:
+            trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
+            trace.finalize()
+        finally:
+            os._exit(0)
+
+    _, status = os.waitpid(child_pid, 0)
+
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert child_pid != parent_pid
+    assert (tmp_path / f"trace.{child_pid}.jsonl").is_file()
+    assert (tmp_path / f"counts.{child_pid}.complete").is_file()
+    assert not (tmp_path / f"trace.{parent_pid}.jsonl").exists()
 
 
 def test_extract_mnk_flattens_all_activation_batch_dimensions() -> None:
