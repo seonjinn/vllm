@@ -74,6 +74,10 @@ def _write_metadata(path: Path, run_kind: str) -> None:
                 "mamba_ssm_cache_dtype=float32",
                 "enforce_eager=0",
                 "cudagraph_capture_sizes=1,2,4,8,16,32",
+                "cudagraph_configured=true",
+                "cudagraph_capture_status=capture_completed",
+                "cudagraph_capture_evidence=server_log_completion_marker",
+                "cudagraph_capture_marker=Graph capturing finished",
                 "workloads=1000:1000",
                 "concurrencies=1",
                 "prompt_multiplier=10",
@@ -255,6 +259,39 @@ def test_summarize_backend_requires_matched_result_files(tmp_path: Path) -> None
     )
 
     with pytest.raises(ValueError, match="result files do not match"):
+        summarize_backend(tmp_path, "cute-dsl")
+
+
+def test_summarize_backend_requires_matching_cudagraph_evidence(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "serving" / "baseline" / "11"
+    lookup = tmp_path / "serving" / "lookup" / "22"
+    baseline.mkdir(parents=True)
+    lookup.mkdir(parents=True)
+    (baseline / "COMPLETE").touch()
+    (lookup / "COMPLETE").touch()
+    _write_metadata(baseline / "metadata.txt", "baseline")
+    _write_metadata(lookup / "metadata.txt", "lookup")
+    lookup_metadata = lookup / "metadata.txt"
+    lookup_metadata.write_text(
+        lookup_metadata.read_text().replace(
+            "cudagraph_capture_status=capture_completed",
+            "cudagraph_capture_status=configured_not_observed",
+        )
+    )
+    _write_result(
+        baseline / "result_isl1000_osl1000_c1.json",
+        output_tps=100.0,
+        duration=200.0,
+    )
+    _write_result(
+        lookup / "result_isl1000_osl1000_c1.json",
+        output_tps=110.0,
+        duration=180.0,
+    )
+
+    with pytest.raises(ValueError, match="metadata do not match"):
         summarize_backend(tmp_path, "cute-dsl")
 
 

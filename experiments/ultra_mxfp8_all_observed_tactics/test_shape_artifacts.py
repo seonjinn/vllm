@@ -136,6 +136,35 @@ def test_merge_traces_rejects_conflicting_tactics_in_selected_phase(
         merge_traces(trace_dir, tmp_path / "observed.csv", tmp_path / "summary.json")
 
 
+def test_merge_traces_rejects_incomplete_expected_rank_coverage(
+    tmp_path: Path,
+) -> None:
+    trace_dir = tmp_path / "traces"
+    trace_dir.mkdir()
+    for rank in range(3):
+        row = {
+            "m": 1001,
+            "n": 2304,
+            "k": 8192,
+            "runner": "CuteRunner",
+            "phase": "baseline",
+            "tactic": 7,
+            "selection_source": "default_autotuner",
+            "invocation_count": 1,
+            "pid": rank + 10,
+            "rank": str(rank),
+        }
+        _write_complete_snapshot(trace_dir, rank + 10, row)
+
+    with pytest.raises(ValueError, match="incomplete rank coverage.*baseline"):
+        merge_traces(
+            trace_dir,
+            tmp_path / "observed.csv",
+            tmp_path / "summary.json",
+            expected_rank_count=4,
+        )
+
+
 def test_merge_traces_prefers_compact_count_snapshot_for_same_process(
     tmp_path: Path,
 ) -> None:

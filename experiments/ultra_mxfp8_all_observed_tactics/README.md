@@ -21,7 +21,8 @@ with the normal vLLM autotuner.
 - CUDA Graph baseline and shape capture: full 1K/10K, 10K/1K, and 1K/1K
   workloads
 - Final baseline/lookup A/B concurrency: 1, 8, 32; ten request waves
-- Final execution: CUDA Graph enabled
+- Final execution: CUDA Graph capture verified from the vLLM completion marker
+- Trace completeness: every capture phase must contain distributed ranks 0-3
 - Source contract: clean, detached experiment and FlashInfer worktrees pinned
   by SHA; installed vLLM runtime pinned by the container image SHA256
 - Correctness: finite and elementwise oracle checks, followed by deterministic

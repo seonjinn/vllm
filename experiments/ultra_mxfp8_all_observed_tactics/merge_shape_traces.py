@@ -29,7 +29,11 @@ def _positive_count(row: dict[str, Any], path: Path, line_number: int) -> int:
 
 
 def merge_traces(
-    trace_dir: Path, output_csv: Path, summary_path: Path
+    trace_dir: Path,
+    output_csv: Path,
+    summary_path: Path,
+    *,
+    expected_rank_count: int | None = None,
 ) -> dict[str, Any]:
     records: defaultdict[ShapeKey, dict[str, Any]] = defaultdict(
         lambda: {
@@ -39,6 +43,7 @@ def merge_traces(
             "tactics_by_phase": defaultdict(lambda: defaultdict(int)),
         }
     )
+    ranks_by_phase: defaultdict[str, set[str]] = defaultdict(set)
     count_files = {
         (
             path.parent.relative_to(trace_dir),
@@ -83,17 +88,31 @@ def merge_traces(
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 raise ValueError(f"invalid trace row {path}:{line_number}") from error
-            records[key]["phases"].add(str(row.get("phase", "unknown")))
+            phase = str(row.get("phase", "unknown"))
+            rank = str(row.get("rank", "unknown"))
+            records[key]["phases"].add(phase)
             relative_parent = path.parent.relative_to(trace_dir)
             records[key]["processes"].add(
                 f"{relative_parent}:{row.get('pid', 'unknown')}"
             )
-            records[key]["ranks"].add(str(row.get("rank", "unknown")))
+            records[key]["ranks"].add(rank)
+            ranks_by_phase[phase].add(rank)
             if row.get("selection_source", "default_autotuner") == "default_autotuner":
                 phase = str(row.get("phase", "unknown"))
                 tactic = json.dumps(row["tactic"], separators=(",", ":"))
                 count = _positive_count(row, path, line_number)
                 records[key]["tactics_by_phase"][phase][tactic] += count
+
+    if expected_rank_count is not None:
+        if expected_rank_count <= 0:
+            raise ValueError("expected_rank_count must be positive")
+        expected_ranks = {str(rank) for rank in range(expected_rank_count)}
+        for phase, actual_ranks in sorted(ranks_by_phase.items()):
+            if actual_ranks != expected_ranks:
+                raise ValueError(
+                    f"incomplete rank coverage for phase {phase}: "
+                    f"expected={sorted(expected_ranks)}, actual={sorted(actual_ranks)}"
+                )
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="") as handle:
@@ -156,6 +175,9 @@ def merge_traces(
         "irregular_m_count": sum(not _is_power_of_two(m) for m in m_values),
         "min_m": min(m_values),
         "max_m": max(m_values),
+        "rank_coverage_by_phase": {
+            phase: sorted(ranks) for phase, ranks in sorted(ranks_by_phase.items())
+        },
         "output_csv": str(output_csv),
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,8 +190,18 @@ def main() -> None:
     parser.add_argument("--trace-dir", type=Path, required=True)
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument("--expected-rank-count", type=int)
     args = parser.parse_args()
-    print(json.dumps(merge_traces(args.trace_dir, args.output_csv, args.summary)))
+    print(
+        json.dumps(
+            merge_traces(
+                args.trace_dir,
+                args.output_csv,
+                args.summary,
+                expected_rank_count=args.expected_rank_count,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":

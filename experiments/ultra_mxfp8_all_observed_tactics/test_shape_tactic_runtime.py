@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +33,24 @@ class TrtRunner:
 class FakeTuner:
     def __init__(self, *, is_tuning_mode: bool) -> None:
         self.is_tuning_mode = is_tuning_mode
+
+
+def test_resolve_rank_prefers_initialized_distributed_rank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    distributed = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_rank=lambda: 3,
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(distributed=distributed))
+    monkeypatch.setenv("RANK", "0")
+    trace = ShapeTrace(tmp_path, "baseline")
+
+    trace.record((1, 2304, 8192), CuteRunner(), 7, "default_autotuner")
+
+    row = json.loads((tmp_path / f"trace.{trace.pid}.jsonl").read_text())
+    assert row["rank"] == "3"
 
 
 def test_shape_trace_counts_repeated_dispatches_without_repeating_trace_rows(
@@ -308,3 +328,44 @@ def test_dispatcher_does_not_trace_autotuner_profiling_calls(tmp_path: Path) -> 
     assert selected == (runner, 7)
     assert not (tmp_path / f"trace.{trace.pid}.jsonl").exists()
     assert not (tmp_path / f"counts.{trace.pid}.jsonl").exists()
+
+
+def test_dispatcher_delegates_lookup_hit_during_autotuner_profiling(
+    tmp_path: Path,
+) -> None:
+    lookup_path = tmp_path / "lookup.json"
+    lookup_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "entries": [
+                    {
+                        "m": 1024,
+                        "n": 2304,
+                        "k": 8192,
+                        "runner": "CuteRunner",
+                        "tactic": 17,
+                    }
+                ],
+            }
+        )
+    )
+    default_runner = TrtRunner()
+    default_calls = 0
+
+    def default(*args, **kwargs):
+        nonlocal default_calls
+        default_calls += 1
+        return default_runner, 23
+
+    dispatch = make_dispatcher(default, TacticLookup.load(lookup_path), None)
+    selected = dispatch(
+        FakeTuner(is_tuning_mode=True),
+        "mxfp8_gemm",
+        [CuteRunner(), default_runner],
+        object(),
+        [FakeTensor((1024, 8192)), FakeTensor((8192, 2304))],
+    )
+
+    assert selected == (default_runner, 23)
+    assert default_calls == 1

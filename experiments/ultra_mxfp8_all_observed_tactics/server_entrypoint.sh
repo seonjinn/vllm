@@ -2,6 +2,64 @@
 
 set -euo pipefail
 
+readonly CUDAGRAPH_COMPLETION_MARKER="Graph capturing finished"
+
+record_cudagraph_evidence() {
+  local requested_run_kind=$1
+  local eager_mode=$2
+  local server_log=$3
+  local metadata_path=$4
+  local configured capture_status evidence
+
+  case "${eager_mode}" in
+    0)
+      configured=true
+      if [[ -f "${server_log}" ]] && \
+        grep -Fq -- "${CUDAGRAPH_COMPLETION_MARKER}" "${server_log}"; then
+        capture_status=capture_completed
+        evidence=server_log_completion_marker
+      else
+        capture_status=configured_not_observed
+        evidence=none
+      fi
+      ;;
+    1)
+      configured=false
+      capture_status=disabled_eager
+      evidence=not_applicable
+      ;;
+    *)
+      echo "Invalid ENFORCE_EAGER=${eager_mode}" >&2
+      return 2
+      ;;
+  esac
+
+  {
+    echo "cudagraph_configured=${configured}"
+    echo "cudagraph_capture_status=${capture_status}"
+    echo "cudagraph_capture_evidence=${evidence}"
+    echo "cudagraph_capture_marker=${CUDAGRAPH_COMPLETION_MARKER}"
+  } >>"${metadata_path}"
+
+  if [[ "${capture_status}" != capture_completed ]] && \
+    [[ "${requested_run_kind}" == baseline || \
+      "${requested_run_kind}" == lookup ]]; then
+    echo "${requested_run_kind} requires server.log marker: ${CUDAGRAPH_COMPLETION_MARKER}" \
+      >&2
+    return 1
+  fi
+}
+
+if [[ "${1:-}" == --record-cudagraph-evidence ]]; then
+  if (($# != 5)); then
+    echo "Usage: $0 --record-cudagraph-evidence RUN_KIND ENFORCE_EAGER SERVER_LOG METADATA" \
+      >&2
+    exit 2
+  fi
+  record_cudagraph_evidence "$2" "$3" "$4" "$5"
+  exit
+fi
+
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_ENGINE_READY_TIMEOUT_S=7200
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
@@ -238,6 +296,9 @@ PY
 done
 
 stop_server
+record_cudagraph_evidence \
+  "${RUN_KIND}" "${ENFORCE_EAGER}" "${RUN_DIR}/server.log" \
+  "${RUN_DIR}/metadata.txt"
 publish_traces
 rm -rf "${SCRATCH_ROOT}"
 trap - EXIT

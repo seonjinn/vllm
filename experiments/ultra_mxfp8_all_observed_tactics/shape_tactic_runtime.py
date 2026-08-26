@@ -62,6 +62,19 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def resolve_rank() -> str:
+    """Return the initialized distributed rank, falling back to process env."""
+    try:
+        import torch
+
+        distributed = torch.distributed
+        if distributed.is_available() and distributed.is_initialized():
+            return str(distributed.get_rank())
+    except (AttributeError, ImportError):
+        pass
+    return os.getenv("RANK", os.getenv("SLURM_PROCID", "unknown"))
+
+
 @dataclass(frozen=True)
 class LookupEntry:
     runner: str
@@ -189,6 +202,7 @@ class ShapeTrace:
         self._seen: set[tuple[Shape, str, str, str]] = set()
         self._counts: dict[tuple[Shape, str, str, str], dict[str, Any]] = {}
         self._calls_since_flush = 0
+        self._rank: str | None = None
         self._lock = threading.Lock()
         atexit.register(self.finalize)
 
@@ -226,6 +240,8 @@ class ShapeTrace:
         with self._lock:
             record = self._counts.get(key)
             if record is None:
+                if self._rank is None:
+                    self._rank = resolve_rank()
                 m, n, k = shape
                 record = {
                     "m": m,
@@ -236,7 +252,7 @@ class ShapeTrace:
                     "selection_source": selection_source,
                     "phase": self._phase,
                     "pid": self.pid,
-                    "rank": os.getenv("RANK", os.getenv("SLURM_PROCID", "unknown")),
+                    "rank": self._rank,
                     "host": socket.gethostname(),
                     "invocation_count": 0,
                 }
@@ -272,6 +288,9 @@ def make_dispatcher(
         inputs: Sequence[Any],
         **kwargs: Any,
     ) -> tuple[Any, Any]:
+        if getattr(self, "is_tuning_mode", False):
+            return original(self, custom_op, runners, tuning_config, inputs, **kwargs)
+
         shape = None
         if custom_op == "mxfp8_gemm":
             try:
@@ -285,7 +304,7 @@ def make_dispatcher(
             selected = original(
                 self, custom_op, runners, tuning_config, inputs, **kwargs
             )
-        if trace is not None and shape is not None and not self.is_tuning_mode:
+        if trace is not None and shape is not None:
             trace.record(shape, selected[0], selected[1], selection_source)
         return selected
 
