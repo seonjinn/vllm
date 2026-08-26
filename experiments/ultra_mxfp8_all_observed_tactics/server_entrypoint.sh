@@ -53,7 +53,8 @@ record_cudagraph_evidence() {
 request_trace_flush() {
   local trace_dir=$1
   local timeout_s=$2
-  local trace pid
+  local trace pid actual_token
+  local token="$$.${RANDOM}.${SECONDS}"
   local -a traces pids missing
   shopt -s nullglob
   traces=("${trace_dir}"/trace.*.jsonl)
@@ -69,19 +70,23 @@ request_trace_flush() {
   done
   for pid in "${pids[@]}"; do
     rm -f "${trace_dir}/counts.${pid}.complete" \
-      "${trace_dir}/flush.${pid}.request"
+      "${trace_dir}/flush.${pid}.request" \
+      "${trace_dir}/flush.${pid}.request.tmp"
     if ! kill -0 "${pid}" 2>/dev/null; then
       echo "MXFP8 trace worker ${pid} exited before flush" >&2
       return 1
     fi
-    touch "${trace_dir}/flush.${pid}.request"
+    printf '%s\n' "${token}" >"${trace_dir}/flush.${pid}.request.tmp"
+    mv "${trace_dir}/flush.${pid}.request.tmp" \
+      "${trace_dir}/flush.${pid}.request"
   done
   local deadline=$((SECONDS + timeout_s))
   while true; do
     missing=()
     for pid in "${pids[@]}"; do
+      actual_token=$(cat "${trace_dir}/counts.${pid}.complete" 2>/dev/null || true)
       if [[ ! -s "${trace_dir}/counts.${pid}.jsonl" ]] || \
-        [[ ! -f "${trace_dir}/counts.${pid}.complete" ]]; then
+        [[ "${actual_token}" != "${token}" ]]; then
         missing+=("${pid}")
       fi
     done

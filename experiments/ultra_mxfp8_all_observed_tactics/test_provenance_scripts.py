@@ -84,6 +84,7 @@ def test_request_trace_flush_rejects_stale_completion_marker(
                 "root = Path(sys.argv[1])\n"
                 "pid = os.getpid()\n"
                 "(root / f'trace.{pid}.jsonl').write_text('{}\\n')\n"
+                "(root / f'counts.{pid}.jsonl').write_text('{}\\n')\n"
                 "(root / f'counts.{pid}.complete').touch()\n"
                 "signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
                 "print(pid, flush=True)\n"

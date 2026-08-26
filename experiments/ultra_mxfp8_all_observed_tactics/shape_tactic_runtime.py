@@ -197,40 +197,66 @@ class ShapeTrace:
         directory.mkdir(parents=True, exist_ok=True)
         self._directory = directory
         self._phase = phase
-        self._initialize_process_state()
+        self._state_lock = threading.Lock()
+        self._initialize_process_state(os.getpid())
+        if hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=self._mark_fork_child)
 
-    def _initialize_process_state(self) -> None:
-        self.pid = os.getpid()
-        self._path = self._directory / f"trace.{self.pid}.jsonl"
-        self._count_path = self._directory / f"counts.{self.pid}.jsonl"
-        self._complete_path = self._directory / f"counts.{self.pid}.complete"
-        self._flush_request_path = self._directory / f"flush.{self.pid}.request"
+    def _initialize_process_state(self, pid: int) -> None:
+        self._path = self._directory / f"trace.{pid}.jsonl"
+        self._count_path = self._directory / f"counts.{pid}.jsonl"
+        self._complete_path = self._directory / f"counts.{pid}.complete"
+        self._flush_request_path = self._directory / f"flush.{pid}.request"
+        self._flush_processing_path = self._directory / f"flush.{pid}.processing"
         self._seen: set[tuple[Shape, str, str, str]] = set()
         self._counts: dict[tuple[Shape, str, str, str], dict[str, Any]] = {}
         self._invocation_index = 0
         self._calls_since_flush = 0
         self._rank: str | None = None
         self._lock = threading.Lock()
-        self._snapshot_thread = threading.Thread(
-            target=self._snapshot_loop,
-            name=f"mxfp8-trace-{self.pid}",
-            daemon=True,
-        )
-        self._snapshot_thread.start()
+        self._snapshot_thread: threading.Thread | None = None
+        self.pid = pid
         atexit.register(self.finalize)
 
-    def _ensure_process_state(self) -> None:
-        if self.pid != os.getpid():
-            self._initialize_process_state()
+    def _mark_fork_child(self) -> None:
+        self._state_lock = threading.Lock()
+        self._snapshot_thread = None
+        self.pid = -1
 
-    def _snapshot_loop(self) -> None:
-        while True:
+    def _ensure_process_state(self) -> None:
+        current_pid = os.getpid()
+        if self.pid == current_pid:
+            return
+        with self._state_lock:
+            if self.pid != current_pid:
+                self._initialize_process_state(current_pid)
+
+    def _ensure_snapshot_thread(self) -> None:
+        thread = self._snapshot_thread
+        if thread is not None and thread.is_alive():
+            return
+        with self._state_lock:
+            if self._snapshot_thread is None or not self._snapshot_thread.is_alive():
+                self._snapshot_thread = threading.Thread(
+                    target=self._snapshot_loop,
+                    args=(self.pid,),
+                    name=f"mxfp8-trace-{self.pid}",
+                    daemon=True,
+                )
+                self._snapshot_thread.start()
+
+    def _snapshot_loop(self, owner_pid: int) -> None:
+        last_token: str | None = None
+        while self.pid == owner_pid and os.getpid() == owner_pid:
             try:
-                self._flush_request_path.unlink()
+                self._flush_request_path.replace(self._flush_processing_path)
             except FileNotFoundError:
                 time.sleep(0.05)
                 continue
-            self.finalize()
+            token = self._flush_processing_path.read_text().strip()
+            self._flush_processing_path.unlink(missing_ok=True)
+            if token and token != last_token and self.finalize(token):
+                last_token = token
 
     def _write_counts_locked(self) -> bool:
         rows = [
@@ -252,11 +278,17 @@ class ShapeTrace:
         with self._lock:
             self._write_counts_locked()
 
-    def finalize(self) -> None:
+    def finalize(self, token: str | None = None) -> bool:
         self._ensure_process_state()
         with self._lock:
-            self._write_counts_locked()
-            self._complete_path.touch()
+            if not self._write_counts_locked():
+                return False
+            if token is None:
+                return True
+            temporary = Path(f"{self._complete_path}.tmp")
+            temporary.write_text(f"{token}\n")
+            temporary.replace(self._complete_path)
+            return True
 
     def record(
         self,
@@ -266,11 +298,11 @@ class ShapeTrace:
         selection_source: str,
     ) -> None:
         self._ensure_process_state()
+        self._ensure_snapshot_thread()
         runner_name = runner.__class__.__name__
         tactic_json = json.dumps(_jsonable(tactic), separators=(",", ":"))
         key = (shape, runner_name, selection_source, tactic_json)
         with self._lock:
-            self._complete_path.unlink(missing_ok=True)
             self._invocation_index += 1
             record = self._counts.get(key)
             if record is None:

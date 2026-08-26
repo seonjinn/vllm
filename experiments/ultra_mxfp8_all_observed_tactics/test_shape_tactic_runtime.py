@@ -3,6 +3,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,16 @@ def _wait_for_path(path: Path, timeout_s: float = 2.0) -> None:
     assert path.is_file()
 
 
+def _wait_for_content(path: Path, expected: str, timeout_s: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.is_file() and path.read_text().strip() == expected:
+            return
+        time.sleep(0.01)
+    assert path.is_file()
+    assert path.read_text().strip() == expected
+
+
 def test_resolve_rank_prefers_initialized_distributed_rank(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -71,7 +82,7 @@ def test_shape_trace_counts_repeated_dispatches_without_repeating_trace_rows(
     trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
     trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
     trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
-    trace.finalize()
+    trace.finalize("test")
 
     trace_rows = (tmp_path / f"trace.{trace.pid}.jsonl").read_text().splitlines()
     count_rows = (tmp_path / f"counts.{trace.pid}.jsonl").read_text().splitlines()
@@ -91,7 +102,7 @@ def test_shape_trace_orders_fallback_before_tuned_tactic(tmp_path: Path) -> None
     trace.record((2, 2048, 8192), runner, -1, "default_autotuner")
     trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
     trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
-    trace.finalize()
+    trace.finalize("test")
 
     rows = [
         json.loads(line)
@@ -104,23 +115,59 @@ def test_shape_trace_orders_fallback_before_tuned_tactic(tmp_path: Path) -> None
     assert by_tactic[5]["last_invocation_index"] == 3
 
 
-def test_shape_trace_invalidates_completed_snapshot_before_new_record(
+def test_shape_trace_acknowledges_each_snapshot_generation(
     tmp_path: Path,
 ) -> None:
     trace = ShapeTrace(tmp_path, "baseline")
     runner = CuteRunner()
     complete_path = tmp_path / f"counts.{trace.pid}.complete"
+    request_path = tmp_path / f"flush.{trace.pid}.request"
 
     trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
-    trace.finalize()
-    assert complete_path.is_file()
+    request_path.write_text("first\n")
+    _wait_for_content(complete_path, "first")
 
     trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
-
-    assert not complete_path.exists()
-    trace.finalize()
+    request_path.write_text("second\n")
+    _wait_for_content(complete_path, "second")
     count = json.loads((tmp_path / f"counts.{trace.pid}.jsonl").read_text())
     assert count["invocation_count"] == 2
+
+
+def test_shape_trace_does_not_drop_request_replaced_during_snapshot_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
+    request_path = tmp_path / f"flush.{trace.pid}.request"
+    complete_path = tmp_path / f"counts.{trace.pid}.complete"
+    original_read_text = Path.read_text
+    replacement_sent = False
+
+    def read_and_replace(path: Path, *args, **kwargs) -> str:
+        nonlocal replacement_sent
+        content = original_read_text(path, *args, **kwargs)
+        if path.name.endswith(".processing") and not replacement_sent:
+            replacement_sent = True
+            request_path.write_text("second\n")
+        return content
+
+    monkeypatch.setattr(Path, "read_text", read_and_replace)
+    request_path.write_text("first\n")
+
+    _wait_for_content(complete_path, "second")
+    assert replacement_sent
+
+
+def test_exit_finalize_preserves_request_acknowledgement(tmp_path: Path) -> None:
+    trace = ShapeTrace(tmp_path, "baseline")
+    trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
+
+    assert trace.finalize("request-token")
+    assert trace.finalize()
+
+    complete_path = tmp_path / f"counts.{trace.pid}.complete"
+    assert complete_path.read_text().strip() == "request-token"
 
 
 def test_shape_trace_flush_request_does_not_reenter_snapshot_write(
@@ -135,7 +182,7 @@ def test_shape_trace_flush_request_does_not_reenter_snapshot_write(
         nonlocal request_sent
         if not request_sent:
             request_sent = True
-            (tmp_path / f"flush.{trace.pid}.request").touch()
+            (tmp_path / f"flush.{trace.pid}.request").write_text("during-flush\n")
             time.sleep(0.05)
         return original_replace(path, target)
 
@@ -143,24 +190,40 @@ def test_shape_trace_flush_request_does_not_reenter_snapshot_write(
 
     trace.flush()
 
-    _wait_for_path(tmp_path / f"counts.{trace.pid}.complete")
+    _wait_for_content(tmp_path / f"counts.{trace.pid}.complete", "during-flush")
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
 def test_shape_trace_resets_process_local_state_after_fork(tmp_path: Path) -> None:
-    trace = ShapeTrace(tmp_path, "baseline")
-    parent_pid = trace.pid
-    child_pid = os.fork()
-    if child_pid == 0:
-        try:
-            trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
-            trace.finalize()
-        finally:
-            os._exit(0)
-
-    _, status = os.waitpid(child_pid, 0)
-
-    assert os.waitstatus_to_exitcode(status) == 0
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "from experiments.ultra_mxfp8_all_observed_tactics."
+                "shape_tactic_runtime import ShapeTrace\n"
+                "trace = ShapeTrace(Path(sys.argv[1]), 'baseline')\n"
+                "parent_pid = trace.pid\n"
+                "child_pid = os.fork()\n"
+                "if child_pid == 0:\n"
+                "    trace.record((2, 2048, 8192), object(), 5, "
+                "'default_autotuner')\n"
+                "    trace.finalize('test')\n"
+                "    os._exit(0)\n"
+                "_, status = os.waitpid(child_pid, 0)\n"
+                "print(parent_pid, child_pid, os.waitstatus_to_exitcode(status))\n"
+            ),
+            str(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    parent_pid, child_pid, exit_code = map(int, result.stdout.split())
+    assert exit_code == 0
     assert child_pid != parent_pid
     assert (tmp_path / f"trace.{child_pid}.jsonl").is_file()
     assert (tmp_path / f"counts.{child_pid}.complete").is_file()
