@@ -19,7 +19,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument(
         "--path",
-        choices=("direct-128x4", "adaptive-op"),
+        choices=("direct-128x4", "adaptive-op", "adaptive-compiled"),
         default="direct-128x4",
     )
     return parser.parse_args()
@@ -28,7 +28,7 @@ def _parse_args() -> argparse.Namespace:
 @torch.inference_mode()
 def main() -> None:
     args = _parse_args()
-    layout = "adaptive" if args.path == "adaptive-op" else "128x4"
+    layout = "adaptive" if args.path.startswith("adaptive-") else "128x4"
     os.environ["VLLM_MXFP8_TRTLLM_LAYOUT"] = layout
     os.environ["VLLM_MXFP8_TRTLLM_SWITCH_M"] = "256"
 
@@ -67,21 +67,33 @@ def main() -> None:
     torch.accelerator.synchronize()
     _mark("WEIGHT_READY")
 
-    if args.path == "adaptive-op":
+    if args.path.startswith("adaptive-"):
+
+        def adaptive_linear(input_: torch.Tensor) -> torch.Tensor:
+            return mxfp8_trtllm_linear(input_, weight, weight_scale, n)
+
+        run_linear = adaptive_linear
+        if args.path == "adaptive-compiled":
+            run_linear = torch.compile(adaptive_linear, dynamic=True, fullgraph=True)
+            _mark("ADAPTIVE_COMPILE_BEGIN")
+            compiled_output = run_linear(x)
+            torch.accelerator.synchronize()
+            _mark(f"ADAPTIVE_COMPILE_DONE output={tuple(compiled_output.shape)}")
+
         small_x = torch.randn((256, k), dtype=torch.bfloat16, device="cuda")
         with autotune(tune_mode=True):
             _mark("ADAPTIVE_SMALL_TUNE_BEGIN")
-            small_output = mxfp8_trtllm_linear(small_x, weight, weight_scale, n)
+            small_output = run_linear(small_x)
             torch.accelerator.synchronize()
             _mark(f"ADAPTIVE_SMALL_TUNE_DONE output={tuple(small_output.shape)}")
 
             _mark("ADAPTIVE_LARGE_TUNE_BEGIN")
-            output = mxfp8_trtllm_linear(x, weight, weight_scale, n)
+            output = run_linear(x)
             torch.accelerator.synchronize()
             _mark(f"ADAPTIVE_LARGE_TUNE_DONE output={tuple(output.shape)}")
 
         _mark("ADAPTIVE_SELECTED_REPLAY_BEGIN")
-        output = mxfp8_trtllm_linear(x, weight, weight_scale, n)
+        output = run_linear(x)
         torch.accelerator.synchronize()
         _mark(f"ADAPTIVE_SELECTED_REPLAY_DONE output={tuple(output.shape)}")
 
@@ -89,7 +101,7 @@ def main() -> None:
         _mark("ADAPTIVE_CUDA_GRAPH_CAPTURE_BEGIN")
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_output = mxfp8_trtllm_linear(static_x, weight, weight_scale, n)
+            graph_output = run_linear(static_x)
         _mark("ADAPTIVE_CUDA_GRAPH_CAPTURE_DONE")
         graph.replay()
         torch.accelerator.synchronize()
