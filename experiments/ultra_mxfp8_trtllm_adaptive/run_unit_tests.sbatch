@@ -16,7 +16,10 @@ mkdir -p "${RUN_DIR}"
 
 PATCH_MOUNTS=(
   "${SOURCE_ROOT}/vllm/envs.py:/usr/local/lib/python3.12/dist-packages/vllm/envs.py"
+  "${SOURCE_ROOT}/vllm/model_executor/kernels/linear/__init__.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/__init__.py"
+  "${SOURCE_ROOT}/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py"
   "${SOURCE_ROOT}/vllm/model_executor/warmup/kernel_warmup.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py"
+  "${SOURCE_ROOT}/vllm/utils/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py"
   "${SOURCE_ROOT}/tests/model_executor/test_flashinfer_autotune_policy.py:/workspace/test_flashinfer_autotune_policy.py"
 )
 CONTAINER_MOUNTS="/lustre:/lustre,$(IFS=,; echo "${PATCH_MOUNTS[*]}")"
