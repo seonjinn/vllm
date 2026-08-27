@@ -221,6 +221,16 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
+def _flashinfer_autotune_token_counts(max_tokens: int) -> tuple[int, ...]:
+    if envs.VLLM_MXFP8_TRTLLM_LAYOUT != "adaptive":
+        return (max_tokens,)
+
+    switch_m = min(envs.VLLM_MXFP8_TRTLLM_SWITCH_M, max_tokens)
+    if switch_m == max_tokens:
+        return (max_tokens,)
+    return (switch_m, max_tokens)
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -265,7 +275,6 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
     dummy_run_kwargs = dict(
-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
         randomize_inputs=True,
@@ -289,7 +298,10 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             torch.inference_mode(),
             _flashinfer_autotune_context(autotune_kwargs),
         ):
-            runner._dummy_run(**dummy_run_kwargs)
+            for num_tokens in _flashinfer_autotune_token_counts(
+                runner.scheduler_config.max_num_batched_tokens
+            ):
+                runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
     finally:
         set_autotune_process_group(None)
 
