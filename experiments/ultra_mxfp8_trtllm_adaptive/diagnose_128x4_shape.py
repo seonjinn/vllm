@@ -31,7 +31,7 @@ def main() -> None:
         shuffle_matrix_a,
         shuffle_matrix_sf_a,
     )
-    from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2
+    from flashinfer.autotuner import autotune
 
     from vllm.utils import flashinfer as vllm_flashinfer
 
@@ -57,17 +57,7 @@ def main() -> None:
     torch.accelerator.synchronize()
     _mark("WEIGHT_READY")
 
-    policy = MeasurementPolicy(
-        execution_mode="cuda_graph",
-        cold_l2=True,
-        refinement_top_k=3,
-        refinement_rounds=3,
-    )
-    with autotune_v2(
-        mode="tune",
-        persistent_cache=False,
-        measurement_policy=policy,
-    ):
+    with autotune(tune_mode=True):
         _mark("TUNE_QUANTIZE_BEGIN")
         x_mxfp8, x_scale = vllm_flashinfer.flashinfer_mxfp8_quantize_128x4(x)
         torch.accelerator.synchronize()
