@@ -4,6 +4,7 @@
 import contextlib
 import sys
 import types
+import weakref
 from contextlib import AbstractContextManager
 from types import SimpleNamespace
 
@@ -125,3 +126,49 @@ def test_flashinfer_adaptive_mxfp8_layers_support_kernel_holder_names() -> None:
 
     assert tuple(layers) == ((128, 256), (512, 256))
     assert all(found_kernel is kernel for _, found_kernel in layers.values())
+
+
+def test_flashinfer_adaptive_mxfp8_warmup_keeps_tensors_alive_until_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references: list[
+        tuple[weakref.ReferenceType[object], weakref.ReferenceType[object]]
+    ] = []
+
+    class TrackedTensor:
+        pass
+
+    class FakeKernel:
+        def apply_weights(self, layer: object, x: object) -> object:
+            output = TrackedTensor()
+            references.append((weakref.ref(x), weakref.ref(output)))
+            return output
+
+    layers = {
+        (128, 256): (
+            SimpleNamespace(weight=SimpleNamespace(device="cuda")),
+            FakeKernel(),
+        ),
+        (512, 256): (
+            SimpleNamespace(weight=SimpleNamespace(device="cuda")),
+            FakeKernel(),
+        ),
+    }
+    runner = SimpleNamespace(get_model=lambda: object())
+
+    monkeypatch.setattr(
+        kernel_warmup, "_flashinfer_adaptive_mxfp8_warmup_m", lambda _: 256
+    )
+    monkeypatch.setattr(kernel_warmup, "_linear_kernel_layers", lambda *_: layers)
+    monkeypatch.setattr(torch, "ones", lambda *_, **__: TrackedTensor())
+
+    def assert_tensors_are_alive() -> None:
+        assert len(references) == len(layers)
+        assert all(
+            input_ref() is not None and output_ref() is not None
+            for input_ref, output_ref in references
+        )
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", assert_tensors_are_alive)
+
+    kernel_warmup._warmup_adaptive_mxfp8_trtllm_linear_layers(runner, 16384)
