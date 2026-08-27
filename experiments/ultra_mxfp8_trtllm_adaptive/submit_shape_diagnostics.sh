@@ -11,6 +11,7 @@ SEGMENT=${SEGMENT:-1}
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64.sqsh}
 SOURCE_ROOT=${SOURCE_ROOT:-/home/sna/vllm-v0271-trtllm-adaptive-ultra}
 SOURCE_COMMIT=${SOURCE_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
+PATH_MODE=${PATH_MODE:-direct-128x4}
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_128x4_diagnostic_${STAMP}}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
@@ -25,9 +26,9 @@ cmd=(
   --qos="${QOS}"
   --time="${WALLTIME}"
   --segment="${SEGMENT}"
-  --job-name="${ACCOUNT}-mxfp8.trt-128x4-diag"
+  --job-name="${ACCOUNT}-mxfp8.trt-${PATH_MODE}"
   --output="${RESULT_ROOT}/slurm/%j.out"
-  --export="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},RESULT_ROOT=${RESULT_ROOT}"
+  --export="ALL,CONTAINER_IMAGE=${CONTAINER_IMAGE},SOURCE_ROOT=${SOURCE_ROOT},SOURCE_COMMIT=${SOURCE_COMMIT},PATH_MODE=${PATH_MODE},RESULT_ROOT=${RESULT_ROOT}"
 )
 if [[ "${SBATCH_TEST_ONLY}" == "1" ]]; then
   cmd+=(--test-only)

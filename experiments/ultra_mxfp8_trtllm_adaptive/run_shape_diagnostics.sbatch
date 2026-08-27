@@ -13,17 +13,20 @@ set -euo pipefail
 
 M=${M:-16384}
 CASE_TIMEOUT=${CASE_TIMEOUT:-180}
+PATH_MODE=${PATH_MODE:-direct-128x4}
 RUN_DIR="${RESULT_ROOT}/${SLURM_JOB_ID}"
 mkdir -p "${RUN_DIR}"
 
 PATCH_MOUNTS=(
   "${SOURCE_ROOT}/vllm/envs.py:/usr/local/lib/python3.12/dist-packages/vllm/envs.py"
+  "${SOURCE_ROOT}/vllm/model_executor/kernels/linear/__init__.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/__init__.py"
+  "${SOURCE_ROOT}/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py"
   "${SOURCE_ROOT}/vllm/utils/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py"
   "${SOURCE_ROOT}/experiments/ultra_mxfp8_trtllm_adaptive/diagnose_128x4_shape.py:/workspace/diagnose_128x4_shape.py"
 )
 CONTAINER_MOUNTS="/lustre:/lustre,$(IFS=,; echo "${PATCH_MOUNTS[*]}")"
 
-export M CASE_TIMEOUT RUN_DIR SOURCE_COMMIT
+export M CASE_TIMEOUT PATH_MODE RUN_DIR SOURCE_COMMIT
 
 # shellcheck disable=SC2016
 srun \
@@ -41,6 +44,7 @@ export CUDA_VISIBLE_DEVICES=0
 echo "source_commit=${SOURCE_COMMIT}" >"${RUN_DIR}/metadata.txt"
 echo "m=${M}" >>"${RUN_DIR}/metadata.txt"
 echo "case_timeout=${CASE_TIMEOUT}" >>"${RUN_DIR}/metadata.txt"
+echo "path_mode=${PATH_MODE}" >>"${RUN_DIR}/metadata.txt"
 vllm --version >>"${RUN_DIR}/metadata.txt"
 python3 -c "import flashinfer; print(flashinfer.__version__)" >>"${RUN_DIR}/metadata.txt"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader \
@@ -56,11 +60,12 @@ for shape in \
   8192:2048 \
   2304:8192; do
   IFS=: read -r n k <<<"${shape}"
-  log="${RUN_DIR}/shape_m${M}_n${n}_k${k}.log"
-  echo "RUN shape=(${M},${n},${k})" | tee "${log}"
+  log="${RUN_DIR}/${PATH_MODE}_m${M}_n${n}_k${k}.log"
+  echo "RUN path=${PATH_MODE} shape=(${M},${n},${k})" | tee "${log}"
   timeout --signal=TERM --kill-after=15 "${CASE_TIMEOUT}" \
     python3 /workspace/diagnose_128x4_shape.py \
-      --m "${M}" --n "${n}" --k "${k}" 2>&1 | tee -a "${log}"
+      --m "${M}" --n "${n}" --k "${k}" --path "${PATH_MODE}" \
+      2>&1 | tee -a "${log}"
   rc=${PIPESTATUS[0]}
   echo "EXIT_CODE=${rc}" | tee -a "${log}"
   if [[ "${rc}" -ne 0 ]]; then
