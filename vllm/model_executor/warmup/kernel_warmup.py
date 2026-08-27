@@ -275,9 +275,11 @@ def _warmup_adaptive_mxfp8_trtllm_linear_layers(
         m,
         tuple(layers),
     )
+    pending_tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
     for (_, k), (layer, kernel) in layers.items():
         x = torch.ones((m, k), dtype=torch.bfloat16, device=layer.weight.device)
-        kernel.apply_weights(layer, x)
+        output = kernel.apply_weights(layer, x)
+        pending_tensors.append((x, output))
     torch.accelerator.synchronize()
 
 
