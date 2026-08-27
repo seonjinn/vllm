@@ -5,8 +5,10 @@ import contextlib
 import sys
 import types
 from contextlib import AbstractContextManager
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm.envs as envs
 from vllm.model_executor.warmup import kernel_warmup
@@ -96,3 +98,30 @@ def test_flashinfer_adaptive_mxfp8_warmup_m_covers_small_layout(
     monkeypatch.setattr(envs, "VLLM_MXFP8_TRTLLM_SWITCH_M", switch_m)
 
     assert kernel_warmup._flashinfer_adaptive_mxfp8_warmup_m(max_tokens) == expected
+
+
+def test_flashinfer_adaptive_mxfp8_layers_support_kernel_holder_names() -> None:
+    class FakeKernel:
+        pass
+
+    kernel = FakeKernel()
+    modules = [
+        SimpleNamespace(
+            quant_method=SimpleNamespace(kernel=kernel),
+            weight=torch.empty((128, 256)),
+        ),
+        SimpleNamespace(
+            scheme=SimpleNamespace(fp8_linear=kernel),
+            weight=torch.empty((512, 256)),
+        ),
+        SimpleNamespace(
+            quant_method=SimpleNamespace(kernel=kernel),
+            weight=torch.empty((128, 256)),
+        ),
+    ]
+    model = SimpleNamespace(modules=lambda: modules)
+
+    layers = kernel_warmup._linear_kernel_layers(model, FakeKernel)
+
+    assert tuple(layers) == ((128, 256), (512, 256))
+    assert all(found_kernel is kernel for _, found_kernel in layers.values())
