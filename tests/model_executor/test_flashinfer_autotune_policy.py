@@ -79,20 +79,20 @@ def test_flashinfer_v2_policy_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None
 @pytest.mark.parametrize(
     ("layout", "switch_m", "max_tokens", "expected"),
     [
-        ("8x4", 256, 16384, (16384,)),
-        ("128x4", 256, 16384, (16384,)),
-        ("adaptive", 256, 16384, (256, 16384)),
-        ("adaptive", 256, 128, (128,)),
+        ("8x4", 256, 16384, None),
+        ("128x4", 256, 16384, None),
+        ("adaptive", 256, 16384, 256),
+        ("adaptive", 256, 128, None),
     ],
 )
-def test_flashinfer_autotune_token_counts_cover_adaptive_layouts(
+def test_flashinfer_adaptive_mxfp8_warmup_m_covers_small_layout(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
     switch_m: int,
     max_tokens: int,
-    expected: tuple[int, ...],
+    expected: int | None,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_MXFP8_TRTLLM_LAYOUT", layout)
     monkeypatch.setattr(envs, "VLLM_MXFP8_TRTLLM_SWITCH_M", switch_m)
 
-    assert kernel_warmup._flashinfer_autotune_token_counts(max_tokens) == expected
+    assert kernel_warmup._flashinfer_adaptive_mxfp8_warmup_m(max_tokens) == expected
