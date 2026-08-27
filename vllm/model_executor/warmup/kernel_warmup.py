@@ -221,14 +221,55 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
-def _flashinfer_autotune_token_counts(max_tokens: int) -> tuple[int, ...]:
+def _flashinfer_adaptive_mxfp8_warmup_m(max_tokens: int) -> int | None:
     if envs.VLLM_MXFP8_TRTLLM_LAYOUT != "adaptive":
-        return (max_tokens,)
+        return None
 
     switch_m = min(envs.VLLM_MXFP8_TRTLLM_SWITCH_M, max_tokens)
     if switch_m == max_tokens:
-        return (max_tokens,)
-    return (switch_m, max_tokens)
+        return None
+    return switch_m
+
+
+def _warmup_adaptive_mxfp8_trtllm_linear_layers(
+    runner: "GPUModelRunner", max_tokens: int
+) -> None:
+    m = _flashinfer_adaptive_mxfp8_warmup_m(max_tokens)
+    if m is None:
+        return
+
+    from vllm.model_executor.kernels.linear import (
+        FlashInferTrtllmMxfp8LinearKernel,
+    )
+
+    layers: dict[
+        tuple[int, int],
+        tuple[torch.nn.Module, FlashInferTrtllmMxfp8LinearKernel],
+    ] = {}
+    for module in runner.get_model().modules():
+        for holder_name in ("quant_method", "scheme"):
+            holder = getattr(module, holder_name, None)
+            kernel = getattr(holder, "fp8_linear", None)
+            weight = getattr(module, "weight", None)
+            if isinstance(kernel, FlashInferTrtllmMxfp8LinearKernel) and isinstance(
+                weight, torch.Tensor
+            ):
+                if weight.ndim != 2:
+                    continue
+                n, k = map(int, weight.shape)
+                layers.setdefault((n, k), (module, kernel))
+                break
+
+    logger.info_once(
+        "Warming adaptive FlashInfer TRTLLM MXFP8 linear kernels at M=%d "
+        "for shapes %s.",
+        m,
+        tuple(layers),
+    )
+    for (_, k), (layer, kernel) in layers.items():
+        x = torch.ones((m, k), dtype=torch.bfloat16, device=layer.weight.device)
+        kernel.apply_weights(layer, x)
+    torch.accelerator.synchronize()
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
@@ -274,6 +315,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
+    max_tokens = runner.scheduler_config.max_num_batched_tokens
     dummy_run_kwargs = dict(
         skip_eplb=True,
         is_profile=True,
@@ -298,10 +340,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             torch.inference_mode(),
             _flashinfer_autotune_context(autotune_kwargs),
         ):
-            for num_tokens in _flashinfer_autotune_token_counts(
-                runner.scheduler_config.max_num_batched_tokens
-            ):
-                runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+            _warmup_adaptive_mxfp8_trtllm_linear_layers(runner, max_tokens)
+            runner._dummy_run(num_tokens=max_tokens, **dummy_run_kwargs)
     finally:
         set_autotune_process_group(None)
 
