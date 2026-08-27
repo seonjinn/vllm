@@ -7,7 +7,7 @@ happen during model execution.
 """
 
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 import torch
 
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
+_LinearKernelT = TypeVar("_LinearKernelT")
 
 
 def _ll_bf16_router_shapes_from_model(
@@ -231,6 +232,28 @@ def _flashinfer_adaptive_mxfp8_warmup_m(max_tokens: int) -> int | None:
     return switch_m
 
 
+def _linear_kernel_layers(
+    model: torch.nn.Module, kernel_type: type[_LinearKernelT]
+) -> dict[tuple[int, int], tuple[torch.nn.Module, _LinearKernelT]]:
+    layers: dict[tuple[int, int], tuple[torch.nn.Module, _LinearKernelT]] = {}
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            continue
+        for holder_name in ("quant_method", "scheme"):
+            holder = getattr(module, holder_name, None)
+            for kernel_name in ("kernel", "fp8_linear"):
+                kernel = getattr(holder, kernel_name, None)
+                if isinstance(kernel, kernel_type):
+                    n, k = map(int, weight.shape)
+                    layers.setdefault((n, k), (module, kernel))
+                    break
+            else:
+                continue
+            break
+    return layers
+
+
 def _warmup_adaptive_mxfp8_trtllm_linear_layers(
     runner: "GPUModelRunner", max_tokens: int
 ) -> None:
@@ -242,23 +265,9 @@ def _warmup_adaptive_mxfp8_trtllm_linear_layers(
         FlashInferTrtllmMxfp8LinearKernel,
     )
 
-    layers: dict[
-        tuple[int, int],
-        tuple[torch.nn.Module, FlashInferTrtllmMxfp8LinearKernel],
-    ] = {}
-    for module in runner.get_model().modules():
-        for holder_name in ("quant_method", "scheme"):
-            holder = getattr(module, holder_name, None)
-            kernel = getattr(holder, "fp8_linear", None)
-            weight = getattr(module, "weight", None)
-            if isinstance(kernel, FlashInferTrtllmMxfp8LinearKernel) and isinstance(
-                weight, torch.Tensor
-            ):
-                if weight.ndim != 2:
-                    continue
-                n, k = map(int, weight.shape)
-                layers.setdefault((n, k), (module, kernel))
-                break
+    layers = _linear_kernel_layers(
+        runner.get_model(), FlashInferTrtllmMxfp8LinearKernel
+    )
 
     logger.info_once(
         "Warming adaptive FlashInfer TRTLLM MXFP8 linear kernels at M=%d "
