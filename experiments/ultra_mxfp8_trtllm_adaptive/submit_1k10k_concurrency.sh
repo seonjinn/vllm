@@ -14,6 +14,7 @@ SOURCE_COMMIT=${SOURCE_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_adaptive_1k10k_concurrency_${STAMP}}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
+SWEEP_GROUPS=${SWEEP_GROUPS:-"c1-32 c128 c512"}
 
 mkdir -p "${RESULT_ROOT}/slurm"
 
@@ -23,7 +24,8 @@ submit_group() {
   local prompt_multiplier=$3
   local max_num_seqs=$4
   local capture_sizes=$5
-  local walltime=$6
+  local gpu_memory_utilization=$6
+  local walltime=$7
   local job_name="${ACCOUNT}-mxfp8.adapt-${label}"
   local export_vars
 
@@ -33,7 +35,7 @@ submit_group() {
   export_vars+=",WORKLOADS=1000:10000,BATCH_SIZES=${batch_sizes}"
   export_vars+=",PROMPT_MULTIPLIER=${prompt_multiplier},MAX_NUM_SEQS=${max_num_seqs}"
   export_vars+=",CUDAGRAPH_CAPTURE_SIZES=${capture_sizes}"
-  export_vars+=",GPU_MEMORY_UTILIZATION=0.80,MXFP8_WORKSPACE_SIZE=1073741824"
+  export_vars+=",GPU_MEMORY_UTILIZATION=${gpu_memory_utilization},MXFP8_WORKSPACE_SIZE=1073741824"
   export_vars+=",MXFP8_ENABLE_PDL=false,LINEAR_BACKEND=flashinfer_trtllm"
 
   local cmd=(
@@ -57,11 +59,18 @@ submit_group() {
   "${cmd[@]}"
 }
 
+group_enabled() {
+  [[ " ${SWEEP_GROUPS} " == *" $1 "* ]]
+}
+
 # Ten waves keep the low- and mid-concurrency measurements stable. The high
 # concurrency jobs use one wave because exact 10K-token outputs would otherwise
 # generate 12.8M (C128) and 51.2M (C512) output tokens per configuration.
-submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:2:4:8:16:32" "04:00:00"
-submit_group "c128" "128" 1 128 "1:32:64:128" "04:00:00"
-submit_group "c512" "512" 1 512 "1:32:128:256:512" "04:00:00"
+group_enabled "c1-32" && \
+  submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:2:4:8:16:32" 0.80 "04:00:00"
+group_enabled "c128" && \
+  submit_group "c128" "128" 1 128 "1:32:64:128" 0.80 "04:00:00"
+group_enabled "c512" && \
+  submit_group "c512" "512" 1 512 "1:32:128:256:512" 0.90 "04:00:00"
 
 echo "result_root=${RESULT_ROOT}"
