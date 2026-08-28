@@ -19,9 +19,9 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
+    _mxfp8_trtllm_adaptive_linear_impl,
     _mxfp8_trtllm_layout_config,
     _mxfp8_trtllm_linear_fixed_impl,
-    mxfp8_trtllm_linear,
     mxfp8_trtllm_use_8x4_sf_layout,
 )
 from vllm.platforms import PlatformEnum
@@ -185,10 +185,10 @@ def test_mxfp8_trtllm_adaptive_op_uses_runtime_shape(monkeypatch) -> None:
 
     weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty((4096,), dtype=torch.uint8)
-    mxfp8_trtllm_linear(
+    _mxfp8_trtllm_adaptive_linear_impl(
         torch.empty((2, 512), dtype=torch.bfloat16), weight, weight_scale, 130
     )
-    mxfp8_trtllm_linear(
+    _mxfp8_trtllm_adaptive_linear_impl(
         torch.empty((3, 512), dtype=torch.bfloat16), weight, weight_scale, 130
     )
 
@@ -340,8 +340,11 @@ def test_mxfp8_trtllm_rejects_unsupported_k(monkeypatch) -> None:
 def test_mxfp8_trtllm_uses_8x4_quantization_and_slices_output(monkeypatch) -> None:
     calls: dict[str, object] = {}
 
-    def quantize_8x4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize_8x4(
+        x: torch.Tensor, *, enable_pdl: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         calls["quant_shape"] = tuple(x.shape)
+        calls["quantizer_pdl"] = enable_pdl
         return (
             torch.empty_like(x, dtype=torch.float8_e4m3fn),
             torch.empty((128,), dtype=torch.uint8),
@@ -396,6 +399,7 @@ def test_mxfp8_trtllm_uses_8x4_quantization_and_slices_output(monkeypatch) -> No
     assert output.shape == (2, 3, 130)
     assert output.is_contiguous()
     assert calls["quant_shape"] == (6, 512)
+    assert calls["quantizer_pdl"] is True
     assert calls["mm"] == {
         "a": (6, 512),
         "b": (512, 256),
