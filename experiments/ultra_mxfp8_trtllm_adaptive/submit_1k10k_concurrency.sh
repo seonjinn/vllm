@@ -11,6 +11,7 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/conta
 MODEL_PATH=${MODEL_PATH:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8}
 SOURCE_ROOT=${SOURCE_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-trtllm-adaptive-ultra}
 SOURCE_COMMIT=${SOURCE_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
+AUTOTUNE_CACHE_DIR=${AUTOTUNE_CACHE_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_adaptive_cg_pdl_off_ws1g_cached_20260827/seed-cache}
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_adaptive_1k10k_concurrency_${STAMP}}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
@@ -37,6 +38,7 @@ submit_group() {
   export_vars+=",CUDAGRAPH_CAPTURE_SIZES=${capture_sizes}"
   export_vars+=",GPU_MEMORY_UTILIZATION=${gpu_memory_utilization},MXFP8_WORKSPACE_SIZE=1073741824"
   export_vars+=",MXFP8_ENABLE_PDL=false,LINEAR_BACKEND=flashinfer_trtllm"
+  export_vars+=",VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=${AUTOTUNE_CACHE_DIR}"
 
   local cmd=(
     sbatch
