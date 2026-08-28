@@ -172,3 +172,24 @@ def test_flashinfer_adaptive_mxfp8_warmup_keeps_tensors_alive_until_sync(
     monkeypatch.setattr(torch.accelerator, "synchronize", assert_tensors_are_alive)
 
     kernel_warmup._warmup_adaptive_mxfp8_trtllm_linear_layers(runner, 16384)
+
+
+def test_flashinfer_mxfp8_workspace_is_preallocated_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int, object]] = []
+    fake_module = types.ModuleType("flashinfer.utils")
+    fake_module._get_cache_buf = (  # type: ignore[attr-defined]
+        lambda name, size, device: calls.append((name, size, device))
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer.utils", fake_module)
+    monkeypatch.setattr(
+        envs,
+        "VLLM_FLASHINFER_MXFP8_WORKSPACE_SIZE",
+        1024 * 1024 * 1024,
+        raising=False,
+    )
+
+    kernel_warmup._preallocate_flashinfer_mxfp8_workspace("cuda:0")
+
+    assert calls == [("mm_mxfp8_workspace", 1024 * 1024 * 1024, "cuda:0")]
