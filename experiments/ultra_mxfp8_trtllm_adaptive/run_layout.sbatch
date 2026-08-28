@@ -20,6 +20,7 @@ PROMPT_MULTIPLIER=${PROMPT_MULTIPLIER:-10}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-12024}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-1:8:32}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.95}
 SWITCH_M=${SWITCH_M:-256}
 MXFP8_WORKSPACE_SIZE=${MXFP8_WORKSPACE_SIZE:-0}
@@ -40,6 +41,7 @@ CONTAINER_MOUNTS="/lustre:/lustre,$(IFS=,; echo "${PATCH_MOUNTS[*]}")"
 
 export RUN_DIR TP WORKLOADS BATCH_SIZES PROMPT_MULTIPLIER
 export MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS
+export CUDAGRAPH_CAPTURE_SIZES
 export GPU_MEMORY_UTILIZATION PORT SOURCE_ROOT SOURCE_COMMIT LAYOUT SWITCH_M
 export LINEAR_BACKEND
 export MXFP8_WORKSPACE_SIZE
@@ -63,6 +65,7 @@ export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR="${VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR:
 export FLASHINFER_WORKSPACE_BASE=/tmp
 export PYTHONPYCACHEPREFIX=/tmp/vllm-pycache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CUDAGRAPH_CAPTURE_SIZES_JSON=${CUDAGRAPH_CAPTURE_SIZES//:/,}
 
 SERVER_LOG="${RUN_DIR}/server.log"
 SERVER_CMD=(
@@ -89,7 +92,7 @@ SERVER_CMD=(
   --mamba-cache-mode all
   --mamba-ssm-cache-dtype float32
   --seed 0
-  --compilation-config "{\"cudagraph_capture_sizes\":[1,8,32],\"pass_config\":{\"fuse_allreduce_rms\":false}}"
+  --compilation-config "{\"cudagraph_capture_sizes\":[${CUDAGRAPH_CAPTURE_SIZES_JSON}],\"pass_config\":{\"fuse_allreduce_rms\":false}}"
 )
 
 {
@@ -109,6 +112,9 @@ SERVER_CMD=(
   echo "tp=${TP}"
   echo "workloads=${WORKLOADS}"
   echo "batch_sizes=${BATCH_SIZES}"
+  echo "prompt_multiplier=${PROMPT_MULTIPLIER}"
+  echo "max_num_seqs=${MAX_NUM_SEQS}"
+  echo "cudagraph_capture_sizes=${CUDAGRAPH_CAPTURE_SIZES_JSON}"
   echo "container=${CONTAINER_IMAGE}"
   sha256sum \
     "${SOURCE_ROOT}/vllm/envs.py" \
