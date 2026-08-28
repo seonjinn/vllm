@@ -11,7 +11,8 @@ CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/conta
 MODEL_PATH=${MODEL_PATH:-/lustre/fsw/coreai_dlalgo_llm/users/sna/ckpts/ultra-v3-sft-hsg-mainfeb5merge-mxfp8_newbase.mxfp8}
 SOURCE_ROOT=${SOURCE_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-trtllm-adaptive-ultra}
 SOURCE_COMMIT=${SOURCE_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
-AUTOTUNE_CACHE_SEED_DIR=${AUTOTUNE_CACHE_SEED_DIR:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_adaptive_cg_pdl_off_ws1g_cached_20260827/seed-cache}
+AUTOTUNE_CACHE_SEED_DIR=${AUTOTUNE_CACHE_SEED_DIR:-}
+AUTOTUNE_SKIP_OPS=${AUTOTUNE_SKIP_OPS:-mxfp8_gemm}
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/vllm-v0271-results/ultra_mxfp8_adaptive_1k10k_concurrency_${STAMP}}
 SBATCH_TEST_ONLY=${SBATCH_TEST_ONLY:-0}
@@ -36,9 +37,10 @@ submit_group() {
   export_vars+=",WORKLOADS=1000:10000,BATCH_SIZES=${batch_sizes}"
   export_vars+=",PROMPT_MULTIPLIER=${prompt_multiplier},MAX_NUM_SEQS=${max_num_seqs}"
   export_vars+=",CUDAGRAPH_CAPTURE_SIZES=${capture_sizes}"
-  export_vars+=",GPU_MEMORY_UTILIZATION=${gpu_memory_utilization},MXFP8_WORKSPACE_SIZE=1073741824"
+  export_vars+=",GPU_MEMORY_UTILIZATION=${gpu_memory_utilization},MXFP8_WORKSPACE_SIZE=0"
   export_vars+=",MXFP8_ENABLE_PDL=false,LINEAR_BACKEND=flashinfer_trtllm"
   export_vars+=",AUTOTUNE_CACHE_SEED_DIR=${AUTOTUNE_CACHE_SEED_DIR}"
+  export_vars+=",VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS=${AUTOTUNE_SKIP_OPS}"
 
   local cmd=(
     sbatch
@@ -69,10 +71,10 @@ group_enabled() {
 # concurrency jobs use one wave because exact 10K-token outputs would otherwise
 # generate 12.8M (C128) and 51.2M (C512) output tokens per configuration.
 group_enabled "c1-32" && \
-  submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:8:32" 0.80 "04:00:00"
+  submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:8:32" 0.85 "04:00:00"
 group_enabled "c128" && \
-  submit_group "c128" "128" 1 32 "1:8:32" 0.80 "04:00:00"
+  submit_group "c128" "128" 1 32 "1:8:32" 0.85 "04:00:00"
 group_enabled "c512" && \
-  submit_group "c512" "512" 1 32 "1:8:32" 0.80 "04:00:00"
+  submit_group "c512" "512" 1 32 "1:8:32" 0.85 "04:00:00"
 
 echo "result_root=${RESULT_ROOT}"
