@@ -67,7 +67,7 @@ group_enabled() {
 # concurrency jobs use one wave because exact 10K-token outputs would otherwise
 # generate 12.8M (C128) and 51.2M (C512) output tokens per configuration.
 group_enabled "c1-32" && \
-  submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:2:4:8:16:32" 0.80 "04:00:00"
+  submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:8:32" 0.80 "04:00:00"
 group_enabled "c128" && \
   submit_group "c128" "128" 1 128 "1:32:64:128" 0.80 "04:00:00"
 group_enabled "c512" && \
