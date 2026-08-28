@@ -105,15 +105,21 @@ def test_mxfp8_trtllm_fixed_impl_uses_matching_scale_layout(
     monkeypatch, use_8x4: bool
 ) -> None:
     calls: dict[str, object] = {}
+    monkeypatch.setattr(envs, "VLLM_FLASHINFER_MXFP8_ENABLE_PDL", False)
 
-    def quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize(
+        x: torch.Tensor, *, enable_pdl: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         calls["quantizer"] = "8x4" if use_8x4 else "128x4"
+        calls["quantizer_pdl"] = enable_pdl
         return (
             torch.empty_like(x, dtype=torch.float8_e4m3fn),
             torch.empty((128,), dtype=torch.uint8),
         )
 
-    def wrong_quantizer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def wrong_quantizer(
+        x: torch.Tensor, *, enable_pdl: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         raise AssertionError("selected the wrong MXFP8 scale layout")
 
     monkeypatch.setattr(
@@ -156,6 +162,7 @@ def test_mxfp8_trtllm_fixed_impl_uses_matching_scale_layout(
 
     assert calls == {
         "quantizer": "8x4" if use_8x4 else "128x4",
+        "quantizer_pdl": False,
         "mm_layout": use_8x4,
     }
     assert output.shape == (3, 130)
