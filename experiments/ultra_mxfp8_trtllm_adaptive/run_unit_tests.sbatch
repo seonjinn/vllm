@@ -21,6 +21,7 @@ PATCH_MOUNTS=(
   "${SOURCE_ROOT}/vllm/model_executor/warmup/kernel_warmup.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py"
   "${SOURCE_ROOT}/vllm/utils/flashinfer.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py"
   "${SOURCE_ROOT}/tests/model_executor/test_flashinfer_autotune_policy.py:/workspace/test_flashinfer_autotune_policy.py"
+  "${SOURCE_ROOT}/tests/kernels/quantization/test_mxfp8_trtllm_linear.py:/workspace/test_mxfp8_trtllm_linear.py"
 )
 CONTAINER_MOUNTS="/lustre:/lustre,$(IFS=,; echo "${PATCH_MOUNTS[*]}")"
 
@@ -33,7 +34,7 @@ srun \
   --container-mounts="${CONTAINER_MOUNTS}" \
   --mpi=pmix \
   bash -lc \
-  'python3 -m pytest -q /workspace/test_flashinfer_autotune_policy.py' \
+  'python3 -m pytest -q /workspace/test_flashinfer_autotune_policy.py /workspace/test_mxfp8_trtllm_linear.py' \
   2>&1 | tee "${RUN_DIR}/pytest.log"
 
 touch "${RUN_DIR}/COMPLETE"
