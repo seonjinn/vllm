@@ -710,6 +710,7 @@ if has_flashinfer():
     )
     def flashinfer_mxfp8_quantize_8x4(
         a: torch.Tensor,
+        enable_pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from flashinfer import SfLayout
         from flashinfer import mxfp8_quantize as mxfp8_quantize_
@@ -718,6 +719,7 @@ if has_flashinfer():
             a,
             backend="cuda",
             sf_swizzle_layout=SfLayout.layout_8x4,
+            enable_pdl=enable_pdl,
         )
 
     @torch.library.register_fake(
@@ -725,6 +727,7 @@ if has_flashinfer():
     )
     def flashinfer_mxfp8_quantize_8x4_fake(
         a: torch.Tensor,
+        enable_pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = a.shape
         scale_size = cdiv(m, 8) * 8 * cdiv(k // 32, 4) * 4
@@ -740,6 +743,7 @@ if has_flashinfer():
     )
     def flashinfer_mxfp8_quantize_128x4(
         a: torch.Tensor,
+        enable_pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from flashinfer import SfLayout
         from flashinfer import mxfp8_quantize as mxfp8_quantize_
@@ -748,6 +752,7 @@ if has_flashinfer():
             a,
             backend="cuda",
             sf_swizzle_layout=SfLayout.layout_128x4,
+            enable_pdl=enable_pdl,
         )
 
     @torch.library.register_fake(
@@ -755,6 +760,7 @@ if has_flashinfer():
     )
     def flashinfer_mxfp8_quantize_128x4_fake(
         a: torch.Tensor,
+        enable_pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = a.shape
         scale_size = cdiv(m, 128) * 128 * cdiv(k // 32, 4) * 4

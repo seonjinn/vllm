@@ -34,7 +34,7 @@ srun \
   --container-mounts="${CONTAINER_MOUNTS}" \
   --mpi=pmix \
   bash -lc \
-  'python3 -m pytest -q /workspace/test_flashinfer_autotune_policy.py /workspace/test_mxfp8_trtllm_linear.py' \
+  'python3 -m pytest -q /workspace/test_flashinfer_autotune_policy.py && python3 -m pytest -q /workspace/test_mxfp8_trtllm_linear.py' \
   2>&1 | tee "${RUN_DIR}/pytest.log"
 
 touch "${RUN_DIR}/COMPLETE"

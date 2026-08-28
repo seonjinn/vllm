@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     VLLM_MXFP8_TRTLLM_LAYOUT: Literal["8x4", "128x4", "adaptive"] = "8x4"
     VLLM_MXFP8_TRTLLM_SWITCH_M: int = 256
     VLLM_FLASHINFER_MXFP8_WORKSPACE_SIZE: int = 0
+    VLLM_FLASHINFER_MXFP8_ENABLE_PDL: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1206,6 +1207,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASHINFER_MXFP8_WORKSPACE_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_MXFP8_WORKSPACE_SIZE", "0")
+    ),
+    "VLLM_FLASHINFER_MXFP8_ENABLE_PDL": lambda: (
+        os.getenv("VLLM_FLASHINFER_MXFP8_ENABLE_PDL", "True").lower() in ("true", "1")
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")

@@ -66,7 +66,9 @@ def _mxfp8_trtllm_linear_fixed_impl(
         if use_8x4_sf_layout
         else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
     )
-    input_mxfp8, input_scale = quantize(x)
+    input_mxfp8, input_scale = quantize(
+        x, enable_pdl=envs.VLLM_FLASHINFER_MXFP8_ENABLE_PDL
+    )
     output = vllm_flashinfer.mm_mxfp8(
         input_mxfp8,
         weight.t(),
