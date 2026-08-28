@@ -178,6 +178,7 @@ def test_flashinfer_mxfp8_workspace_is_preallocated_from_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, int, object]] = []
+    device = torch.device("cuda:0")
     fake_module = types.ModuleType("flashinfer.utils")
     fake_module._get_cache_buf = (  # type: ignore[attr-defined]
         lambda name, size, device: calls.append((name, size, device))
@@ -190,6 +191,6 @@ def test_flashinfer_mxfp8_workspace_is_preallocated_from_config(
         raising=False,
     )
 
-    kernel_warmup._preallocate_flashinfer_mxfp8_workspace("cuda:0")
+    kernel_warmup._preallocate_flashinfer_mxfp8_workspace(device)
 
-    assert calls == [("mm_mxfp8_workspace", 1024 * 1024 * 1024, "cuda:0")]
+    assert calls == [("mm_mxfp8_workspace", 1024 * 1024 * 1024, device)]

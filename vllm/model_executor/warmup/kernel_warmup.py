@@ -232,6 +232,16 @@ def _flashinfer_adaptive_mxfp8_warmup_m(max_tokens: int) -> int | None:
     return switch_m
 
 
+def _preallocate_flashinfer_mxfp8_workspace(device: torch.device | str) -> None:
+    workspace_size = envs.VLLM_FLASHINFER_MXFP8_WORKSPACE_SIZE
+    if workspace_size <= 0:
+        return
+
+    from flashinfer.utils import _get_cache_buf
+
+    _get_cache_buf("mm_mxfp8_workspace", workspace_size, torch.device(device))
+
+
 def _linear_kernel_layers(
     model: torch.nn.Module, kernel_type: type[_LinearKernelT]
 ) -> dict[tuple[int, int], tuple[torch.nn.Module, _LinearKernelT]]:
@@ -268,6 +278,9 @@ def _warmup_adaptive_mxfp8_trtllm_linear_layers(
     layers = _linear_kernel_layers(
         runner.get_model(), FlashInferTrtllmMxfp8LinearKernel
     )
+    if layers:
+        first_layer, _ = next(iter(layers.values()))
+        _preallocate_flashinfer_mxfp8_workspace(first_layer.weight.device)
 
     logger.info_once(
         "Warming adaptive FlashInfer TRTLLM MXFP8 linear kernels at M=%d "
