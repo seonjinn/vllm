@@ -69,8 +69,8 @@ group_enabled() {
 group_enabled "c1-32" && \
   submit_group "c1-32" "1 2 4 8 16 32" 10 32 "1:8:32" 0.80 "04:00:00"
 group_enabled "c128" && \
-  submit_group "c128" "128" 1 128 "1:32:64:128" 0.80 "04:00:00"
+  submit_group "c128" "128" 1 32 "1:8:32" 0.80 "04:00:00"
 group_enabled "c512" && \
-  submit_group "c512" "512" 1 512 "1:32:128:256:512" 0.90 "04:00:00"
+  submit_group "c512" "512" 1 32 "1:8:32" 0.80 "04:00:00"
 
 echo "result_root=${RESULT_ROOT}"
