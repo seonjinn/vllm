@@ -31,6 +31,7 @@ def test_plan_uses_reverse_order_same_allocation_contract() -> None:
         "concurrencies=8 32",
         "waves=10",
         "cuda_graph=true",
+        "cuda_graph_memory_profiling=true",
         "allocation=2nodes,4gpus_per_node",
         "order=cutedsl adaptive-lookup",
         "order=adaptive-lookup cutedsl",
@@ -48,5 +49,10 @@ def test_script_loads_tactic_hook_without_shadowing_installed_extensions() -> No
     assert "PYTHONDONTWRITEBYTECODE=1" in source
     assert 'BSIZES="${CONCURRENCIES}"' in source
     assert 'MULT="${WAVES}"' in source
+    assert "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1" in source
+    assert (
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"
+        in source.split('SBATCH_EXTRA_EXPORT_NAMES="', 1)[1].split('"', 1)[0]
+    )
     assert "sbatch --test-only" not in source
     assert 'SBATCH_TEST_ONLY="${test_only}"' in source
