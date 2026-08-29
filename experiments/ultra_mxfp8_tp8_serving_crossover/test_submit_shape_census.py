@@ -49,6 +49,8 @@ def test_plan_gates_high_concurrency_with_one_wave_smoke() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "concurrencies=128 512 waves=1" in result.stdout
+    assert "server_max_num_seqs=256" in result.stdout
+    assert 'compilation_config={"cudagraph_capture_sizes":[1,128,256]}' in result.stdout
 
 
 def test_plan_allows_single_variable_fixed_layout_diagnostic() -> None:

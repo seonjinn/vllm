@@ -28,6 +28,8 @@ readonly LOW_CONCURRENCIES=${LOW_CONCURRENCIES:-"1 2 4 8 16 32"}
 readonly LOW_WAVES=${LOW_WAVES:-10}
 readonly HIGH_CONCURRENCIES=${HIGH_CONCURRENCIES:-"128 512"}
 readonly HIGH_WAVES=${HIGH_WAVES:-1}
+readonly HIGH_SERVER_MAX_NUM_SEQS=${HIGH_SERVER_MAX_NUM_SEQS:-256}
+readonly HIGH_COMPILATION_CONFIG_JSON=${HIGH_COMPILATION_CONFIG_JSON:-'{"cudagraph_capture_sizes":[1,128,256]}'}
 readonly SBATCH_EXTRA_EXPORT_NAMES="SOURCE_ROOT FLASHINFER_ROOT FLASHINFER_COMMIT EXPECTED_CONTAINER_SHA256 EXPECTED_VLLM_VERSION MXFP8_TACTIC_TRACE_DIR MXFP8_TACTIC_TRACE_PHASE MXFP8_TACTIC_BACKEND MXFP8_TACTIC_SCALE_LAYOUT"
 
 case "${TRTLLM_LAYOUT}" in
@@ -48,11 +50,15 @@ phase_config() {
       PHASE_BSIZES="${LOW_CONCURRENCIES}"
       PHASE_MULT=${LOW_WAVES}
       PHASE_WALLTIME=04:00:00
+      PHASE_MAX_NUM_SEQS=${PHASE_BSIZES##* }
+      PHASE_COMPILATION_CONFIG_JSON=
       ;;
     high-smoke)
       PHASE_BSIZES="${HIGH_CONCURRENCIES}"
       PHASE_MULT=${HIGH_WAVES}
       PHASE_WALLTIME=04:00:00
+      PHASE_MAX_NUM_SEQS=${HIGH_SERVER_MAX_NUM_SEQS}
+      PHASE_COMPILATION_CONFIG_JSON=${HIGH_COMPILATION_CONFIG_JSON}
       ;;
     *)
       echo "Unsupported phase: $1" >&2
@@ -72,7 +78,7 @@ print_plan() {
   echo "slurm_extra_exports=${SBATCH_EXTRA_EXPORT_NAMES}"
   for phase in ${PHASES}; do
     phase_config "${phase}"
-    echo "phase=${phase} concurrencies=${PHASE_BSIZES} waves=${PHASE_MULT}"
+    echo "phase=${phase} concurrencies=${PHASE_BSIZES} waves=${PHASE_MULT} server_max_num_seqs=${PHASE_MAX_NUM_SEQS} compilation_config=${PHASE_COMPILATION_CONFIG_JSON:-default}"
   done
 }
 
@@ -143,14 +149,12 @@ readonly LAUNCHER="${BENCH_ROOT}/experiments/backend_sweep_v0271/submit_mxfp8_li
 submit_phase() {
   local phase=$1
   local test_only=$2
-  local phase_stamp phase_root run_root trace_dir max_num_seqs output
+  local phase_stamp phase_root run_root trace_dir output
   phase_config "${phase}"
   phase_stamp="${STAMP}_${phase}"
   phase_root="${RESULT_ROOT}/${phase}"
   run_root="${phase_root}/${phase_stamp}_main_flashinfer_trtllm_rep0"
   trace_dir="${run_root}/traces"
-  max_num_seqs=${PHASE_BSIZES##* }
-
   output=$(remote env \
     ACCOUNT="${ACCOUNT}" \
     PARTITION="${PARTITION}" \
@@ -181,8 +185,9 @@ submit_phase() {
     MULT="${PHASE_MULT}" \
     MAX_MODEL_LEN=12024 \
     MAX_NUM_BATCHED_TOKENS=16384 \
-    SERVER_MAX_NUM_SEQS="${max_num_seqs}" \
-    GPU_MEM=0.95 \
+    SERVER_MAX_NUM_SEQS="${PHASE_MAX_NUM_SEQS}" \
+    COMPILATION_CONFIG_JSON="${PHASE_COMPILATION_CONFIG_JSON}" \
+    GPU_MEM=0.90 \
     ASYNC_SCHEDULING=0 \
     FORCE_DISABLE_ASYNC_SCHEDULING=1 \
     SHARED_SERVER=1 \
