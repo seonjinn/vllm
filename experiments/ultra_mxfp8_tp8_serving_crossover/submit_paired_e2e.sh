@@ -11,6 +11,7 @@ readonly QOS=${QOS:-user-restrictions}
 readonly REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-/home/sna/vllm-v0271-ultra-tp8-crossover}
 readonly SOURCE_COMMIT=${SOURCE_COMMIT:-e3c4137b83bd77d63245b28f99c01b79a7bf7a6c}
 readonly SOURCE_ROOT=${SOURCE_ROOT:-/home/sna/vllm-v0271-mxfp8-pins/${SOURCE_COMMIT}}
+readonly TACTIC_RUNTIME_ROOT="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
 readonly BENCH_COMMIT=${BENCH_COMMIT:-45b96a08f62b0687ecf732c7d57880426646bb0b}
 readonly BENCH_REPO=${BENCH_REPO:-/home/sna/vllm-benchmark-layout-ncu/4f2ca9d1f0b1}
 readonly BENCH_ROOT=${BENCH_ROOT:-/home/sna/vllm-benchmark-serving-crossover/${BENCH_COMMIT:0:12}}
@@ -96,6 +97,7 @@ readonly LAUNCHER="${BENCH_ROOT}/experiments/backend_sweep_v0271/submit_mxfp8_li
 remote test -s "${PAIRED_DRIVER}"
 remote test -s "${PAIR_BENCHMARK_SCRIPT}"
 remote test -s "${LOOKUP_PATH}"
+remote test -s "${TACTIC_RUNTIME_ROOT}/sitecustomize.py"
 
 submit_order() {
   local order=$1
@@ -145,7 +147,7 @@ submit_order() {
     VLLM_MXFP8_TRTLLM_LAYOUT=adaptive \
     VLLM_MXFP8_TRTLLM_SWITCH_M=256 \
     VLLM_MXFP8_TRTLLM_TACTICS= \
-    PYTHONPATH="${BENCH_ROOT}" \
+    PYTHONPATH="${TACTIC_RUNTIME_ROOT}:${BENCH_ROOT}" \
     VLLM_SUBPROCESS_PYTHONPATH= \
     SOURCE_ROOT="${SOURCE_ROOT}" \
     FLASHINFER_ROOT="${FLASHINFER_ROOT}" \

@@ -37,11 +37,13 @@ def test_plan_uses_reverse_order_same_allocation_contract() -> None:
     ]
 
 
-def test_script_keeps_installed_extensions_and_strict_results() -> None:
+def test_script_loads_tactic_hook_without_shadowing_installed_extensions() -> None:
     source = SUBMIT_SCRIPT.read_text()
 
-    assert 'PYTHONPATH="${BENCH_ROOT}"' in source
+    assert 'PYTHONPATH="${TACTIC_RUNTIME_ROOT}:${BENCH_ROOT}"' in source
     assert "VLLM_SUBPROCESS_PYTHONPATH=" in source
+    assert 'test -s "${TACTIC_RUNTIME_ROOT}/sitecustomize.py"' in source
+    assert 'PYTHONPATH="${SOURCE_ROOT}' not in source
     assert "STRICT_RESULT_TOKENS=1" in source
     assert "PYTHONDONTWRITEBYTECODE=1" in source
     assert 'BSIZES="${CONCURRENCIES}"' in source
