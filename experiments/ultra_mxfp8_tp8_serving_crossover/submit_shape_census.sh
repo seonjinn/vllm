@@ -22,18 +22,36 @@ readonly STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 readonly RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/results/mxfp8_tp8_serving_crossover_${STAMP}}
 readonly PHASES=${PHASES:-"low high-smoke"}
 readonly PRINT_PLAN=${PRINT_PLAN:-0}
+readonly TRTLLM_LAYOUT=${TRTLLM_LAYOUT:-adaptive}
+readonly TRTLLM_SWITCH_M=${TRTLLM_SWITCH_M:-256}
+readonly LOW_CONCURRENCIES=${LOW_CONCURRENCIES:-"1 2 4 8 16 32"}
+readonly LOW_WAVES=${LOW_WAVES:-10}
+readonly HIGH_CONCURRENCIES=${HIGH_CONCURRENCIES:-"128 512"}
+readonly HIGH_WAVES=${HIGH_WAVES:-1}
 readonly SBATCH_EXTRA_EXPORT_NAMES="SOURCE_ROOT FLASHINFER_ROOT FLASHINFER_COMMIT EXPECTED_CONTAINER_SHA256 EXPECTED_VLLM_VERSION MXFP8_TACTIC_TRACE_DIR MXFP8_TACTIC_TRACE_PHASE MXFP8_TACTIC_BACKEND MXFP8_TACTIC_SCALE_LAYOUT"
+
+case "${TRTLLM_LAYOUT}" in
+  8x4 | 128x4 | adaptive) ;;
+  *)
+    echo "Unsupported TRTLLM_LAYOUT: ${TRTLLM_LAYOUT}" >&2
+    exit 2
+    ;;
+esac
+if ((LOW_WAVES <= 0 || HIGH_WAVES <= 0)); then
+  echo "LOW_WAVES and HIGH_WAVES must be positive" >&2
+  exit 2
+fi
 
 phase_config() {
   case "$1" in
     low)
-      PHASE_BSIZES="1 2 4 8 16 32"
-      PHASE_MULT=10
+      PHASE_BSIZES="${LOW_CONCURRENCIES}"
+      PHASE_MULT=${LOW_WAVES}
       PHASE_WALLTIME=04:00:00
       ;;
     high-smoke)
-      PHASE_BSIZES="128 512"
-      PHASE_MULT=1
+      PHASE_BSIZES="${HIGH_CONCURRENCIES}"
+      PHASE_MULT=${HIGH_WAVES}
       PHASE_WALLTIME=04:00:00
       ;;
     *)
@@ -48,7 +66,7 @@ print_plan() {
   echo "model=${MODEL_PATH}"
   echo "parallelism=TP8,DP1,EP8"
   echo "workload=ISL1000,OSL10000"
-  echo "layout=adaptive,switch_m=256"
+  echo "layout=${TRTLLM_LAYOUT},switch_m=${TRTLLM_SWITCH_M}"
   echo "ray_install_if_missing=1,node_local_tmp=true"
   echo "benchmark_commit=${BENCH_COMMIT}"
   echo "slurm_extra_exports=${SBATCH_EXTRA_EXPORT_NAMES}"
@@ -172,8 +190,8 @@ submit_phase() {
     STRICT_WARMUP_TOKENS=0 \
     BENCH_TIMEOUT_S=14400 \
     SERVER_HEALTH_TIMEOUT_S=7200 \
-    VLLM_MXFP8_TRTLLM_LAYOUT=adaptive \
-    VLLM_MXFP8_TRTLLM_SWITCH_M=256 \
+    VLLM_MXFP8_TRTLLM_LAYOUT="${TRTLLM_LAYOUT}" \
+    VLLM_MXFP8_TRTLLM_SWITCH_M="${TRTLLM_SWITCH_M}" \
     VLLM_MXFP8_TRTLLM_TACTICS= \
     PYTHONPATH="${EXP_DIR_REMOTE}:${SOURCE_ROOT}" \
     VLLM_SUBPROCESS_PYTHONPATH="${SOURCE_ROOT}" \
@@ -185,7 +203,7 @@ submit_phase() {
     MXFP8_TACTIC_TRACE_DIR="${trace_dir}" \
     MXFP8_TACTIC_TRACE_PHASE="${phase}" \
     MXFP8_TACTIC_BACKEND=trtllm \
-    MXFP8_TACTIC_SCALE_LAYOUT=adaptive \
+    MXFP8_TACTIC_SCALE_LAYOUT="${TRTLLM_LAYOUT}" \
     "${LAUNCHER}")
   printf '%s\n' "${output}"
 }
@@ -204,7 +222,7 @@ remote mkdir -p "${RESULT_ROOT}/slurm"
   echo "model_index_sha256=${model_index_sha}"
   echo "parallelism=TP8,DP1,EP8"
   echo "workload=ISL1000,OSL10000"
-  echo "layout=adaptive,switch_m=256"
+  echo "layout=${TRTLLM_LAYOUT},switch_m=${TRTLLM_SWITCH_M}"
   echo "phases=${PHASES}"
 } | remote tee "${RESULT_ROOT}/manifest.txt" >/dev/null
 for phase in ${PHASES}; do

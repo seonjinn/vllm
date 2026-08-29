@@ -8,10 +8,17 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("submit_shape_census.sh")
 
 
-def _print_plan(phases: str) -> subprocess.CompletedProcess[str]:
+def _print_plan(
+    phases: str, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["bash", str(SCRIPT)],
-        env={**os.environ, "PRINT_PLAN": "1", "PHASES": phases},
+        env={
+            **os.environ,
+            "PRINT_PLAN": "1",
+            "PHASES": phases,
+            **(extra_env or {}),
+        },
         check=False,
         capture_output=True,
         text=True,
@@ -42,6 +49,21 @@ def test_plan_gates_high_concurrency_with_one_wave_smoke() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "concurrencies=128 512 waves=1" in result.stdout
+
+
+def test_plan_allows_single_variable_fixed_layout_diagnostic() -> None:
+    result = _print_plan(
+        "low",
+        {
+            "TRTLLM_LAYOUT": "8x4",
+            "LOW_CONCURRENCIES": "1",
+            "LOW_WAVES": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "layout=8x4,switch_m=256" in result.stdout
+    assert "concurrencies=1 waves=1" in result.stdout
 
 
 def test_plan_rejects_unknown_phase() -> None:
