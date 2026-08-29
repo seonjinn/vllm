@@ -8,11 +8,12 @@ import subprocess
 from pathlib import Path
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
+SUBMIT_SCRIPT = EXPERIMENT_DIR / "submit_gsm8k_correctness.sh"
 
 
 def test_smoke_plan_keeps_matched_tp8_correctness_contract() -> None:
     result = subprocess.run(
-        ["bash", str(EXPERIMENT_DIR / "submit_gsm8k_correctness.sh")],
+        ["bash", str(SUBMIT_SCRIPT)],
         env={**os.environ, "PRINT_PLAN": "1", "PHASE": "smoke"},
         check=True,
         capture_output=True,
@@ -33,7 +34,7 @@ def test_smoke_plan_keeps_matched_tp8_correctness_contract() -> None:
 
 def test_full_plan_uses_all_1319_examples() -> None:
     result = subprocess.run(
-        ["bash", str(EXPERIMENT_DIR / "submit_gsm8k_correctness.sh")],
+        ["bash", str(SUBMIT_SCRIPT)],
         env={
             **os.environ,
             "PRINT_PLAN": "1",
@@ -53,7 +54,7 @@ def test_full_plan_uses_all_1319_examples() -> None:
 
 def test_plan_rejects_unknown_correctness_arm() -> None:
     result = subprocess.run(
-        ["bash", str(EXPERIMENT_DIR / "submit_gsm8k_correctness.sh")],
+        ["bash", str(SUBMIT_SCRIPT)],
         env={**os.environ, "PRINT_PLAN": "1", "ARMS": "unknown"},
         capture_output=True,
         text=True,
@@ -61,3 +62,11 @@ def test_plan_rejects_unknown_correctness_arm() -> None:
 
     assert result.returncode == 2
     assert "Unsupported correctness arm: unknown" in result.stderr
+
+
+def test_server_uses_installed_vllm_extensions() -> None:
+    source = SUBMIT_SCRIPT.read_text()
+
+    assert 'PYTHONPATH="${BENCH_ROOT}"' in source
+    assert "VLLM_SUBPROCESS_PYTHONPATH=" in source
+    assert 'PYTHONPATH="${BENCH_ROOT}:${SOURCE_ROOT}"' not in source
