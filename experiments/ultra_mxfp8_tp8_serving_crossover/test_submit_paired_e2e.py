@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
 SUBMIT_SCRIPT = EXPERIMENT_DIR / "submit_paired_e2e.sh"
+
+
+def test_submit_script_is_executable() -> None:
+    assert SUBMIT_SCRIPT.stat().st_mode & stat.S_IXUSR
 
 
 def test_plan_uses_reverse_order_same_allocation_contract() -> None:
