@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("submit_adaptive_oracle.sh")
+
+
+def test_adaptive_oracle_submitter_is_executable() -> None:
+    assert SCRIPT.stat().st_mode & stat.S_IXUSR
 
 
 def test_adaptive_oracle_plan_is_layout_partitioned() -> None:
