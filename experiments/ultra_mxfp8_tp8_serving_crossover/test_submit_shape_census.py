@@ -28,6 +28,15 @@ def test_plan_uses_tp8_and_ten_low_concurrency_waves() -> None:
     assert "concurrencies=1 2 4 8 16 32 waves=10" in result.stdout
 
 
+def test_plan_pins_trace_aware_benchmark_export_contract() -> None:
+    result = _print_plan("low")
+
+    assert result.returncode == 0, result.stderr
+    assert "benchmark_commit=5504d071e6c082f7dc82347c8eabfc9cad9740ef" in result.stdout
+    assert "slurm_extra_exports=SOURCE_ROOT FLASHINFER_ROOT" in result.stdout
+    assert "MXFP8_TACTIC_TRACE_DIR" in result.stdout
+
+
 def test_plan_gates_high_concurrency_with_one_wave_smoke() -> None:
     result = _print_plan("high-smoke")
 

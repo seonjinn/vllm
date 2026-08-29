@@ -9,8 +9,8 @@ readonly ACCOUNT=${ACCOUNT:-coreai_dlalgo_llm}
 readonly PARTITION=${PARTITION:-gb200}
 readonly QOS=${QOS:-user-restrictions}
 readonly REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-/home/sna/vllm-v0271-ultra-tp8-crossover}
-readonly BENCH_ROOT=${BENCH_ROOT:-/home/sna/vllm-benchmark-serving-crossover/4f2ca9d1f0b1}
-readonly BENCH_COMMIT=${BENCH_COMMIT:-4f2ca9d1f0b176394022a9867f4c35bbbdbd34c9}
+readonly BENCH_COMMIT=${BENCH_COMMIT:-5504d071e6c082f7dc82347c8eabfc9cad9740ef}
+readonly BENCH_ROOT=${BENCH_ROOT:-/home/sna/vllm-benchmark-serving-crossover/${BENCH_COMMIT:0:12}}
 readonly FLASHINFER_ROOT=${FLASHINFER_ROOT:-/home/sna/flashinfer-mxfp8-pins/cec5e66dbd75a253edb5a819b2403bf410ca3223}
 readonly FLASHINFER_COMMIT=${FLASHINFER_COMMIT:-cec5e66dbd75a253edb5a819b2403bf410ca3223}
 readonly CONTAINER_IMAGE=${CONTAINER_IMAGE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/vllm_openai_v0271_aarch64_20260813_2688476.sqsh}
@@ -22,6 +22,7 @@ readonly STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 readonly RESULT_ROOT=${RESULT_ROOT:-/lustre/fsw/coreai_dlalgo_llm/users/sna/results/mxfp8_tp8_serving_crossover_${STAMP}}
 readonly PHASES=${PHASES:-"low high-smoke"}
 readonly PRINT_PLAN=${PRINT_PLAN:-0}
+readonly SBATCH_EXTRA_EXPORT_NAMES="SOURCE_ROOT FLASHINFER_ROOT FLASHINFER_COMMIT EXPECTED_CONTAINER_SHA256 EXPECTED_VLLM_VERSION MXFP8_TACTIC_TRACE_DIR MXFP8_TACTIC_TRACE_PHASE MXFP8_TACTIC_BACKEND MXFP8_TACTIC_SCALE_LAYOUT"
 
 phase_config() {
   case "$1" in
@@ -49,6 +50,8 @@ print_plan() {
   echo "workload=ISL1000,OSL10000"
   echo "layout=adaptive,switch_m=256"
   echo "ray_install_if_missing=1,node_local_tmp=true"
+  echo "benchmark_commit=${BENCH_COMMIT}"
+  echo "slurm_extra_exports=${SBATCH_EXTRA_EXPORT_NAMES}"
   for phase in ${PHASES}; do
     phase_config "${phase}"
     echo "phase=${phase} concurrencies=${PHASE_BSIZES} waves=${PHASE_MULT}"
@@ -151,6 +154,7 @@ submit_phase() {
     HF_HOME_OVERRIDE="/raid/scratch/sna/mxfp8_tp8_crossover/${STAMP}/hf" \
     RAY_INSTALL_IF_MISSING=1 \
     RAY_INSTALL_PACKAGE='ray[default]' \
+    SBATCH_EXTRA_EXPORT_NAMES="${SBATCH_EXTRA_EXPORT_NAMES}" \
     SBATCH_EXPORT_MODE=all \
     SBATCH_TEST_ONLY="${test_only}" \
     DRY_RUN=0 \
