@@ -105,7 +105,15 @@ if [[ $(remote awk -F= '$1 == "sha256" {print $2}' \
   echo "Container metadata does not match ${EXPECTED_CONTAINER_SHA256}" >&2
   exit 1
 fi
+actual_container_sha=$(remote sha256sum "${CONTAINER_IMAGE}" | awk '{print $1}')
+if [[ "${actual_container_sha}" != "${EXPECTED_CONTAINER_SHA256}" ]]; then
+  echo "Container bytes do not match ${EXPECTED_CONTAINER_SHA256}" >&2
+  exit 1
+fi
 remote test -f "${MODEL_PATH}/config.json"
+model_config_sha=$(remote sha256sum "${MODEL_PATH}/config.json" | awk '{print $1}')
+model_index_sha=$(remote sha256sum \
+  "${MODEL_PATH}/model.safetensors.index.json" | awk '{print $1}')
 
 readonly EXP_DIR_REMOTE="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
 readonly LAUNCHER="${BENCH_ROOT}/experiments/backend_sweep_v0271/submit_mxfp8_linear_workloads_tp8.sh"
@@ -178,6 +186,21 @@ submit_phase() {
 
 print_plan
 remote mkdir -p "${RESULT_ROOT}"
+remote mkdir -p "${RESULT_ROOT}/slurm"
+{
+  echo "source_commit=${SOURCE_COMMIT}"
+  echo "benchmark_commit=${BENCH_COMMIT}"
+  echo "flashinfer_commit=${FLASHINFER_COMMIT}"
+  echo "container=${CONTAINER_IMAGE}"
+  echo "container_sha256=${actual_container_sha}"
+  echo "model=${MODEL_PATH}"
+  echo "model_config_sha256=${model_config_sha}"
+  echo "model_index_sha256=${model_index_sha}"
+  echo "parallelism=TP8,DP1,EP8"
+  echo "workload=ISL1000,OSL10000"
+  echo "layout=adaptive,switch_m=256"
+  echo "phases=${PHASES}"
+} | remote tee "${RESULT_ROOT}/manifest.txt" >/dev/null
 for phase in ${PHASES}; do
   echo "Preflight: ${phase}"
   submit_phase "${phase}" 1
