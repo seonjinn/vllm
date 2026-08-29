@@ -56,6 +56,7 @@ def _write_allocation(
     osl: int = 10_000,
     raw_updates: dict[tuple[str, int], dict] | None = None,
     duplicate_raw: tuple[str, int] | None = None,
+    write_outer: bool = True,
 ) -> Path:
     slug = "-then-".join(order)
     allocation = root / "runs" / slug / "flashinfer_cutedsl" / "rep0" / "shortin"
@@ -100,7 +101,8 @@ def _write_allocation(
             }
         )
     outer_path = allocation / "result_shortin.json"
-    outer_path.write_text(json.dumps({"order": list(order), "runs": runs}) + "\n")
+    if write_outer:
+        outer_path.write_text(json.dumps({"order": list(order), "runs": runs}) + "\n")
     return outer_path
 
 
@@ -177,6 +179,34 @@ def test_cli_summarizes_two_reverse_order_allocations_deterministically(
     assert second.returncode == 0, second.stderr
     assert (output_dir / "summary.json").read_bytes() == json_bytes
     assert (output_dir / "summary.csv").read_bytes() == csv_bytes
+
+
+def test_cli_discovers_harness_tree_without_outer_results(tmp_path: Path) -> None:
+    root = tmp_path / "results"
+    _write_allocation(
+        root,
+        order=FORWARD,
+        throughputs={
+            "cutedsl": {8: 100.0, 32: 200.0},
+            "adaptive-lookup": {8: 110.0, 32: 220.0},
+        },
+        write_outer=False,
+    )
+    _write_allocation(
+        root,
+        order=REVERSE,
+        throughputs={
+            "cutedsl": {8: 100.0, 32: 200.0},
+            "adaptive-lookup": {8: 120.0, 32: 240.0},
+        },
+        write_outer=False,
+    )
+
+    result = _run(root, tmp_path / "summary")
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((tmp_path / "summary" / "summary.json").read_text())
+    assert summary["orders"] == [list(FORWARD), list(REVERSE)]
 
 
 def test_cli_rejects_missing_reverse_order_allocation(tmp_path: Path) -> None:

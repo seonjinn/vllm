@@ -31,6 +31,33 @@ def _find_outer_results(root: Path) -> list[tuple[Path, dict[str, Any]]]:
         payload = _load_json(path)
         if isinstance(payload, dict) and "order" in payload and "runs" in payload:
             results.append((path, payload))
+    if results:
+        return results
+
+    for order in (FORWARD, REVERSE):
+        order_slug = "-then-".join(order)
+        for paired_dir in sorted((root / "runs" / order_slug).glob("**/paired")):
+            runs = []
+            for arm in order:
+                result_path = paired_dir / arm / "result.json"
+                if not result_path.is_file():
+                    break
+                embedded = _load_json(result_path)
+                runs.append(
+                    {
+                        "arm": arm,
+                        "result": embedded,
+                        "result_path": str(result_path),
+                    }
+                )
+            if len(runs) == len(order):
+                virtual_outer_path = paired_dir.parent / "result_shortin.json"
+                results.append(
+                    (
+                        virtual_outer_path,
+                        {"order": list(order), "runs": runs},
+                    )
+                )
     return results
 
 
