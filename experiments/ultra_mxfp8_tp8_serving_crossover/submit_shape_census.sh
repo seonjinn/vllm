@@ -130,6 +130,9 @@ submit_phase() {
     REPETITIONS=0 \
     STAMP_PREFIX="${phase_stamp}" \
     RUN_ROOT_BASE="${phase_root}" \
+    SBATCH_OUT_DIR="${RESULT_ROOT}/slurm" \
+    JOB_PREFIX="${ACCOUNT}-sna.mx-tp8-census-${phase}" \
+    SUBMIT_DELAY_S=0 \
     WALLTIME="${PHASE_WALLTIME}" \
     CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
     VLLM_SOURCE_ROOT="${SOURCE_ROOT}" \
