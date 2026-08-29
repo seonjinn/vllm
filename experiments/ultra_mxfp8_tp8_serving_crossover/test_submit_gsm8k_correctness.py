@@ -64,10 +64,11 @@ def test_plan_rejects_unknown_correctness_arm() -> None:
     assert "Unsupported correctness arm: unknown" in result.stderr
 
 
-def test_server_uses_installed_vllm_extensions() -> None:
+def test_server_uses_installed_vllm_extensions_and_tactic_hook() -> None:
     source = SUBMIT_SCRIPT.read_text()
 
-    assert 'PYTHONPATH="${BENCH_ROOT}"' in source
+    assert 'PYTHONPATH="${TACTIC_RUNTIME_ROOT}:${BENCH_ROOT}"' in source
     assert "VLLM_SUBPROCESS_PYTHONPATH=" in source
     assert "PYTHONDONTWRITEBYTECODE=1" in source
     assert 'PYTHONPATH="${BENCH_ROOT}:${SOURCE_ROOT}"' not in source
+    assert 'PYTHONPATH="${SOURCE_ROOT}' not in source

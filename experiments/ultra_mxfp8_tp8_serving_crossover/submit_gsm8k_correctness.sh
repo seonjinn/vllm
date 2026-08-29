@@ -11,7 +11,8 @@ readonly QOS=${QOS:-user-restrictions}
 readonly REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-/home/sna/vllm-v0271-ultra-tp8-crossover}
 readonly SOURCE_COMMIT=${SOURCE_COMMIT:-e3c4137b83bd77d63245b28f99c01b79a7bf7a6c}
 readonly SOURCE_ROOT=${SOURCE_ROOT:-/home/sna/vllm-v0271-mxfp8-pins/${SOURCE_COMMIT}}
-readonly BENCH_COMMIT=${BENCH_COMMIT:-6f554151054f9ba3ddb2ad1174c811f8c7a348a8}
+readonly TACTIC_RUNTIME_ROOT="${SOURCE_ROOT}/experiments/ultra_mxfp8_all_observed_tactics"
+readonly BENCH_COMMIT=${BENCH_COMMIT:-85de736cd35e0873839fa6c6767b35acf9cb1b53}
 readonly BENCH_REPO=${BENCH_REPO:-/home/sna/vllm-benchmark-layout-ncu/4f2ca9d1f0b1}
 readonly BENCH_ROOT=${BENCH_ROOT:-/home/sna/vllm-benchmark-serving-crossover/${BENCH_COMMIT:0:12}}
 readonly FLASHINFER_COMMIT=${FLASHINFER_COMMIT:-cec5e66dbd75a253edb5a819b2403bf410ca3223}
@@ -115,6 +116,7 @@ readonly LAUNCHER="${BENCH_ROOT}/experiments/backend_sweep_v0271/submit_mxfp8_li
 remote test -s "${GSM8K_DATASET}"
 remote test -s "${BENCH_PY}"
 remote test -s "${LOOKUP_PATH}"
+remote test -s "${TACTIC_RUNTIME_ROOT}/sitecustomize.py"
 
 submit_arm() {
   local arm=$1
@@ -164,7 +166,7 @@ submit_arm() {
     VLLM_MXFP8_TRTLLM_LAYOUT="${ARM_LAYOUT}" \
     VLLM_MXFP8_TRTLLM_SWITCH_M="${TRTLLM_SWITCH_M}" \
     VLLM_MXFP8_TRTLLM_TACTICS= \
-    PYTHONPATH="${BENCH_ROOT}" \
+    PYTHONPATH="${TACTIC_RUNTIME_ROOT}:${BENCH_ROOT}" \
     VLLM_SUBPROCESS_PYTHONPATH= \
     SOURCE_ROOT="${SOURCE_ROOT}" \
     SOURCE_COMMIT="${SOURCE_COMMIT}" \
