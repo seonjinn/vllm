@@ -69,4 +69,5 @@ def test_server_uses_installed_vllm_extensions() -> None:
 
     assert 'PYTHONPATH="${BENCH_ROOT}"' in source
     assert "VLLM_SUBPROCESS_PYTHONPATH=" in source
+    assert "PYTHONDONTWRITEBYTECODE=1" in source
     assert 'PYTHONPATH="${BENCH_ROOT}:${SOURCE_ROOT}"' not in source
