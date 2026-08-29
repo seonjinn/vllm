@@ -72,3 +72,9 @@ def test_server_uses_installed_vllm_extensions_and_tactic_hook() -> None:
     assert "PYTHONDONTWRITEBYTECODE=1" in source
     assert 'PYTHONPATH="${BENCH_ROOT}:${SOURCE_ROOT}"' not in source
     assert 'PYTHONPATH="${SOURCE_ROOT}' not in source
+
+
+def test_correctness_run_disables_unrelated_flashinfer_autotuning() -> None:
+    source = SUBMIT_SCRIPT.read_text()
+
+    assert "ENABLE_FLASHINFER_AUTOTUNE=0" in source
