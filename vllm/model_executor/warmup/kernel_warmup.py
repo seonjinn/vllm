@@ -221,10 +221,12 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
-def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ...]:
+def _flashinfer_autotune_runs(
+    runner: "GPUModelRunner",
+) -> tuple[tuple[int, bool | None], ...]:
     max_tokens = runner.scheduler_config.max_num_batched_tokens
     if envs.VLLM_MXFP8_TRTLLM_LAYOUT != "adaptive":
-        return (max_tokens,)
+        return ((max_tokens, None),)
 
     from vllm.model_executor.kernels.linear import (
         FlashInferTrtllmMxfp8LinearKernel,
@@ -236,9 +238,9 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
             if isinstance(kernel, FlashInferTrtllmMxfp8LinearKernel):
                 switch_m = envs.VLLM_MXFP8_TRTLLM_SWITCH_M
                 if 0 < switch_m < max_tokens:
-                    return (max_tokens, switch_m)
-                return (max_tokens,)
-    return (max_tokens,)
+                    return ((max_tokens, None), (max_tokens, True))
+                return ((max_tokens, None),)
+    return ((max_tokens, None),)
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
@@ -278,8 +280,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
 
     # We skip EPLB here since we don't want to record dummy metrics.
     # When autotuning with number of tokens m, FlashInfer tunes operations for
-    # all token counts up to m. Adaptive MXFP8 TRTLLM still needs one run per
-    # scale layout because the layout is part of the GEMM tuning key.
+    # all token counts up to m. Adaptive MXFP8 TRTLLM still needs one max-token
+    # run per scale layout because the layout is part of the GEMM tuning key.
     # Randomize inputs to avoid every token pick the same experts,
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
@@ -308,8 +310,17 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             torch.inference_mode(),
             _flashinfer_autotune_context(autotune_kwargs),
         ):
-            for num_tokens in _flashinfer_autotune_token_counts(runner):
-                runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+            for num_tokens, use_8x4 in _flashinfer_autotune_runs(runner):
+                if use_8x4 is None:
+                    runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
+                    continue
+
+                from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+                    _mxfp8_trtllm_layout_override,
+                )
+
+                with _mxfp8_trtllm_layout_override(use_8x4=use_8x4):
+                    runner._dummy_run(num_tokens=num_tokens, **dummy_run_kwargs)
     finally:
         set_autotune_process_group(None)
 

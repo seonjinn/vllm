@@ -16,6 +16,7 @@ from vllm.model_executor.kernels.linear import (
     Mxfp8LinearLayerConfig,
     init_mxfp8_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8 import flashinfer as mxfp8_flashinfer
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
@@ -67,6 +68,16 @@ def test_mxfp8_trtllm_adaptive_switch_is_configurable(monkeypatch) -> None:
 
     assert mxfp8_trtllm_use_8x4_sf_layout(32)
     assert not mxfp8_trtllm_use_8x4_sf_layout(33)
+
+
+def test_mxfp8_trtllm_layout_override_is_scoped(monkeypatch) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "256")
+
+    assert not mxfp8_trtllm_use_8x4_sf_layout(16_384)
+    with mxfp8_flashinfer._mxfp8_trtllm_layout_override(use_8x4=True):
+        assert mxfp8_trtllm_use_8x4_sf_layout(16_384)
+    assert not mxfp8_trtllm_use_8x4_sf_layout(16_384)
 
 
 def test_mxfp8_trtllm_layout_policy_rejects_invalid_value(monkeypatch) -> None:

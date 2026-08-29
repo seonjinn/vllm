@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cache
 from typing import NamedTuple
 
@@ -22,6 +25,10 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_TRTLLM_LAYOUT"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_TRTLLM_SWITCH_M"
+_MXFP8_TRTLLM_LAYOUT_OVERRIDE = ContextVar[bool | None](
+    "mxfp8_trtllm_layout_override",
+    default=None,
+)
 
 
 class _Mxfp8TrtllmLayoutConfig(NamedTuple):
@@ -44,6 +51,10 @@ def _mxfp8_trtllm_layout_config() -> _Mxfp8TrtllmLayoutConfig:
 
 
 def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
+    override = _MXFP8_TRTLLM_LAYOUT_OVERRIDE.get()
+    if override is not None:
+        return override
+
     config = _mxfp8_trtllm_layout_config()
     if config.policy == "8x4":
         return True
@@ -51,6 +62,15 @@ def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
         return False
     assert config.switch_m is not None
     return m <= config.switch_m
+
+
+@contextmanager
+def _mxfp8_trtllm_layout_override(*, use_8x4: bool) -> Generator[None, None, None]:
+    token = _MXFP8_TRTLLM_LAYOUT_OVERRIDE.set(use_8x4)
+    try:
+        yield
+    finally:
+        _MXFP8_TRTLLM_LAYOUT_OVERRIDE.reset(token)
 
 
 def _mxfp8_trtllm_linear_fixed_impl(

@@ -38,16 +38,16 @@ def _fake_runner(kernel: object, max_num_batched_tokens: int = 16_384) -> Any:
     )
 
 
-def test_adaptive_mxfp8_trtllm_autotune_warms_both_layouts(
+def test_adaptive_mxfp8_trtllm_autotune_warms_both_layouts_at_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_MXFP8_TRTLLM_LAYOUT", "adaptive")
     monkeypatch.setattr(envs, "VLLM_MXFP8_TRTLLM_SWITCH_M", 256)
     kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
 
-    token_counts = kernel_warmup._flashinfer_autotune_token_counts(_fake_runner(kernel))
+    runs = kernel_warmup._flashinfer_autotune_runs(_fake_runner(kernel))
 
-    assert token_counts == (16_384, 256)
+    assert runs == ((16_384, None), (16_384, True))
 
 
 @pytest.mark.parametrize(
