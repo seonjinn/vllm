@@ -209,6 +209,33 @@ def test_cli_discovers_harness_tree_without_outer_results(tmp_path: Path) -> Non
     assert summary["orders"] == [list(FORWARD), list(REVERSE)]
 
 
+def test_cli_discovers_mixed_outer_and_harness_results(tmp_path: Path) -> None:
+    root = tmp_path / "results"
+    _write_allocation(
+        root,
+        order=FORWARD,
+        throughputs={
+            "cutedsl": {8: 100.0, 32: 200.0},
+            "adaptive-lookup": {8: 110.0, 32: 220.0},
+        },
+        write_outer=False,
+    )
+    _write_allocation(
+        root,
+        order=REVERSE,
+        throughputs={
+            "cutedsl": {8: 100.0, 32: 200.0},
+            "adaptive-lookup": {8: 120.0, 32: 240.0},
+        },
+    )
+
+    result = _run(root, tmp_path / "summary")
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((tmp_path / "summary" / "summary.json").read_text())
+    assert summary["orders"] == [list(FORWARD), list(REVERSE)]
+
+
 def test_cli_rejects_missing_reverse_order_allocation(tmp_path: Path) -> None:
     root = tmp_path / "results"
     _write_allocation(

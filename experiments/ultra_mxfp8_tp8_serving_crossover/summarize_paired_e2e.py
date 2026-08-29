@@ -31,10 +31,16 @@ def _find_outer_results(root: Path) -> list[tuple[Path, dict[str, Any]]]:
         payload = _load_json(path)
         if isinstance(payload, dict) and "order" in payload and "runs" in payload:
             results.append((path, payload))
-    if results:
-        return results
+    found_orders = {
+        tuple(payload["order"])
+        for _, payload in results
+        if isinstance(payload.get("order"), list)
+        and all(isinstance(arm, str) for arm in payload["order"])
+    }
 
     for order in (FORWARD, REVERSE):
+        if order in found_orders:
+            continue
         order_slug = "-then-".join(order)
         for paired_dir in sorted((root / "runs" / order_slug).glob("**/paired")):
             runs = []
