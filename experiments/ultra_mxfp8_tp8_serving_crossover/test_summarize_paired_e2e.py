@@ -123,16 +123,24 @@ def _valid_tree(root: Path) -> None:
     )
 
 
-def _run(root: Path, output_dir: Path) -> subprocess.CompletedProcess[str]:
+def _run(
+    root: Path,
+    output_dir: Path,
+    *,
+    concurrencies: tuple[int, ...] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--root",
+        str(root),
+        "--output-dir",
+        str(output_dir),
+    ]
+    if concurrencies is not None:
+        command.extend(["--concurrencies", *(str(value) for value in concurrencies)])
     return subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "--root",
-            str(root),
-            "--output-dir",
-            str(output_dir),
-        ],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -218,6 +226,36 @@ def test_cli_rejects_missing_requested_concurrency(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "missing concurrency 32" in result.stderr
+
+
+def test_cli_validates_only_explicitly_requested_concurrency(tmp_path: Path) -> None:
+    root = tmp_path / "results"
+    _write_allocation(
+        root,
+        order=FORWARD,
+        throughputs={
+            "cutedsl": {8: 100.0, 32: 200.0},
+            "adaptive-lookup": {8: 110.0, 32: 220.0},
+        },
+        raw_updates={("adaptive-lookup", 32): {"failed": 1}},
+    )
+    _write_allocation(
+        root,
+        order=REVERSE,
+        throughputs={
+            "cutedsl": {8: 100.0},
+            "adaptive-lookup": {8: 120.0},
+        },
+    )
+
+    result = _run(root, tmp_path / "summary", concurrencies=(8,))
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((tmp_path / "summary" / "summary.json").read_text())
+    assert summary["concurrencies"] == [8]
+    assert summary["comparisons"][0][
+        "geometric_mean_throughput_ratio"
+    ] == pytest.approx(math.sqrt(1.32))
 
 
 def test_cli_rejects_duplicate_concurrency_row(tmp_path: Path) -> None:

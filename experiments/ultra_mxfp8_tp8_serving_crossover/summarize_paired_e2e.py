@@ -71,9 +71,10 @@ def _index_embedded_rows(
     if not isinstance(config, dict):
         raise ValueError(f"{arm}: embedded result is missing config")
     batch_sizes = config.get("batch_sizes")
-    if batch_sizes is not None and tuple(sorted(batch_sizes)) != requested:
+    if batch_sizes is not None and not set(requested).issubset(batch_sizes):
         raise ValueError(
-            f"{arm}: embedded batch_sizes={batch_sizes}, expected {list(requested)}"
+            f"{arm}: embedded batch_sizes={batch_sizes} does not contain "
+            f"requested {list(requested)}"
         )
     raw_rows = result.get("results")
     if not isinstance(raw_rows, list):
@@ -89,7 +90,11 @@ def _index_embedded_rows(
             )
         rows[concurrency] = row
     _validate_concurrency_set(
-        rows, arm=arm, requested=requested, source="embedded rows"
+        rows,
+        arm=arm,
+        requested=requested,
+        source="embedded rows",
+        allow_unexpected=True,
     )
     return rows
 
@@ -100,6 +105,7 @@ def _validate_concurrency_set(
     arm: str,
     requested: tuple[int, ...],
     source: str,
+    allow_unexpected: bool = False,
 ) -> None:
     expected = set(requested)
     actual = set(rows)
@@ -107,7 +113,7 @@ def _validate_concurrency_set(
     if missing:
         raise ValueError(f"{arm}: missing concurrency {missing[0]} in {source}")
     unexpected = sorted(actual - expected)
-    if unexpected:
+    if unexpected and not allow_unexpected:
         raise ValueError(f"{arm}: unexpected concurrency {unexpected[0]} in {source}")
 
 
@@ -255,7 +261,11 @@ def _summarize_allocation(
         )
         raw_paths = _index_raw_results(arm_dir, arm=arm)
         _validate_concurrency_set(
-            raw_paths, arm=arm, requested=requested, source="raw results"
+            raw_paths,
+            arm=arm,
+            requested=requested,
+            source="raw results",
+            allow_unexpected=True,
         )
         by_arm[arm] = {
             concurrency: _validate_measurement(
