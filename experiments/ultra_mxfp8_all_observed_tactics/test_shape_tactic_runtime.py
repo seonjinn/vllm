@@ -55,6 +55,10 @@ def _wait_for_content(path: Path, expected: str, timeout_s: float = 2.0) -> None
     assert path.read_text().strip() == expected
 
 
+def _artifact_path(root: Path, kind: str, trace: ShapeTrace, suffix: str) -> Path:
+    return root / f"{kind}.{trace.process_id}.{suffix}"
+
+
 def test_resolve_rank_prefers_initialized_distributed_rank(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -69,7 +73,7 @@ def test_resolve_rank_prefers_initialized_distributed_rank(
 
     trace.record((1, 2304, 8192), CuteRunner(), 7, "default_autotuner")
 
-    row = json.loads((tmp_path / f"trace.{trace.pid}.jsonl").read_text())
+    row = json.loads(_artifact_path(tmp_path, "trace", trace, "jsonl").read_text())
     assert row["rank"] == "3"
 
 
@@ -84,15 +88,19 @@ def test_shape_trace_counts_repeated_dispatches_without_repeating_trace_rows(
     trace.record((1001, 2304, 8192), runner, 7, "default_autotuner")
     trace.finalize("test")
 
-    trace_rows = (tmp_path / f"trace.{trace.pid}.jsonl").read_text().splitlines()
-    count_rows = (tmp_path / f"counts.{trace.pid}.jsonl").read_text().splitlines()
+    trace_rows = (
+        _artifact_path(tmp_path, "trace", trace, "jsonl").read_text().splitlines()
+    )
+    count_rows = (
+        _artifact_path(tmp_path, "counts", trace, "jsonl").read_text().splitlines()
+    )
     assert len(trace_rows) == 1
     assert len(count_rows) == 1
     count = json.loads(count_rows[0])
     assert count["invocation_count"] == 3
     assert count["first_invocation_index"] == 1
     assert count["last_invocation_index"] == 3
-    assert (tmp_path / f"counts.{trace.pid}.complete").is_file()
+    assert _artifact_path(tmp_path, "counts", trace, "complete").is_file()
 
 
 def test_shape_trace_orders_fallback_before_tuned_tactic(tmp_path: Path) -> None:
@@ -106,7 +114,9 @@ def test_shape_trace_orders_fallback_before_tuned_tactic(tmp_path: Path) -> None
 
     rows = [
         json.loads(line)
-        for line in (tmp_path / f"counts.{trace.pid}.jsonl").read_text().splitlines()
+        for line in _artifact_path(tmp_path, "counts", trace, "jsonl")
+        .read_text()
+        .splitlines()
     ]
     by_tactic = {row["tactic"]: row for row in rows}
     assert by_tactic[-1]["first_invocation_index"] == 1
@@ -120,8 +130,8 @@ def test_shape_trace_acknowledges_each_snapshot_generation(
 ) -> None:
     trace = ShapeTrace(tmp_path, "baseline")
     runner = CuteRunner()
-    complete_path = tmp_path / f"counts.{trace.pid}.complete"
-    request_path = tmp_path / f"flush.{trace.pid}.request"
+    complete_path = _artifact_path(tmp_path, "counts", trace, "complete")
+    request_path = _artifact_path(tmp_path, "flush", trace, "request")
 
     trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
     request_path.write_text("first\n")
@@ -130,7 +140,7 @@ def test_shape_trace_acknowledges_each_snapshot_generation(
     trace.record((2, 2048, 8192), runner, 5, "default_autotuner")
     request_path.write_text("second\n")
     _wait_for_content(complete_path, "second")
-    count = json.loads((tmp_path / f"counts.{trace.pid}.jsonl").read_text())
+    count = json.loads(_artifact_path(tmp_path, "counts", trace, "jsonl").read_text())
     assert count["invocation_count"] == 2
 
 
@@ -139,8 +149,8 @@ def test_shape_trace_does_not_drop_request_replaced_during_snapshot_read(
 ) -> None:
     trace = ShapeTrace(tmp_path, "baseline")
     trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
-    request_path = tmp_path / f"flush.{trace.pid}.request"
-    complete_path = tmp_path / f"counts.{trace.pid}.complete"
+    request_path = _artifact_path(tmp_path, "flush", trace, "request")
+    complete_path = _artifact_path(tmp_path, "counts", trace, "complete")
     original_read_text = Path.read_text
     replacement_sent = False
 
@@ -166,7 +176,7 @@ def test_exit_finalize_preserves_request_acknowledgement(tmp_path: Path) -> None
     assert trace.finalize("request-token")
     assert trace.finalize()
 
-    complete_path = tmp_path / f"counts.{trace.pid}.complete"
+    complete_path = _artifact_path(tmp_path, "counts", trace, "complete")
     assert complete_path.read_text().strip() == "request-token"
 
 
@@ -182,7 +192,9 @@ def test_shape_trace_flush_request_does_not_reenter_snapshot_write(
         nonlocal request_sent
         if not request_sent:
             request_sent = True
-            (tmp_path / f"flush.{trace.pid}.request").write_text("during-flush\n")
+            _artifact_path(tmp_path, "flush", trace, "request").write_text(
+                "during-flush\n"
+            )
             time.sleep(0.05)
         return original_replace(path, target)
 
@@ -190,7 +202,9 @@ def test_shape_trace_flush_request_does_not_reenter_snapshot_write(
 
     trace.flush()
 
-    _wait_for_content(tmp_path / f"counts.{trace.pid}.complete", "during-flush")
+    _wait_for_content(
+        _artifact_path(tmp_path, "counts", trace, "complete"), "during-flush"
+    )
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
@@ -225,9 +239,26 @@ def test_shape_trace_resets_process_local_state_after_fork(tmp_path: Path) -> No
     parent_pid, child_pid, exit_code = map(int, result.stdout.split())
     assert exit_code == 0
     assert child_pid != parent_pid
-    assert (tmp_path / f"trace.{child_pid}.jsonl").is_file()
-    assert (tmp_path / f"counts.{child_pid}.complete").is_file()
-    assert not (tmp_path / f"trace.{parent_pid}.jsonl").exists()
+    traces = list(tmp_path.glob(f"trace.*.{child_pid}.jsonl"))
+    completions = list(tmp_path.glob(f"counts.*.{child_pid}.complete"))
+    assert len(traces) == 1
+    assert len(completions) == 1
+    assert not list(tmp_path.glob(f"trace.*.{parent_pid}.jsonl"))
+
+
+def test_shape_trace_uses_host_and_pid_in_artifact_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("socket.gethostname", lambda: "gb200/node:7")
+
+    trace = ShapeTrace(tmp_path, "baseline")
+    trace.record((2, 2048, 8192), CuteRunner(), 5, "default_autotuner")
+    trace.finalize()
+
+    assert trace.process_id == f"gb200_node_7.{trace.pid}"
+    assert _artifact_path(tmp_path, "trace", trace, "jsonl").is_file()
+    complete = _artifact_path(tmp_path, "counts", trace, "complete")
+    assert complete.read_text().strip() == "atexit"
 
 
 def test_extract_mnk_flattens_all_activation_batch_dimensions() -> None:
@@ -484,8 +515,8 @@ def test_dispatcher_does_not_trace_autotuner_profiling_calls(tmp_path: Path) -> 
     trace.finalize()
 
     assert selected == (runner, 7)
-    assert not (tmp_path / f"trace.{trace.pid}.jsonl").exists()
-    assert not (tmp_path / f"counts.{trace.pid}.jsonl").exists()
+    assert not _artifact_path(tmp_path, "trace", trace, "jsonl").exists()
+    assert not _artifact_path(tmp_path, "counts", trace, "jsonl").exists()
 
 
 def test_dispatcher_delegates_lookup_hit_during_autotuner_profiling(

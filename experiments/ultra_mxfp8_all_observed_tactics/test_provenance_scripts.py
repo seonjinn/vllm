@@ -34,7 +34,7 @@ def test_request_trace_flush_finalizes_live_worker_without_stopping_it(
                 "signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
                 "trace.record((2, 2048, 8192), object(), 5, "
                 "'default_autotuner')\n"
-                "print(os.getpid(), flush=True)\n"
+                "print(trace.process_id, flush=True)\n"
                 "while True:\n"
                 "    signal.pause()\n"
             ),
@@ -45,9 +45,9 @@ def test_request_trace_flush_finalizes_live_worker_without_stopping_it(
     )
     try:
         assert worker.stdout is not None
-        pid = int(worker.stdout.readline())
+        process_id = worker.stdout.readline().strip()
         deadline = time.monotonic() + 2
-        trace_path = tmp_path / f"trace.{pid}.jsonl"
+        trace_path = tmp_path / f"trace.{process_id}.jsonl"
         while not trace_path.is_file() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert trace_path.is_file()
@@ -66,8 +66,8 @@ def test_request_trace_flush_finalizes_live_worker_without_stopping_it(
         )
 
         assert result.returncode == 0, result.stderr
-        assert (tmp_path / f"counts.{pid}.complete").is_file()
-        count = json.loads((tmp_path / f"counts.{pid}.jsonl").read_text())
+        assert (tmp_path / f"counts.{process_id}.complete").is_file()
+        count = json.loads((tmp_path / f"counts.{process_id}.jsonl").read_text())
         assert count["invocation_count"] == 1
         assert worker.poll() is None
     finally:

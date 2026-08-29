@@ -203,11 +203,18 @@ class ShapeTrace:
             os.register_at_fork(after_in_child=self._mark_fork_child)
 
     def _initialize_process_state(self, pid: int) -> None:
-        self._path = self._directory / f"trace.{pid}.jsonl"
-        self._count_path = self._directory / f"counts.{pid}.jsonl"
-        self._complete_path = self._directory / f"counts.{pid}.complete"
-        self._flush_request_path = self._directory / f"flush.{pid}.request"
-        self._flush_processing_path = self._directory / f"flush.{pid}.processing"
+        host = "".join(
+            character if character.isalnum() or character in "_.-" else "_"
+            for character in socket.gethostname()
+        )
+        self.process_id = f"{host}.{pid}"
+        self._path = self._directory / f"trace.{self.process_id}.jsonl"
+        self._count_path = self._directory / f"counts.{self.process_id}.jsonl"
+        self._complete_path = self._directory / f"counts.{self.process_id}.complete"
+        self._flush_request_path = self._directory / f"flush.{self.process_id}.request"
+        self._flush_processing_path = (
+            self._directory / f"flush.{self.process_id}.processing"
+        )
         self._seen: set[tuple[Shape, str, str, str]] = set()
         self._counts: dict[tuple[Shape, str, str, str], dict[str, Any]] = {}
         self._invocation_index = 0
@@ -284,6 +291,10 @@ class ShapeTrace:
             if not self._write_counts_locked():
                 return False
             if token is None:
+                if not self._complete_path.exists():
+                    temporary = Path(f"{self._complete_path}.tmp")
+                    temporary.write_text("atexit\n")
+                    temporary.replace(self._complete_path)
                 return True
             temporary = Path(f"{self._complete_path}.tmp")
             temporary.write_text(f"{token}\n")

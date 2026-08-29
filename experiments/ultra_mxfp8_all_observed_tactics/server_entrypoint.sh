@@ -54,9 +54,9 @@ record_cudagraph_evidence() {
 request_trace_flush() {
   local trace_dir=$1
   local timeout_s=$2
-  local trace pid actual_token
+  local trace process_id pid actual_token
   local token="$$.${RANDOM}.${SECONDS}"
-  local -a traces pids missing
+  local -a traces process_ids pids missing
   shopt -s nullglob
   traces=("${trace_dir}"/trace.*.jsonl)
   if ((${#traces[@]} == 0)); then
@@ -64,31 +64,36 @@ request_trace_flush() {
     return 1
   fi
   for trace in "${traces[@]}"; do
-    pid=$(basename "${trace}")
-    pid=${pid#trace.}
-    pid=${pid%.jsonl}
+    process_id=$(basename "${trace}")
+    process_id=${process_id#trace.}
+    process_id=${process_id%.jsonl}
+    pid=${process_id##*.}
+    process_ids+=("${process_id}")
     pids+=("${pid}")
   done
-  for pid in "${pids[@]}"; do
-    rm -f "${trace_dir}/counts.${pid}.complete" \
-      "${trace_dir}/flush.${pid}.request" \
-      "${trace_dir}/flush.${pid}.request.tmp"
+  for index in "${!pids[@]}"; do
+    process_id=${process_ids[index]}
+    pid=${pids[index]}
+    rm -f "${trace_dir}/counts.${process_id}.complete" \
+      "${trace_dir}/flush.${process_id}.request" \
+      "${trace_dir}/flush.${process_id}.request.tmp"
     if ! kill -0 "${pid}" 2>/dev/null; then
-      echo "MXFP8 trace worker ${pid} exited before flush" >&2
+      echo "MXFP8 trace worker ${process_id} exited before flush" >&2
       return 1
     fi
-    printf '%s\n' "${token}" >"${trace_dir}/flush.${pid}.request.tmp"
-    mv "${trace_dir}/flush.${pid}.request.tmp" \
-      "${trace_dir}/flush.${pid}.request"
+    printf '%s\n' "${token}" >"${trace_dir}/flush.${process_id}.request.tmp"
+    mv "${trace_dir}/flush.${process_id}.request.tmp" \
+      "${trace_dir}/flush.${process_id}.request"
   done
   local deadline=$((SECONDS + timeout_s))
   while true; do
     missing=()
-    for pid in "${pids[@]}"; do
-      actual_token=$(cat "${trace_dir}/counts.${pid}.complete" 2>/dev/null || true)
-      if [[ ! -s "${trace_dir}/counts.${pid}.jsonl" ]] || \
+    for process_id in "${process_ids[@]}"; do
+      actual_token=$(cat \
+        "${trace_dir}/counts.${process_id}.complete" 2>/dev/null || true)
+      if [[ ! -s "${trace_dir}/counts.${process_id}.jsonl" ]] || \
         [[ "${actual_token}" != "${token}" ]]; then
-        missing+=("${pid}")
+        missing+=("${process_id}")
       fi
     done
     ((${#missing[@]} == 0)) && return 0
@@ -273,7 +278,7 @@ stop_server() {
   wait "${server_pid}" 2>/dev/null || true
 }
 publish_traces() {
-  local trace pid
+  local trace process_id
   local -a traces
   shopt -s nullglob
   traces=("${SCRATCH_ROOT}"/traces/trace.*.jsonl)
@@ -282,11 +287,11 @@ publish_traces() {
     return 1
   fi
   for trace in "${traces[@]}"; do
-    pid=$(basename "${trace}")
-    pid=${pid#trace.}
-    pid=${pid%.jsonl}
-    test -s "${SCRATCH_ROOT}/traces/counts.${pid}.jsonl"
-    test -f "${SCRATCH_ROOT}/traces/counts.${pid}.complete"
+    process_id=$(basename "${trace}")
+    process_id=${process_id#trace.}
+    process_id=${process_id%.jsonl}
+    test -s "${SCRATCH_ROOT}/traces/counts.${process_id}.jsonl"
+    test -f "${SCRATCH_ROOT}/traces/counts.${process_id}.complete"
   done
   local stage="${RUN_DIR}/traces.tmp.${SLURM_JOB_ID}"
   rm -rf "${stage}"
