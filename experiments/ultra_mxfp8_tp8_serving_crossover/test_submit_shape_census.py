@@ -24,6 +24,7 @@ def test_plan_uses_tp8_and_ten_low_concurrency_waves() -> None:
     assert result.returncode == 0, result.stderr
     assert "parallelism=TP8,DP1,EP8" in result.stdout
     assert "workload=ISL1000,OSL10000" in result.stdout
+    assert "ray_install_if_missing=1,node_local_tmp=true" in result.stdout
     assert "concurrencies=1 2 4 8 16 32 waves=10" in result.stdout
 
 

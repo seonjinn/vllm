@@ -48,6 +48,7 @@ print_plan() {
   echo "parallelism=TP8,DP1,EP8"
   echo "workload=ISL1000,OSL10000"
   echo "layout=adaptive,switch_m=256"
+  echo "ray_install_if_missing=1,node_local_tmp=true"
   for phase in ${PHASES}; do
     phase_config "${phase}"
     echo "phase=${phase} concurrencies=${PHASE_BSIZES} waves=${PHASE_MULT}"
@@ -148,7 +149,8 @@ submit_phase() {
     JOB_CACHE_DIR=/raid/scratch \
     CONTAINER_MOUNTS=/home/sna:/home/sna,/raid/scratch:/raid/scratch \
     HF_HOME_OVERRIDE="/raid/scratch/sna/mxfp8_tp8_crossover/${STAMP}/hf" \
-    RAY_INSTALL_IF_MISSING=0 \
+    RAY_INSTALL_IF_MISSING=1 \
+    RAY_INSTALL_PACKAGE='ray[default]' \
     SBATCH_EXPORT_MODE=all \
     SBATCH_TEST_ONLY="${test_only}" \
     DRY_RUN=0 \
