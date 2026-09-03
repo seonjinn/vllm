@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import sys
 import types
 from collections.abc import Generator
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +25,7 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     _mxfp8_trtllm_layout_config,
     _mxfp8_trtllm_linear_fixed_impl,
     _mxfp8_trtllm_tactics,
+    _trace_mxfp8_dense_shape,
     mxfp8_trtllm_linear,
     mxfp8_trtllm_tactic,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -36,6 +39,47 @@ def _kernel() -> FlashInferTrtllmMxfp8LinearKernel:
     kernel = object.__new__(FlashInferTrtllmMxfp8LinearKernel)
     kernel.config = Mxfp8LinearLayerConfig()
     return kernel
+
+
+def test_mxfp8_dense_shape_trace_records_unique_serving_shape(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE", "1")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.0.self_attn.qkv_proj"
+
+    for _ in range(2):
+        _trace_mxfp8_dense_shape(
+            layer=layer,
+            m=8,
+            n_logical=2304,
+            n_physical=2304,
+            k=8192,
+        )
+
+    records = [
+        json.loads(line)
+        for path in tmp_path.glob("dense_shapes_*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0] | {
+        "pid": records[0]["pid"],
+        "hostname": records[0]["hostname"],
+    } == {
+        "event": "mxfp8_dense_shape",
+        "family": "QKV",
+        "hostname": records[0]["hostname"],
+        "k": 8192,
+        "m": 8,
+        "n_logical": 2304,
+        "n_physical": 2304,
+        "pid": records[0]["pid"],
+        "prefix": "model.layers.0.self_attn.qkv_proj",
+    }
 
 
 @pytest.fixture(autouse=True)

@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+import socket
 from functools import cache
-from typing import NamedTuple
+from pathlib import Path
+from typing import Any, NamedTuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -23,6 +27,67 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_TRTLLM_LAYOUT"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_TRTLLM_SWITCH_M"
 MXFP8_TRTLLM_TACTICS_ENV = "VLLM_MXFP8_TRTLLM_TACTICS"
+_MXFP8_DENSE_TRACE_SEEN: set[tuple[str, int, int, int, int]] = set()
+
+
+def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
+    prefix = str(getattr(layer, "prefix", "")).lower()
+    if any(name in prefix for name in ("qkv_proj", "q_proj", "k_proj", "v_proj")):
+        return "QKV"
+    if any(name in prefix for name in ("o_proj", "out_proj", "attention.dense")):
+        return "O"
+    if any(name in prefix for name in ("gate_up_proj", "gate_proj", "up_proj")):
+        return "FC1"
+    if any(name in prefix for name in ("down_proj", "fc2", ".w2")):
+        return "FC2"
+    if "mamba" in prefix:
+        return "MambaProjection"
+    if any(name in prefix for name in ("mlp", "ffn", "expert")):
+        return "MLPOrExpertDense"
+    return "OtherDense"
+
+
+def _trace_mxfp8_dense_shape(
+    *,
+    layer: torch.nn.Module,
+    m: int,
+    n_logical: int,
+    n_physical: int,
+    k: int,
+) -> None:
+    enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "").strip().lower()
+    if enabled in ("", "0", "false", "no", "off"):
+        return
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return
+    trace_dir = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", "").strip()
+    if not trace_dir:
+        return
+
+    family = _mxfp8_dense_family(layer)
+    prefix = str(getattr(layer, "prefix", "unknown"))
+    shape = (family, int(m), int(n_logical), int(n_physical), int(k))
+    max_records = int(os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"))
+    if shape in _MXFP8_DENSE_TRACE_SEEN or len(_MXFP8_DENSE_TRACE_SEEN) >= max_records:
+        return
+    _MXFP8_DENSE_TRACE_SEEN.add(shape)
+
+    output_dir = Path(trace_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"dense_shapes_{socket.gethostname()}_{os.getpid()}.jsonl"
+    record = {
+        "event": "mxfp8_dense_shape",
+        "family": family,
+        "hostname": socket.gethostname(),
+        "k": int(k),
+        "m": int(m),
+        "n_logical": int(n_logical),
+        "n_physical": int(n_physical),
+        "pid": os.getpid(),
+        "prefix": prefix,
+    }
+    with output.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 class _Mxfp8TrtllmLayoutConfig(NamedTuple):
@@ -91,7 +156,7 @@ def _mxfp8_trtllm_runtime(
     device_type: str,
     device_index: int,
     use_8x4_sf_layout: bool,
-) -> tuple[object, torch.Tensor]:
+) -> tuple[Any, torch.Tensor]:
     from flashinfer.gemm.gemm_base import (
         DEFAULT_WORKSPACE_SIZE,
         _get_cache_buf,
@@ -133,7 +198,9 @@ def _mxfp8_trtllm_tactic_linear_impl(
     )
     runner, workspace = _mxfp8_trtllm_runtime(
         x.device.type,
-        x.device.index if x.device.index is not None else torch.cuda.current_device(),
+        x.device.index
+        if x.device.index is not None
+        else torch.accelerator.current_device_index(),
         use_8x4_sf_layout,
     )
     result = runner.forward(
@@ -488,6 +555,14 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         output_size = layer._mxfp8_trtllm_output_size
         input_shape = x.shape
         input_2d = x.view(-1, K)
+
+        _trace_mxfp8_dense_shape(
+            layer=layer,
+            m=input_2d.shape[0],
+            n_logical=output_size,
+            n_physical=weight.shape[0],
+            k=K,
+        )
 
         output = mxfp8_trtllm_linear(
             input_2d,
