@@ -75,6 +75,7 @@ def test_mxfp8_dense_shape_trace_records_unique_serving_shape(
         "hostname": records[0]["hostname"],
         "k": 8192,
         "m": 8,
+        "n": 2304,
         "n_logical": 2304,
         "n_physical": 2304,
         "pid": records[0]["pid"],

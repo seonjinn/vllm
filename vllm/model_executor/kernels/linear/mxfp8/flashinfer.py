@@ -81,6 +81,7 @@ def _trace_mxfp8_dense_shape(
         "hostname": socket.gethostname(),
         "k": int(k),
         "m": int(m),
+        "n": int(n_physical),
         "n_logical": int(n_logical),
         "n_physical": int(n_physical),
         "pid": os.getpid(),
