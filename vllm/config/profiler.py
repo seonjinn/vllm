@@ -13,7 +13,7 @@ from vllm.utils.hashing import safe_hash
 
 logger = init_logger(__name__)
 
-ProfilerKind = Literal["torch", "cuda", "proton"]
+ProfilerKind = Literal["torch", "cuda", "proton", "ntrace"]
 ProtonBackend = Literal["cupti"]
 ProtonContext = Literal["shadow", "python"]
 ProtonData = Literal["tree", "trace"]
@@ -44,7 +44,8 @@ class ProfilerConfig:
 
     - 'torch': Use PyTorch profiler.
     - 'cuda': Use CUDA profiler.
-    - 'proton': Use Triton Proton profiler."""
+    - 'proton': Use Triton Proton profiler.
+    - 'ntrace': Use the optional ntrace CUPTI profiler."""
 
     torch_profiler_dir: str = ""
     """Directory to save torch profiler traces. Both AsyncLLM's CPU traces and

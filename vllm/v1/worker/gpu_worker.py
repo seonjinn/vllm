@@ -180,6 +180,7 @@ class Worker(WorkerBase):
         # Profiler wrapper is created lazily in profile() when start is called,
         # so we have all the information needed for proper trace naming.
         self.profiler: Any | None = None
+        self._ntrace_rollout_controller: Any | None = None
         self.profiler_config = vllm_config.profiler_config
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -436,6 +437,13 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+
+        if self.profiler_config.profiler == "ntrace":
+            from ntrace import NemoRLRolloutTraceController
+
+            self._ntrace_rollout_controller = NemoRLRolloutTraceController(
+                rank=self.rank
+            )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -729,7 +737,7 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            cuda_graph_memory_bytes = self._capture_model_with_ntrace()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -870,6 +878,17 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def _capture_model_with_ntrace(self) -> int:
+        controller = self._ntrace_rollout_controller
+        if controller is None:
+            return self.model_runner.capture_model()
+
+        token = controller.begin_engine_initialization(name="vllm_capture_model")
+        try:
+            return self.model_runner.capture_model()
+        finally:
+            controller.end_engine_initialization(token)
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
@@ -1144,6 +1163,17 @@ class Worker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        if self.profiler_config.profiler == "ntrace":
+            controller = self._ntrace_rollout_controller
+            if controller is None:
+                raise RuntimeError("ntrace profiler was not initialized")
+            if is_start:
+                controller.begin_rollout(step_id=profile_prefix)
+            else:
+                controller.finish_rollout()
+                controller.assert_trace_completed()
+            return
+
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:
             raise RuntimeError(

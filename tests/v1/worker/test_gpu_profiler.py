@@ -619,3 +619,44 @@ def test_gpu_worker_recreates_proton_profiler_for_each_run():
         call(worker.profiler_config, worker_name="second_rank1"),
     ]
     assert wrapper.return_value.start.call_count == 2
+
+
+def test_ntrace_profiler_config_is_accepted():
+    config = ProfilerConfig(profiler="ntrace")
+
+    assert config.profiler == "ntrace"
+
+
+def test_gpu_worker_traces_cuda_graph_capture_with_ntrace():
+    worker = MagicMock()
+    worker._ntrace_rollout_controller = MagicMock()
+    worker._ntrace_rollout_controller.begin_engine_initialization.return_value = (
+        "capture-token"
+    )
+    worker.model_runner.capture_model.return_value = 1234
+
+    result = Worker._capture_model_with_ntrace(worker)
+
+    assert result == 1234
+    worker._ntrace_rollout_controller.begin_engine_initialization.assert_called_once_with(
+        name="vllm_capture_model"
+    )
+    worker.model_runner.capture_model.assert_called_once_with()
+    worker._ntrace_rollout_controller.end_engine_initialization.assert_called_once_with(
+        "capture-token"
+    )
+
+
+def test_gpu_worker_dispatches_rollout_profile_to_ntrace():
+    worker = MagicMock()
+    worker.profiler_config.profiler = "ntrace"
+    worker._ntrace_rollout_controller = MagicMock()
+
+    Worker.profile(worker, profile_prefix="step-7")
+    Worker.profile(worker, is_start=False)
+
+    worker._ntrace_rollout_controller.begin_rollout.assert_called_once_with(
+        step_id="step-7"
+    )
+    worker._ntrace_rollout_controller.finish_rollout.assert_called_once_with()
+    worker._ntrace_rollout_controller.assert_trace_completed.assert_called_once_with()
