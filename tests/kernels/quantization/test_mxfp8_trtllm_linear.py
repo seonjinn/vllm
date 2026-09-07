@@ -19,13 +19,20 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp8_linear_kernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    MXFP8_TRTLLM_IMPL_ENV,
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
+    MXFP8_TRTLLM_TACTIC_POLICY_ENV,
     MXFP8_TRTLLM_TACTICS_ENV,
+    _mxfp8_trtllm_exact_cache,
+    _mxfp8_trtllm_exact_linear_impl,
+    _mxfp8_trtllm_impl,
     _mxfp8_trtllm_layout_config,
     _mxfp8_trtllm_linear_fixed_impl,
+    _mxfp8_trtllm_tactic_policy,
     _mxfp8_trtllm_tactics,
     _trace_mxfp8_dense_shape,
+    _tune_mxfp8_trtllm_exact_shape,
     mxfp8_trtllm_linear,
     mxfp8_trtllm_tactic,
     mxfp8_trtllm_use_8x4_sf_layout,
@@ -85,11 +92,17 @@ def test_mxfp8_dense_shape_trace_records_unique_serving_shape(
 
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
+    _mxfp8_trtllm_impl.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_tactic_policy.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
+    _mxfp8_trtllm_exact_cache.clear()
     yield
+    _mxfp8_trtllm_impl.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_tactic_policy.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
+    _mxfp8_trtllm_exact_cache.clear()
 
 
 @pytest.mark.parametrize(
@@ -127,9 +140,102 @@ def test_mxfp8_trtllm_layout_policy_rejects_invalid_value(monkeypatch) -> None:
 
 
 def test_mxfp8_trtllm_environment_variables_are_registered() -> None:
+    assert MXFP8_TRTLLM_IMPL_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_LAYOUT_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_SWITCH_M_ENV in envs.environment_variables
+    assert MXFP8_TRTLLM_TACTIC_POLICY_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_TACTICS_ENV in envs.environment_variables
+
+
+def test_mxfp8_trtllm_exact_tuner_profiles_both_layouts_and_all_tactics(
+    monkeypatch,
+) -> None:
+    profiled: list[tuple[bool, int]] = []
+
+    class Runner:
+        def __init__(self, use_8x4: bool) -> None:
+            self.use_8x4 = use_8x4
+
+        def get_valid_tactics(self, inputs, profile) -> list[int]:
+            assert profile.get_opt_shapes() == [(3, 512), (512, 256)]
+            return [1, 2] if self.use_8x4 else [7]
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_runtime",
+        lambda *args: (Runner(args[2]), torch.empty((32,), dtype=torch.int8)),
+    )
+
+    def time_candidate(*args, use_8x4_sf_layout: bool, tactic: int, **kwargs) -> float:
+        profiled.append((use_8x4_sf_layout, tactic))
+        return {
+            (True, -1): 8.0,
+            (True, 1): 5.0,
+            (True, 2): 6.0,
+            (False, -1): 7.0,
+            (False, 7): 4.0,
+        }[(use_8x4_sf_layout, tactic)]
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._time_mxfp8_trtllm_candidate",
+        time_candidate,
+    )
+
+    selected = _tune_mxfp8_trtllm_exact_shape(
+        torch.empty((3, 512), dtype=torch.bfloat16),
+        torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((4096,), dtype=torch.uint8),
+        candidate_layouts=(True, False),
+    )
+
+    assert profiled == [(True, -1), (True, 1), (True, 2), (False, -1), (False, 7)]
+    assert selected == (False, 7)
+
+
+def test_mxfp8_trtllm_exact_dispatch_caches_physical_shape(monkeypatch) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, "direct")
+    monkeypatch.setenv(MXFP8_TRTLLM_TACTIC_POLICY_ENV, "exact-shape")
+    tuning_calls: list[tuple[int, int, int]] = []
+    dispatch_calls: list[tuple[bool, int]] = []
+
+    def tune(x, weight, weight_scale, *, candidate_layouts):
+        tuning_calls.append((x.shape[0], weight.shape[0], weight.shape[1]))
+        assert candidate_layouts == (True, False)
+        return False, 7
+
+    def dispatch(
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        use_8x4_sf_layout,
+        tactic,
+    ) -> torch.Tensor:
+        dispatch_calls.append((use_8x4_sf_layout, tactic))
+        return torch.empty((x.shape[0], output_features), dtype=x.dtype)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._tune_mxfp8_trtllm_exact_shape",
+        tune,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_tactic_linear_impl",
+        dispatch,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty((4096,), dtype=torch.uint8)
+
+    for _ in range(2):
+        _mxfp8_trtllm_exact_linear_impl(
+            torch.empty((3, 512), dtype=torch.bfloat16),
+            weight,
+            weight_scale,
+            130,
+        )
+
+    assert tuning_calls == [(3, 256, 512)]
+    assert dispatch_calls == [(False, 7), (False, 7)]
 
 
 def test_mxfp8_trtllm_tactic_uses_exact_shape(monkeypatch) -> None:
