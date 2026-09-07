@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from enum import Enum
-import os
 
 import torch
 
@@ -45,6 +45,55 @@ def _mxfp8_dense_backend() -> str:
             f"{_SUPPORTED_MXFP8_DENSE_BACKENDS}, got {backend!r}"
         )
     return backend
+
+
+def mxfp8_trtllm_dense_enabled() -> bool:
+    return _mxfp8_dense_backend() == "trtllm"
+
+
+def mxfp8_trtllm_padded_n(logical_n: int) -> int:
+    if logical_n <= 0:
+        raise ValueError(f"MXFP8 output dimension must be positive, got {logical_n}")
+    return ((logical_n + 127) // 128) * 128
+
+
+def prepare_mxfp8_trtllm_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+    logical_n, k = weight.shape
+    scale_k = k // MXFP8_BLOCK_SIZE
+    padded_n = mxfp8_trtllm_padded_n(logical_n)
+    scale_2d = weight_scale[:logical_n, :scale_k].contiguous()
+
+    if padded_n != logical_n:
+        padded_weight = weight.new_zeros((padded_n, k))
+        padded_weight[:logical_n, :].copy_(weight)
+        padded_scale = scale_2d.new_zeros((padded_n, scale_k))
+        padded_scale[:logical_n, :].copy_(scale_2d)
+    else:
+        padded_weight = weight.contiguous()
+        padded_scale = scale_2d
+
+    shuffled_weight = (
+        shuffle_matrix_a(padded_weight.view(torch.uint8), 128)
+        .contiguous()
+        .view(MXFP8_VALUE_DTYPE)
+        .reshape(padded_n, k)
+    )
+    shuffled_scale = (
+        shuffle_matrix_sf_a(
+            padded_scale.view(torch.uint8),
+            128,
+            num_elts_per_sf=MXFP8_BLOCK_SIZE,
+        )
+        .contiguous()
+        .view(MXFP8_SCALE_DTYPE)
+        .reshape(padded_n * scale_k)
+    )
+    return shuffled_weight, shuffled_scale, logical_n
 
 
 def _mxfp8_use_8x4_sf_layout() -> bool:
@@ -256,10 +305,11 @@ class Mxfp8LinearOp:
         if backend in ("cutlass", "auto"):
             pad_to_128 = True
 
-        if pad_to_128:
-            M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
-        else:
-            M_padded = M_orig
+        M_padded = (
+            ((M_orig + min_dim - 1) // min_dim) * min_dim
+            if pad_to_128
+            else M_orig
+        )
         pad_rows = M_padded - M_orig
         if pad_rows > 0:
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))

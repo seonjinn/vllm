@@ -676,8 +676,8 @@ if has_flashinfer():
                         except ValueError:
                             continue
                         hint_map[(m, n, k)] = hint_tactic
-                    setattr(mm_mxfp8, "_trtllm_tactic_hints_raw", raw)
-                    setattr(mm_mxfp8, "_trtllm_tactic_hints_map", hint_map)
+                    mm_mxfp8._trtllm_tactic_hints_raw = raw
+                    mm_mxfp8._trtllm_tactic_hints_map = hint_map
                     return hint_map.get(shape_key)
 
                 def _trace_shape(tactic_value: int, tactic_source: str) -> None:
@@ -703,7 +703,7 @@ if has_flashinfer():
                     seen = getattr(mm_mxfp8, "_trtllm_shape_trace_seen", None)
                     if seen is None:
                         seen = set()
-                        setattr(mm_mxfp8, "_trtllm_shape_trace_seen", seen)
+                        mm_mxfp8._trtllm_shape_trace_seen = seen
                     if shape_key in seen:
                         return
                     max_shapes = int(
@@ -776,7 +776,7 @@ if has_flashinfer():
                     cache = getattr(mm_mxfp8, "_trtllm_tactic_cache", None)
                     if cache is None:
                         cache = {}
-                        setattr(mm_mxfp8, "_trtllm_tactic_cache", cache)
+                        mm_mxfp8._trtllm_tactic_cache = cache
 
                     cache_key = (
                         int(A.shape[0]),
@@ -787,12 +787,15 @@ if has_flashinfer():
                         str(out_dtype),
                         bool(use_8x4),
                     )
+                    tactic_is_cached = cache_key in cache
                     tactic = cache.get(cache_key, -1)
-                    tactic_source = "auto_cache" if cache_key in cache else "auto_default"
+                    tactic_source = (
+                        "auto_cache" if tactic_is_cached else "auto_default"
+                    )
                     is_capturing = getattr(
                         torch.cuda, "is_current_stream_capturing", lambda: False
                     )
-                    if tactic == -1 and not is_capturing():
+                    if not tactic_is_cached and not is_capturing():
                         inputs = [A, B, A_scale, B_scale, out_dtype, out, workspace]
                         try:
                             valid = list(
@@ -833,7 +836,7 @@ if has_flashinfer():
                             tactic = min(trials, key=lambda item: item[1])[0]
                             cache[cache_key] = tactic
                             tactic_source = "auto_tuned"
-                    elif tactic == -1:
+                    elif not tactic_is_cached:
                         tactic_source = "auto_capture_default"
 
                 _trace_shape(tactic, tactic_source)

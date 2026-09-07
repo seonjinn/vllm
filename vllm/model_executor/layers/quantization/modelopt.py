@@ -11,11 +11,9 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.layers.attention import Attention, MLAAttention
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
-    RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -25,7 +23,6 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoeWeightScaleSupported,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
-    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -70,7 +67,8 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
     Mxfp8LinearBackend,
     Mxfp8LinearOp,
-    mxfp8_e4m3_quantize,
+    mxfp8_trtllm_dense_enabled,
+    prepare_mxfp8_trtllm_weight,
     swizzle_mxfp8_scale,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
@@ -98,7 +96,6 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
-from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -1671,6 +1668,15 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             f" got {layer.weight_scale.dtype}"
         )
 
+        if mxfp8_trtllm_dense_enabled():
+            weight, weight_scale, logical_n = prepare_mxfp8_trtllm_weight(
+                layer.weight.data, layer.weight_scale.data
+            )
+            layer.weight = Parameter(weight, requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            layer._mxfp8_trtllm_logical_n = logical_n
+            return
+
         if self.backend == Mxfp8LinearBackend.EMULATION:
             # Swizzled layout is not used
             self._process_weights_after_loading_scale_2d(layer)
@@ -1696,13 +1702,20 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 f"expected {MXFP8_SCALE_DTYPE}"
             )
 
-        return self.mxfp8_linear_op.apply(
+        logical_n = getattr(layer, "_mxfp8_trtllm_logical_n", None)
+        output = self.mxfp8_linear_op.apply(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
             out_dtype=x.dtype,
-            bias=bias,
+            bias=None if logical_n is not None else bias,
         )
+        if logical_n is None:
+            return output
+        output = output[..., :logical_n]
+        if bias is not None:
+            output = output + bias
+        return output
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
