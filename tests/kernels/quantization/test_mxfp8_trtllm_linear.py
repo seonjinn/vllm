@@ -225,7 +225,7 @@ def test_mxfp8_trtllm_exact_tuner_profiles_both_layouts_and_all_tactics(
 
 
 def test_mxfp8_trtllm_exact_dispatch_caches_physical_shape(monkeypatch) -> None:
-    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
     monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, "direct")
     monkeypatch.setenv(MXFP8_TRTLLM_TACTIC_POLICY_ENV, "exact-shape")
     tuning_calls: list[tuple[int, int, int]] = []
@@ -233,8 +233,8 @@ def test_mxfp8_trtllm_exact_dispatch_caches_physical_shape(monkeypatch) -> None:
 
     def tune(x, weight, weight_scale, *, candidate_layouts):
         tuning_calls.append((x.shape[0], weight.shape[0], weight.shape[1]))
-        assert candidate_layouts == (True, False)
-        return False, 7
+        assert candidate_layouts == (True,)
+        return True, 7
 
     def dispatch(
         x,
@@ -268,7 +268,20 @@ def test_mxfp8_trtllm_exact_dispatch_caches_physical_shape(monkeypatch) -> None:
         )
 
     assert tuning_calls == [(3, 256, 512)]
-    assert dispatch_calls == [(False, 7), (False, 7)]
+    assert dispatch_calls == [(True, 7), (True, 7)]
+
+
+@pytest.mark.parametrize("layout", ["128x4", "adaptive"])
+def test_mxfp8_trtllm_exact_rejects_unstable_layouts(monkeypatch, layout: str) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, layout)
+
+    with pytest.raises(ValueError, match="supports only the 8x4 layout"):
+        _mxfp8_trtllm_exact_linear_impl(
+            torch.empty((3, 512), dtype=torch.bfloat16),
+            torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+            torch.empty((4096,), dtype=torch.uint8),
+            130,
+        )
 
 
 def test_mxfp8_trtllm_tactic_uses_exact_shape(monkeypatch) -> None:

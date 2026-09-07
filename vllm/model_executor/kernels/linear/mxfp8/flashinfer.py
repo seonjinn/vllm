@@ -401,11 +401,12 @@ def _mxfp8_trtllm_exact_linear_impl(
     output_features: int,
 ) -> torch.Tensor:
     config = _mxfp8_trtllm_layout_config()
-    candidate_layouts: tuple[bool, ...]
-    if config.policy == "adaptive":
-        candidate_layouts = (True, False)
-    else:
-        candidate_layouts = (config.policy == "8x4",)
+    if config.policy != "8x4":
+        raise ValueError(
+            f"{MXFP8_TRTLLM_TACTIC_POLICY_ENV}=exact-shape supports only the "
+            f"8x4 layout; got {MXFP8_TRTLLM_LAYOUT_ENV}={config.policy}"
+        )
+    candidate_layouts = (True,)
 
     cache_key = (
         x.device.type,

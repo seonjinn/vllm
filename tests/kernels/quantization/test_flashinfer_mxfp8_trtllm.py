@@ -198,7 +198,7 @@ def test_flashinfer_trtllm_mxfp8_linear_cuda_graph(
 @torch.inference_mode()
 def test_direct_exact_mxfp8_linear_cuda_graph(monkeypatch) -> None:
     monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, "direct")
-    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
     monkeypatch.setenv(MXFP8_TRTLLM_TACTIC_POLICY_ENV, "exact-shape")
     torch.manual_seed(0)
     m, n, k = 7, 256, 512
