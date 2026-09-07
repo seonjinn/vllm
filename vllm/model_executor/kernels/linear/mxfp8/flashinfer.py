@@ -452,44 +452,47 @@ def _mxfp8_trtllm_linear_fixed_impl(
     *,
     use_8x4_sf_layout: bool,
 ) -> torch.Tensor:
-    quantize = (
-        vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
-        if use_8x4_sf_layout
-        else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
-    )
-    input_mxfp8, input_scale = quantize(x)
-    if _mxfp8_trtllm_impl() == "direct":
-        physical_output_features = int(weight.shape[0])
-        output = torch.empty(
-            (x.shape[0], physical_output_features), dtype=x.dtype, device=x.device
+    with _device_guard(x.device):
+        quantize = (
+            vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+            if use_8x4_sf_layout
+            else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
         )
-        runner, workspace = _mxfp8_trtllm_runtime(
-            x.device.type,
-            _tensor_device_index(x),
-            use_8x4_sf_layout,
-        )
-        runner.forward(
-            [
+        input_mxfp8, input_scale = quantize(x)
+        if _mxfp8_trtllm_impl() == "direct":
+            physical_output_features = int(weight.shape[0])
+            output = torch.empty(
+                (x.shape[0], physical_output_features),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            runner, workspace = _mxfp8_trtllm_runtime(
+                x.device.type,
+                _tensor_device_index(x),
+                use_8x4_sf_layout,
+            )
+            runner.forward(
+                [
+                    input_mxfp8,
+                    weight.t(),
+                    input_scale,
+                    weight_scale,
+                    x.dtype,
+                    output,
+                    workspace,
+                ],
+                tactic=-1,
+            )
+        else:
+            output = vllm_flashinfer.mm_mxfp8(
                 input_mxfp8,
                 weight.t(),
                 input_scale,
                 weight_scale,
-                x.dtype,
-                output,
-                workspace,
-            ],
-            tactic=-1,
-        )
-    else:
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            out_dtype=x.dtype,
-            backend="trtllm",
-            use_8x4_sf_layout=use_8x4_sf_layout,
-        )
+                out_dtype=x.dtype,
+                backend="trtllm",
+                use_8x4_sf_layout=use_8x4_sf_layout,
+            )
     return output[:, :output_features].contiguous()
 
 
@@ -808,32 +811,33 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
                 f"FlashInfer TRTLLM MXFP8 requires K to be divisible by 256, got K={K}."
             )
 
-        scale_k = K // MXFP8_BLOCK_SIZE
-        weight_scale = layer.weight_scale.data[:N, :scale_k].contiguous()
-        padded_n = ((N + 127) // 128) * 128
-        if padded_n != N:
-            padded_weight = weight.new_zeros((padded_n, K))
-            padded_weight[:N] = weight
-            weight = padded_weight
+        with _device_guard(weight.device):
+            scale_k = K // MXFP8_BLOCK_SIZE
+            weight_scale = layer.weight_scale.data[:N, :scale_k].contiguous()
+            padded_n = ((N + 127) // 128) * 128
+            if padded_n != N:
+                padded_weight = weight.new_zeros((padded_n, K))
+                padded_weight[:N] = weight
+                weight = padded_weight
 
-            padded_scale = weight_scale.new_zeros((padded_n, scale_k))
-            padded_scale[:N] = weight_scale
-            weight_scale = padded_scale
-        else:
-            weight = weight.contiguous()
+                padded_scale = weight_scale.new_zeros((padded_n, scale_k))
+                padded_scale[:N] = weight_scale
+                weight_scale = padded_scale
+            else:
+                weight = weight.contiguous()
 
-        layer.weight = Parameter(
-            shuffle_matrix_a(weight, 128).reshape(padded_n, K),
-            requires_grad=False,
-        )
-        layer.weight_scale = Parameter(
-            shuffle_matrix_sf_a(
-                weight_scale,
-                128,
-                num_elts_per_sf=MXFP8_BLOCK_SIZE,
-            ).reshape(-1),
-            requires_grad=False,
-        )
+            layer.weight = Parameter(
+                shuffle_matrix_a(weight, 128).reshape(padded_n, K),
+                requires_grad=False,
+            )
+            layer.weight_scale = Parameter(
+                shuffle_matrix_sf_a(
+                    weight_scale,
+                    128,
+                    num_elts_per_sf=MXFP8_BLOCK_SIZE,
+                ).reshape(-1),
+                requires_grad=False,
+            )
         layer._mxfp8_trtllm_output_size = N
 
     def apply_weights(

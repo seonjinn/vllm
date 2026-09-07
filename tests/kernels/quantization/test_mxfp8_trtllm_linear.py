@@ -36,6 +36,7 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     _mxfp8_trtllm_tactics,
     _trace_mxfp8_dense_shape,
     _tune_mxfp8_trtllm_exact_shape,
+    mxfp8_trtllm_linear,
     mxfp8_trtllm_tactic,
     mxfp8_trtllm_use_8x4_sf_layout,
 )
@@ -412,6 +413,67 @@ def test_mxfp8_trtllm_adaptive_op_uses_joint_flashinfer_api(monkeypatch) -> None
     )
     assert output.shape == (3, 130)
     assert output.is_contiguous()
+
+
+@pytest.mark.parametrize(
+    ("has_dynamic_quant", "expected_route"),
+    [(True, "adaptive"), (False, "dispatch")],
+)
+def test_mxfp8_trtllm_public_adaptive_routing(
+    monkeypatch, has_dynamic_quant: bool, expected_route: str
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, "flashinfer")
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._has_mxfp8_dynamic_quant",
+        lambda: has_dynamic_quant,
+    )
+    calls: list[str] = []
+
+    def route(
+        name: str,
+    ):
+        def impl(*args) -> torch.Tensor:
+            calls.append(name)
+            return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+
+        return impl
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "mxfp8_trtllm_adaptive_linear",
+        route("adaptive"),
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "mxfp8_trtllm_dispatch_linear",
+        route("dispatch"),
+    )
+
+    output = mxfp8_trtllm_linear(
+        torch.empty((3, 512), dtype=torch.bfloat16),
+        torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((4096,), dtype=torch.uint8),
+        130,
+    )
+
+    assert calls == [expected_route]
+    assert output.shape == (3, 130)
+
+
+def test_mxfp8_trtllm_exact_rejects_cold_cache_during_capture(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="cache missed during CUDA Graph capture"):
+        _mxfp8_trtllm_exact_linear_impl(
+            torch.empty((3, 512), dtype=torch.bfloat16),
+            torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+            torch.empty((4096,), dtype=torch.uint8),
+            130,
+        )
 
 
 def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:

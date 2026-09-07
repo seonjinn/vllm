@@ -22,15 +22,9 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     _mxfp8_trtllm_runtime,
     _mxfp8_trtllm_tactic_policy,
 )
-from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
-from vllm.utils.flashinfer import has_flashinfer
 
-if not (
-    current_platform.is_cuda()
-    and current_platform.is_device_capability_family(100)
-    and has_flashinfer()
-):
+if not FlashInferTrtllmMxfp8LinearKernel.is_supported()[0]:
     pytest.skip(
         reason="FlashInfer TRTLLM MXFP8 requires an SM100-family GPU",
         allow_module_level=True,
