@@ -4,6 +4,7 @@
 import json
 import os
 import socket
+import time
 from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -12,6 +13,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     mxfp8_e4m3_quantize,
@@ -26,8 +28,12 @@ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_TRTLLM_LAYOUT"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_TRTLLM_SWITCH_M"
+MXFP8_TRTLLM_IMPL_ENV = "VLLM_MXFP8_TRTLLM_IMPL"
+MXFP8_TRTLLM_TACTIC_POLICY_ENV = "VLLM_MXFP8_TRTLLM_TACTIC_POLICY"
 MXFP8_TRTLLM_TACTICS_ENV = "VLLM_MXFP8_TRTLLM_TACTICS"
 _MXFP8_DENSE_TRACE_SEEN: set[tuple[str, int, int, int, int]] = set()
+_mxfp8_trtllm_exact_cache: dict[tuple[Any, ...], tuple[bool, int]] = {}
+logger = init_logger(__name__)
 
 
 def _mxfp8_dense_family(layer: torch.nn.Module) -> str:
@@ -96,6 +102,24 @@ class _Mxfp8TrtllmLayoutConfig(NamedTuple):
     switch_m: int | None
 
 
+class _ShapeProfile:
+    def __init__(self, m: int, n: int, k: int) -> None:
+        self._shapes = [(m, k), (k, n)]
+
+    def get_opt_shapes(self) -> list[tuple[int, int]]:
+        return self._shapes
+
+
+@cache
+def _mxfp8_trtllm_impl() -> str:
+    return envs.VLLM_MXFP8_TRTLLM_IMPL
+
+
+@cache
+def _mxfp8_trtllm_tactic_policy() -> str:
+    return envs.VLLM_MXFP8_TRTLLM_TACTIC_POLICY
+
+
 @cache
 def _mxfp8_trtllm_layout_config() -> _Mxfp8TrtllmLayoutConfig:
     policy = envs.VLLM_MXFP8_TRTLLM_LAYOUT.strip().lower()
@@ -152,6 +176,14 @@ def mxfp8_trtllm_tactic(m: int, n: int, k: int) -> int | None:
     return _mxfp8_trtllm_tactics().get((m, n, k))
 
 
+def _tensor_device_index(tensor: torch.Tensor) -> int:
+    if tensor.device.index is not None:
+        return tensor.device.index
+    if tensor.device.type == "cuda":
+        return torch.accelerator.current_device_index()
+    return -1
+
+
 @cache
 def _mxfp8_trtllm_runtime(
     device_type: str,
@@ -199,9 +231,7 @@ def _mxfp8_trtllm_tactic_linear_impl(
     )
     runner, workspace = _mxfp8_trtllm_runtime(
         x.device.type,
-        x.device.index
-        if x.device.index is not None
-        else torch.accelerator.current_device_index(),
+        _tensor_device_index(x),
         use_8x4_sf_layout,
     )
     result = runner.forward(
@@ -219,6 +249,176 @@ def _mxfp8_trtllm_tactic_linear_impl(
     return result[:, :output_features].contiguous()
 
 
+def _time_mxfp8_trtllm_candidate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    use_8x4_sf_layout: bool,
+    tactic: int,
+    warmup: int = 2,
+    iterations: int = 8,
+) -> float:
+    quantize = (
+        vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+        if use_8x4_sf_layout
+        else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
+    )
+    physical_output_features = int(weight.shape[0])
+    output = torch.empty(
+        (x.shape[0], physical_output_features),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    runner, workspace = _mxfp8_trtllm_runtime(
+        x.device.type,
+        _tensor_device_index(x),
+        use_8x4_sf_layout,
+    )
+
+    def run() -> None:
+        input_mxfp8, input_scale = quantize(x)
+        runner.forward(
+            [
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                x.dtype,
+                output,
+                workspace,
+            ],
+            tactic=tactic,
+        )
+
+    for _ in range(warmup):
+        run()
+    torch.accelerator.synchronize()
+    start = torch.Event(enable_timing=True)
+    end = torch.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        run()
+    end.record()
+    torch.accelerator.synchronize()
+    return float(start.elapsed_time(end)) / max(1, iterations)
+
+
+def _tune_mxfp8_trtllm_exact_shape(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    candidate_layouts: tuple[bool, ...],
+) -> tuple[bool, int]:
+    tuning_start = time.perf_counter()
+    m, k = int(x.shape[0]), int(x.shape[1])
+    n = int(weight.shape[0])
+    profile = _ShapeProfile(m, n, k)
+    trials: list[tuple[float, bool, int]] = []
+
+    for use_8x4_sf_layout in candidate_layouts:
+        quantize = (
+            vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+            if use_8x4_sf_layout
+            else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
+        )
+        input_mxfp8, input_scale = quantize(x)
+        runner, workspace = _mxfp8_trtllm_runtime(
+            x.device.type,
+            _tensor_device_index(x),
+            use_8x4_sf_layout,
+        )
+        output = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        inputs = [
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            x.dtype,
+            output,
+            workspace,
+        ]
+        valid_tactics = list(runner.get_valid_tactics(inputs, profile))
+        candidates = list(dict.fromkeys([-1, *valid_tactics]))
+        for tactic in candidates:
+            latency_ms = _time_mxfp8_trtllm_candidate(
+                x,
+                weight,
+                weight_scale,
+                use_8x4_sf_layout=use_8x4_sf_layout,
+                tactic=int(tactic),
+            )
+            trials.append((latency_ms, use_8x4_sf_layout, int(tactic)))
+
+    if not trials:
+        raise RuntimeError(f"No valid TRTLLM MXFP8 tactic for {(m, n, k)}")
+    latency_ms, use_8x4_sf_layout, tactic = min(trials, key=lambda trial: trial[0])
+    logger.info(
+        "Tuned TRTLLM MXFP8 shape M=%d N=%d K=%d across %d candidates: "
+        "layout=%s tactic=%d latency=%.4f ms tuning_wall=%.3f s",
+        m,
+        n,
+        k,
+        len(trials),
+        "8x4" if use_8x4_sf_layout else "128x4",
+        tactic,
+        latency_ms,
+        time.perf_counter() - tuning_start,
+    )
+    return use_8x4_sf_layout, tactic
+
+
+def _mxfp8_trtllm_exact_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    config = _mxfp8_trtllm_layout_config()
+    candidate_layouts: tuple[bool, ...]
+    if config.policy == "adaptive":
+        candidate_layouts = (True, False)
+    else:
+        candidate_layouts = (config.policy == "8x4",)
+
+    cache_key = (
+        x.device.type,
+        _tensor_device_index(x),
+        int(x.shape[0]),
+        int(weight.shape[0]),
+        int(x.shape[1]),
+        x.dtype,
+        weight.dtype,
+        weight_scale.dtype,
+        candidate_layouts,
+    )
+    selected = _mxfp8_trtllm_exact_cache.get(cache_key)
+    if selected is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "TRTLLM MXFP8 exact-shape cache missed during CUDA Graph capture; "
+                "run an eager warmup for this physical (M, N, K) first"
+            )
+        selected = _tune_mxfp8_trtllm_exact_shape(
+            x,
+            weight,
+            weight_scale,
+            candidate_layouts=candidate_layouts,
+        )
+        _mxfp8_trtllm_exact_cache[cache_key] = selected
+
+    use_8x4_sf_layout, tactic = selected
+    return _mxfp8_trtllm_tactic_linear_impl(
+        x,
+        weight,
+        weight_scale,
+        output_features,
+        use_8x4_sf_layout,
+        tactic,
+    )
+
+
 def _mxfp8_trtllm_linear_fixed_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -233,15 +433,38 @@ def _mxfp8_trtllm_linear_fixed_impl(
         else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
     )
     input_mxfp8, input_scale = quantize(x)
-    output = vllm_flashinfer.mm_mxfp8(
-        input_mxfp8,
-        weight.t(),
-        input_scale,
-        weight_scale,
-        out_dtype=x.dtype,
-        backend="trtllm",
-        use_8x4_sf_layout=use_8x4_sf_layout,
-    )
+    if _mxfp8_trtllm_impl() == "direct":
+        physical_output_features = int(weight.shape[0])
+        output = torch.empty(
+            (x.shape[0], physical_output_features), dtype=x.dtype, device=x.device
+        )
+        runner, workspace = _mxfp8_trtllm_runtime(
+            x.device.type,
+            _tensor_device_index(x),
+            use_8x4_sf_layout,
+        )
+        runner.forward(
+            [
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                x.dtype,
+                output,
+                workspace,
+            ],
+            tactic=-1,
+        )
+    else:
+        output = vllm_flashinfer.mm_mxfp8(
+            input_mxfp8,
+            weight.t(),
+            input_scale,
+            weight_scale,
+            out_dtype=x.dtype,
+            backend="trtllm",
+            use_8x4_sf_layout=use_8x4_sf_layout,
+        )
     return output[:, :output_features].contiguous()
 
 
@@ -300,7 +523,21 @@ def mxfp8_trtllm_linear(
     weight_scale: torch.Tensor,
     output_features: int,
 ) -> torch.Tensor:
-    if _mxfp8_trtllm_layout_config().policy == "adaptive":
+    implementation = _mxfp8_trtllm_impl()
+    tactic_policy = _mxfp8_trtllm_tactic_policy()
+    if tactic_policy == "exact-shape":
+        if implementation != "direct":
+            raise ValueError(
+                f"{MXFP8_TRTLLM_TACTIC_POLICY_ENV}=exact-shape requires "
+                f"{MXFP8_TRTLLM_IMPL_ENV}=direct"
+            )
+        return torch.ops.vllm.mxfp8_trtllm_exact_linear(
+            x, weight, weight_scale, output_features
+        )
+    if (
+        implementation == "flashinfer"
+        and _mxfp8_trtllm_layout_config().policy == "adaptive"
+    ):
         return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
             x, weight, weight_scale, output_features
         )
@@ -332,6 +569,11 @@ def _mxfp8_trtllm_tactic_linear_fake(
 direct_register_custom_op(
     op_name="mxfp8_trtllm_adaptive_linear",
     op_func=_mxfp8_trtllm_adaptive_linear_impl,
+    fake_impl=_mxfp8_trtllm_linear_fake,
+)
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_exact_linear",
+    op_func=_mxfp8_trtllm_exact_linear_impl,
     fake_impl=_mxfp8_trtllm_linear_fake,
 )
 direct_register_custom_op(

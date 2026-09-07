@@ -147,6 +147,22 @@ def test_mxfp8_trtllm_environment_variables_are_registered() -> None:
     assert MXFP8_TRTLLM_TACTICS_ENV in envs.environment_variables
 
 
+@pytest.mark.parametrize("implementation", ["flashinfer", "direct"])
+def test_mxfp8_trtllm_implementation_is_configurable(
+    monkeypatch, implementation: str
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, implementation)
+
+    assert _mxfp8_trtllm_impl() == implementation
+
+
+@pytest.mark.parametrize("policy", ["default", "exact-shape"])
+def test_mxfp8_trtllm_tactic_policy_is_configurable(monkeypatch, policy: str) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_TACTIC_POLICY_ENV, policy)
+
+    assert _mxfp8_trtllm_tactic_policy() == policy
+
+
 def test_mxfp8_trtllm_exact_tuner_profiles_both_layouts_and_all_tactics(
     monkeypatch,
 ) -> None:
@@ -163,6 +179,18 @@ def test_mxfp8_trtllm_exact_tuner_profiles_both_layouts_and_all_tactics(
     monkeypatch.setattr(
         "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_runtime",
         lambda *args: (Runner(args[2]), torch.empty((32,), dtype=torch.int8)),
+    )
+    fake_quantize = lambda x: (
+        torch.empty_like(x, dtype=torch.float8_e4m3fn),
+        torch.empty((128,), dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.vllm_flashinfer.flashinfer_mxfp8_quantize_8x4",
+        fake_quantize,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.vllm_flashinfer.flashinfer_mxfp8_quantize_128x4",
+        fake_quantize,
     )
 
     def time_candidate(*args, use_8x4_sf_layout: bool, tactic: int, **kwargs) -> float:
