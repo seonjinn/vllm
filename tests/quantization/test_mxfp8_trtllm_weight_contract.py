@@ -14,7 +14,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 
 @pytest.mark.parametrize(
     ("logical_n", "padded_n"),
-    [(128, 128), (4384, 4480), (5120, 5120)],
+    [(128, 128), (4384, 4480), (5120, 5120), (8768, 8832)],
 )
 def test_mxfp8_trtllm_padded_n(logical_n: int, padded_n: int) -> None:
     assert mxfp8_trtllm_padded_n(logical_n) == padded_n
