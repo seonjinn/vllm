@@ -235,41 +235,57 @@ def test_mxfp8_trtllm_fixed_impl_uses_matching_scale_layout(
     assert output.is_contiguous()
 
 
-def test_mxfp8_trtllm_adaptive_op_uses_runtime_shape(monkeypatch) -> None:
+def test_mxfp8_trtllm_adaptive_op_uses_joint_flashinfer_api(monkeypatch) -> None:
     monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
-    monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "2")
-    calls: list[bool] = []
+    calls: dict[str, object] = {}
 
-    def fixed_impl(*args, use_8x4_sf_layout: bool, **kwargs) -> torch.Tensor:
-        calls.append(use_8x4_sf_layout)
-        return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+    def mm_mxfp8_dynamic_quant(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        *,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        calls.update(a=a, b=b, b_scale=b_scale, out_dtype=out_dtype)
+        return torch.ones((a.shape[0], b.shape[1]), dtype=out_dtype)
 
-    monkeypatch.setattr(
-        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_linear_fixed_impl",
-        fixed_impl,
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        types.SimpleNamespace(mm_mxfp8_dynamic_quant=mm_mxfp8_dynamic_quant),
     )
 
+    x = torch.empty((3, 512), dtype=torch.bfloat16)
     weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty((4096,), dtype=torch.uint8)
-    mxfp8_trtllm_linear(
-        torch.empty((2, 512), dtype=torch.bfloat16), weight, weight_scale, 130
-    )
-    mxfp8_trtllm_linear(
-        torch.empty((3, 512), dtype=torch.bfloat16), weight, weight_scale, 130
-    )
+    output = mxfp8_trtllm_linear(x, weight, weight_scale, 130)
 
-    assert calls == [True, False]
+    assert set(calls) == {"a", "b", "b_scale", "out_dtype"}
+    assert calls["a"] is x
+    assert calls["b_scale"] is weight_scale
+    assert calls["out_dtype"] is torch.bfloat16
+    called_weight = calls["b"]
+    assert isinstance(called_weight, torch.Tensor)
+    assert called_weight.shape == (512, 256)
+    assert called_weight.stride() == weight.t().stride()
+    assert (
+        called_weight.untyped_storage().data_ptr()
+        == weight.untyped_storage().data_ptr()
+    )
+    assert output.shape == (3, 130)
+    assert output.is_contiguous()
 
 
 def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
-    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
     monkeypatch.setenv(
         MXFP8_TRTLLM_TACTICS_ENV,
         "3x256x512:7;3x130x512:8",
     )
     calls: list[int] = []
 
-    def tactic_impl(*args, tactic: int, **kwargs) -> torch.Tensor:
+    def tactic_impl(*args, **kwargs) -> torch.Tensor:
+        tactic = args[5]
         calls.append(tactic)
         return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
 
@@ -290,16 +306,22 @@ def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
 
 def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
     monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
-    monkeypatch.setenv(MXFP8_TRTLLM_SWITCH_M_ENV, "2")
-    calls: list[bool] = []
+    calls: list[int] = []
 
-    def fixed_impl(*args, use_8x4_sf_layout: bool, **kwargs) -> torch.Tensor:
-        calls.append(use_8x4_sf_layout)
-        return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+    def mm_mxfp8_dynamic_quant(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        *,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        calls.append(a.shape[0])
+        return torch.ones((a.shape[0], b.shape[1]), dtype=out_dtype)
 
-    monkeypatch.setattr(
-        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_linear_fixed_impl",
-        fixed_impl,
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        types.SimpleNamespace(mm_mxfp8_dynamic_quant=mm_mxfp8_dynamic_quant),
     )
 
     weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
@@ -312,7 +334,7 @@ def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
     compiled_linear(torch.empty((2, 512), dtype=torch.bfloat16))
     compiled_linear(torch.empty((3, 512), dtype=torch.bfloat16))
 
-    assert calls == [True, False]
+    assert calls == [2, 3]
 
 
 @pytest.mark.parametrize(

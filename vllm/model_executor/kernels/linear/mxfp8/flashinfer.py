@@ -245,6 +245,23 @@ def _mxfp8_trtllm_linear_fixed_impl(
     return output[:, :output_features].contiguous()
 
 
+def _mxfp8_trtllm_adaptive_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_features: int,
+) -> torch.Tensor:
+    from flashinfer import mm_mxfp8_dynamic_quant
+
+    output = mm_mxfp8_dynamic_quant(
+        x,
+        weight.t(),
+        weight_scale,
+        out_dtype=x.dtype,
+    )
+    return output[:, :output_features].contiguous()
+
+
 def _mxfp8_trtllm_dispatch_linear_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -283,6 +300,10 @@ def mxfp8_trtllm_linear(
     weight_scale: torch.Tensor,
     output_features: int,
 ) -> torch.Tensor:
+    if _mxfp8_trtllm_layout_config().policy == "adaptive":
+        return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
+            x, weight, weight_scale, output_features
+        )
     return torch.ops.vllm.mxfp8_trtllm_dispatch_linear(
         x, weight, weight_scale, output_features
     )
@@ -308,6 +329,11 @@ def _mxfp8_trtllm_tactic_linear_fake(
     return torch.empty((x.shape[0], output_features), dtype=x.dtype, device=x.device)
 
 
+direct_register_custom_op(
+    op_name="mxfp8_trtllm_adaptive_linear",
+    op_func=_mxfp8_trtllm_adaptive_linear_impl,
+    fake_impl=_mxfp8_trtllm_linear_fake,
+)
 direct_register_custom_op(
     op_name="mxfp8_trtllm_dispatch_linear",
     op_func=_mxfp8_trtllm_dispatch_linear_impl,
