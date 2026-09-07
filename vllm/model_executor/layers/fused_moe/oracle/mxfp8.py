@@ -38,6 +38,12 @@ def _select_kernel_cls(
     )
     last_reason: str | None = None
     for cls in backend_to_kernel_cls(backend):
+        # Nemotron3 Ultra MXFP8 uses a non-gated RELU2_NO_MUL MoE. The
+        # monolithic TRTLLM path assumes the gated/SwiGLU shape contract for
+        # MXFP8 block-scale MoE, so prefer the modular expert path here.
+        if not config.is_act_and_mul and cls.is_monolithic():
+            last_reason = "skipped monolithic TRTLLM for non-gated MXFP8 MoE"
+            continue
         supported, reason = cls.is_supported_config(
             cls,
             config,

@@ -1537,9 +1537,17 @@ class FusedMoE(CustomOp):
     def hidden_size(self) -> int:
         return self.moe_config.hidden_dim
 
+    @hidden_size.setter
+    def hidden_size(self, value: int) -> None:
+        self.moe_config.hidden_dim = value
+
     @property
     def intermediate_size_per_partition(self) -> int:
         return self.moe_config.intermediate_size_per_partition
+
+    @intermediate_size_per_partition.setter
+    def intermediate_size_per_partition(self, value: int) -> None:
+        self.moe_config.intermediate_size_per_partition = value
 
     def extra_repr(self) -> str:
         s = (

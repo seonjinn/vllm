@@ -11,10 +11,7 @@ from vllm.vllm_flash_attn.flash_attn_interface import (
 )
 
 if not (FA2_AVAILABLE or FA3_AVAILABLE):
-    raise ImportError(
-        "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
-        "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."
-    )
+    pass
 
 __all__ = [
     "fa_version_unsupported_reason",

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from enum import Enum
+import os
 
 import torch
 
@@ -21,6 +23,49 @@ class Mxfp8LinearBackend(Enum):
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_BLOCK_SIZE = 32
+MXFP8_INPUT_QUANT_KEY = "mxfp8_e4m3_block_scale"
+
+
+_SUPPORTED_MXFP8_DENSE_BACKENDS = ("cutlass", "trtllm", "auto")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _mxfp8_dense_backend() -> str:
+    backend = os.environ.get("VLLM_MXFP8_DENSE_GEMM_BACKEND", "cutlass")
+    backend = backend.strip().lower()
+    if backend not in _SUPPORTED_MXFP8_DENSE_BACKENDS:
+        raise ValueError(
+            "VLLM_MXFP8_DENSE_GEMM_BACKEND must be one of "
+            f"{_SUPPORTED_MXFP8_DENSE_BACKENDS}, got {backend!r}"
+        )
+    return backend
+
+
+def _mxfp8_use_8x4_sf_layout() -> bool:
+    raw = os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4")
+    return raw.strip().lower() in ("8x4", "layout_8x4", "true", "1")
+
+
+@dataclass(frozen=True)
+class Mxfp8QuantizedActivation:
+    """Pre-quantized MXFP8 activation handoff for ModelOpt MXFP8 linears.
+
+    This is a narrow scaffold for the #42469/#42597 style QuantizedActivation
+    contract. The producer owns activation quantization and scale layout; the
+    linear consumes the result without re-running mxfp8_e4m3_quantize.
+    """
+
+    value: torch.Tensor
+    scale: torch.Tensor
+    orig_shape: tuple[int, ...]
+    sf_layout: str = "128x4"
+    input_quant_key: str = MXFP8_INPUT_QUANT_KEY
 
 
 def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
@@ -52,9 +97,25 @@ def _mxfp8_e4m3_quantize_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 
-    x_q, x_scales = flashinfer_mxfp8_quantize(
-        x, is_sf_swizzled_layout=is_sf_swizzled_layout
-    )
+    kwargs = {
+        "input": x,
+        "is_sf_swizzled_layout": is_sf_swizzled_layout,
+    }
+    use_8x4 = is_sf_swizzled_layout and _mxfp8_use_8x4_sf_layout()
+    if use_8x4:
+        from flashinfer import SfLayout
+
+        kwargs["sf_swizzle_layout"] = SfLayout.layout_8x4
+        kwargs["backend"] = os.environ.get("VLLM_MXFP8_DENSE_QUANT_BACKEND", "cuda")
+
+    try:
+        x_q, x_scales = flashinfer_mxfp8_quantize(**kwargs)
+    except TypeError:
+        if use_8x4 and _env_flag("VLLM_MXFP8_DENSE_REQUIRE_8X4_QUANT"):
+            raise
+        x_q, x_scales = flashinfer_mxfp8_quantize(
+            x, is_sf_swizzled_layout=is_sf_swizzled_layout
+        )
     if x_scales.ndim == 1 and x.ndim == 2 and not is_sf_swizzled_layout:
         x_scales = x_scales.view(x.size(0), -1)
     return x_q, x_scales
@@ -94,7 +155,8 @@ def mxfp8_e4m3_quantize_fake(
         M, N = x.shape
         K = (N + block_size - 1) // block_size
         if is_sf_swizzled_layout:
-            M_padded = ((M + 127) // 128) * 128
+            m_tile = 8 if _mxfp8_use_8x4_sf_layout() else 128
+            M_padded = ((M + m_tile - 1) // m_tile) * m_tile
             K_padded = ((K + 3) // 4) * 4
             scales = torch.empty(
                 M_padded * K_padded, dtype=MXFP8_SCALE_DTYPE, device=x.device
@@ -105,7 +167,8 @@ def mxfp8_e4m3_quantize_fake(
         B, M, N = x.shape
         K = (N + block_size - 1) // block_size
         if is_sf_swizzled_layout:
-            M_padded = ((M + 127) // 128) * 128
+            m_tile = 8 if _mxfp8_use_8x4_sf_layout() else 128
+            M_padded = ((M + m_tile - 1) // m_tile) * m_tile
             K_padded = ((K + 3) // 4) * 4
             scales = torch.empty(
                 B * M_padded * K_padded, dtype=MXFP8_SCALE_DTYPE, device=x.device
@@ -173,8 +236,9 @@ class Mxfp8LinearOp:
         input_2d = input.view(-1, K)
         M_orig = input_2d.shape[0]
 
-        # Minimum dimension size for F8_128x4 block scaling layout
+        # Minimum dimension size for the original F8_128x4 CUTLASS path.
         min_dim = 128
+        backend = _mxfp8_dense_backend()
 
         assert min_dim <= K, (
             f"mm_mxfp8 requires K >= {min_dim}, got K={K}. "
@@ -188,9 +252,16 @@ class Mxfp8LinearOp:
             f"out_features is too small for mm_mxfp8."
         )
 
-        M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
-        if M_padded != M_orig:
-            pad_rows = M_padded - M_orig
+        pad_to_128 = _env_flag("VLLM_MXFP8_DENSE_PAD_TO_128", backend != "trtllm")
+        if backend in ("cutlass", "auto"):
+            pad_to_128 = True
+
+        if pad_to_128:
+            M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
+        else:
+            M_padded = M_orig
+        pad_rows = M_padded - M_orig
+        if pad_rows > 0:
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
         input_mxfp8, input_scale = mxfp8_e4m3_quantize(
@@ -207,10 +278,10 @@ class Mxfp8LinearOp:
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cutlass",
+            backend=backend,
         )
 
-        if M_padded != M_orig:
+        if pad_rows > 0:
             output = output[:M_orig, :]
 
         if bias is not None:
@@ -219,14 +290,64 @@ class Mxfp8LinearOp:
         output_shape = (*input_shape[:-1], N)
         return output.view(output_shape)
 
-    def apply(
+    def apply_quantized(
         self,
-        input: torch.Tensor,
+        input: Mxfp8QuantizedActivation,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if input.input_quant_key != MXFP8_INPUT_QUANT_KEY:
+            raise ValueError(
+                "Unsupported MXFP8 activation quant key: "
+                f"{input.input_quant_key!r}"
+            )
+        if input.value.dtype != MXFP8_VALUE_DTYPE:
+            raise ValueError(
+                f"MXFP8 activation must be {MXFP8_VALUE_DTYPE}, "
+                f"got {input.value.dtype}."
+            )
+        if input.scale.dtype != MXFP8_SCALE_DTYPE:
+            raise ValueError(
+                f"MXFP8 activation scale must be {MXFP8_SCALE_DTYPE}, "
+                f"got {input.scale.dtype}."
+            )
+
+        N, K = weight.shape
+        input_2d = input.value.view(-1, K)
+        backend = _mxfp8_dense_backend()
+        output = vllm_flashinfer.mm_mxfp8(
+            input_2d,
+            weight.t(),
+            input.scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            backend=backend,
+        )
+
+        m_orig = 1
+        for dim in input.orig_shape[:-1]:
+            m_orig *= dim
+        if output.shape[0] != m_orig:
+            output = output[:m_orig, :]
+
+        if bias is not None:
+            output = output + bias
+
+        return output.view(*input.orig_shape[:-1], N)
+
+    def apply(
+        self,
+        input: torch.Tensor | Mxfp8QuantizedActivation,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if isinstance(input, Mxfp8QuantizedActivation):
+            return self.apply_quantized(input, weight, weight_scale, out_dtype, bias)
+
         if self.backend == Mxfp8LinearBackend.EMULATION:
             return self._apply_emulation(input, weight, weight_scale, out_dtype, bias)
 

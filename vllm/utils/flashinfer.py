@@ -574,6 +574,277 @@ if has_flashinfer():
     ) -> torch.Tensor:
         from flashinfer import mm_mxfp8 as mm_mxfp8_
 
+        use_direct_trtllm = (
+            backend == "trtllm"
+            and os.environ.get("VLLM_MXFP8_DENSE_DIRECT_TRTLLM", "0")
+            .strip()
+            .lower()
+            not in ("0", "false", "no", "off", "")
+        )
+        if use_direct_trtllm:
+            require_direct = (
+                os.environ.get("VLLM_MXFP8_DENSE_REQUIRE_DIRECT_TRTLLM", "0")
+                .strip()
+                .lower()
+                not in ("0", "false", "no", "off", "")
+            )
+            try:
+                from flashinfer.gemm.gemm_base import (  # type: ignore
+                    DEFAULT_WORKSPACE_SIZE,
+                    _get_cache_buf,
+                    get_trtllm_gemm_module,
+                )
+
+                use_8x4 = (
+                    os.environ.get("VLLM_MXFP8_DENSE_A_SF_LAYOUT", "128x4")
+                    .strip()
+                    .lower()
+                    in ("8x4", "layout_8x4", "true", "1")
+                )
+                out = torch.empty(
+                    (A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device
+                )
+                workspace = _get_cache_buf(
+                    "vllm_direct_trtllm_mxfp8_workspace",
+                    DEFAULT_WORKSPACE_SIZE,
+                    A.device,
+                )
+                runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+                    use_8x4_sf_layout=use_8x4
+                )
+                tactic_raw = os.environ.get(
+                    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1"
+                )
+                tactic_hints_raw = os.environ.get(
+                    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS", ""
+                )
+                tactic_policy = os.environ.get(
+                    "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_POLICY", ""
+                )
+                tactic_raw_norm = tactic_raw.strip().lower()
+                tactic_policy = tactic_policy.strip().lower()
+                use_shape_cache = tactic_raw_norm in (
+                    "auto",
+                    "auto-best",
+                    "shape-cache",
+                    "shape_cache",
+                ) or tactic_policy in (
+                    "auto",
+                    "auto-best",
+                    "shape-cache",
+                    "shape_cache",
+                )
+
+                def _fallback_tactic() -> int:
+                    try:
+                        return int(tactic_raw)
+                    except ValueError:
+                        return -1
+
+                tactic = _fallback_tactic()
+
+                def _shape_hint_tactic() -> int | None:
+                    raw = tactic_hints_raw.strip()
+                    if not raw:
+                        return None
+                    shape_key = (
+                        int(A.shape[0]),
+                        int(B.shape[1]),
+                        int(A.shape[1]),
+                    )
+                    cached_raw = getattr(
+                        mm_mxfp8, "_trtllm_tactic_hints_raw", None
+                    )
+                    cached_map = getattr(
+                        mm_mxfp8, "_trtllm_tactic_hints_map", None
+                    )
+                    if cached_raw == raw and isinstance(cached_map, dict):
+                        return cached_map.get(shape_key)
+
+                    hint_map: dict[tuple[int, int, int], int] = {}
+                    for item in raw.split(";"):
+                        item = item.strip()
+                        if not item or ":" not in item:
+                            continue
+                        shape, hint = item.rsplit(":", 1)
+                        try:
+                            m, n, k = (
+                                int(part.strip())
+                                for part in shape.split(",", 2)
+                            )
+                            hint_tactic = int(hint.strip())
+                        except ValueError:
+                            continue
+                        hint_map[(m, n, k)] = hint_tactic
+                    setattr(mm_mxfp8, "_trtllm_tactic_hints_raw", raw)
+                    setattr(mm_mxfp8, "_trtllm_tactic_hints_map", hint_map)
+                    return hint_map.get(shape_key)
+
+                def _trace_shape(tactic_value: int, tactic_source: str) -> None:
+                    trace_flag = (
+                        os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "0")
+                        .strip()
+                        .lower()
+                    )
+                    if trace_flag in ("0", "false", "no", "off", ""):
+                        return
+                    trace_dir = os.environ.get(
+                        "VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", ""
+                    ).strip()
+                    if not trace_dir:
+                        return
+                    shape_key = (
+                        int(A.shape[0]),
+                        int(B.shape[1]),
+                        int(A.shape[1]),
+                        str(out_dtype),
+                        bool(use_8x4),
+                    )
+                    seen = getattr(mm_mxfp8, "_trtllm_shape_trace_seen", None)
+                    if seen is None:
+                        seen = set()
+                        setattr(mm_mxfp8, "_trtllm_shape_trace_seen", seen)
+                    if shape_key in seen:
+                        return
+                    max_shapes = int(
+                        os.environ.get(
+                            "VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"
+                        )
+                    )
+                    if len(seen) >= max_shapes:
+                        return
+                    seen.add(shape_key)
+
+                    try:
+                        import json
+                        import socket
+                        import time
+
+                        os.makedirs(trace_dir, exist_ok=True)
+                        rank = (
+                            os.environ.get("RANK")
+                            or os.environ.get("LOCAL_RANK")
+                            or os.environ.get("SLURM_PROCID")
+                            or "na"
+                        )
+                        path = os.path.join(
+                            trace_dir,
+                            f"mxfp8_dense_shapes_rank{rank}_pid{os.getpid()}.jsonl",
+                        )
+                        record = {
+                            "event": "mxfp8_dense_shape",
+                            "time": time.time(),
+                            "pid": os.getpid(),
+                            "hostname": socket.gethostname(),
+                            "rank": rank,
+                            "m": int(A.shape[0]),
+                            "n": int(B.shape[1]),
+                            "k": int(A.shape[1]),
+                            "a_shape": [int(x) for x in A.shape],
+                            "b_shape": [int(x) for x in B.shape],
+                            "a_dtype": str(A.dtype),
+                            "b_dtype": str(B.dtype),
+                            "out_dtype": str(out_dtype),
+                            "use_8x4_sf_layout": bool(use_8x4),
+                            "tactic": int(tactic_value),
+                            "tactic_source": tactic_source,
+                        }
+                        with open(path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(record, sort_keys=True) + "\n")
+                    except Exception:
+                        return
+
+                hint_tactic = _shape_hint_tactic()
+                tactic_source = "env"
+                if hint_tactic is not None:
+                    tactic = hint_tactic
+                    tactic_source = "hint"
+                    use_shape_cache = False
+
+                if use_shape_cache:
+                    class _ShapeProfile:
+                        def __init__(
+                            self,
+                            a_shape: tuple[int, ...],
+                            b_shape: tuple[int, ...],
+                        ) -> None:
+                            self._shapes = [a_shape, b_shape]
+
+                        def get_opt_shapes(self) -> list[tuple[int, ...]]:
+                            return self._shapes
+
+                    cache = getattr(mm_mxfp8, "_trtllm_tactic_cache", None)
+                    if cache is None:
+                        cache = {}
+                        setattr(mm_mxfp8, "_trtllm_tactic_cache", cache)
+
+                    cache_key = (
+                        int(A.shape[0]),
+                        int(A.shape[1]),
+                        int(B.shape[1]),
+                        str(A.dtype),
+                        str(B.dtype),
+                        str(out_dtype),
+                        bool(use_8x4),
+                    )
+                    tactic = cache.get(cache_key, -1)
+                    tactic_source = "auto_cache" if cache_key in cache else "auto_default"
+                    is_capturing = getattr(
+                        torch.cuda, "is_current_stream_capturing", lambda: False
+                    )
+                    if tactic == -1 and not is_capturing():
+                        inputs = [A, B, A_scale, B_scale, out_dtype, out, workspace]
+                        try:
+                            valid = list(
+                                runner.get_valid_tactics(
+                                    inputs,
+                                    _ShapeProfile(tuple(A.shape), tuple(B.shape)),
+                                )
+                            )
+                        except Exception:
+                            valid = []
+                        candidates = [-1] + [x for x in valid if x != -1]
+                        warmup = int(os.environ.get(
+                            "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_WARMUP", "2"
+                        ))
+                        iters = int(os.environ.get(
+                            "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_ITERS", "8"
+                        ))
+                        trials: list[tuple[int, float]] = []
+                        for candidate in candidates:
+                            try:
+                                for _ in range(warmup):
+                                    runner.forward(inputs, tactic=candidate)
+                                torch.cuda.synchronize()
+                                start = torch.cuda.Event(enable_timing=True)
+                                end = torch.cuda.Event(enable_timing=True)
+                                start.record()
+                                for _ in range(iters):
+                                    runner.forward(inputs, tactic=candidate)
+                                end.record()
+                                torch.cuda.synchronize()
+                                trials.append((
+                                    int(candidate),
+                                    float(start.elapsed_time(end)) / max(1, iters),
+                                ))
+                            except Exception:
+                                continue
+                        if trials:
+                            tactic = min(trials, key=lambda item: item[1])[0]
+                            cache[cache_key] = tactic
+                            tactic_source = "auto_tuned"
+                    elif tactic == -1:
+                        tactic_source = "auto_capture_default"
+
+                _trace_shape(tactic, tactic_source)
+                return runner.forward(
+                    [A, B, A_scale, B_scale, out_dtype, out, workspace],
+                    tactic=tactic,
+                )
+            except Exception:
+                if require_direct:
+                    raise
+
         return mm_mxfp8_(
             A,
             B,
