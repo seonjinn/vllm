@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import time
+from contextlib import AbstractContextManager, nullcontext
 from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -121,6 +122,15 @@ def _mxfp8_trtllm_tactic_policy() -> str:
 
 
 @cache
+def _has_mxfp8_dynamic_quant() -> bool:
+    try:
+        import flashinfer
+    except ImportError:
+        return False
+    return callable(getattr(flashinfer, "mm_mxfp8_dynamic_quant", None))
+
+
+@cache
 def _mxfp8_trtllm_layout_config() -> _Mxfp8TrtllmLayoutConfig:
     policy = envs.VLLM_MXFP8_TRTLLM_LAYOUT.strip().lower()
     if policy != "adaptive":
@@ -184,6 +194,17 @@ def _tensor_device_index(tensor: torch.Tensor) -> int:
     return -1
 
 
+def _device_guard(device: torch.device) -> AbstractContextManager[None]:
+    if device.type != "cpu":
+        index = (
+            device.index
+            if device.index is not None
+            else torch.accelerator.current_device_index()
+        )
+        return torch.accelerator.device_index(index)
+    return nullcontext()
+
+
 @cache
 def _mxfp8_trtllm_runtime(
     device_type: str,
@@ -198,14 +219,15 @@ def _mxfp8_trtllm_runtime(
 
     device = torch.device(device_type, device_index)
     suffix = "8x4" if use_8x4_sf_layout else "128x4"
-    workspace = _get_cache_buf(
-        f"vllm_mxfp8_trtllm_tactic_workspace_{suffix}",
-        DEFAULT_WORKSPACE_SIZE,
-        device,
-    )
-    runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
-        use_8x4_sf_layout=use_8x4_sf_layout
-    )
+    with _device_guard(device):
+        workspace = _get_cache_buf(
+            f"vllm_mxfp8_trtllm_tactic_workspace_{suffix}",
+            DEFAULT_WORKSPACE_SIZE,
+            device,
+        )
+        runner = get_trtllm_gemm_module().trtllm_mxfp8_gemm_runner(
+            use_8x4_sf_layout=use_8x4_sf_layout
+        )
     return runner, workspace
 
 
@@ -217,35 +239,36 @@ def _mxfp8_trtllm_tactic_linear_impl(
     use_8x4_sf_layout: bool,
     tactic: int,
 ) -> torch.Tensor:
-    quantize = (
-        vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
-        if use_8x4_sf_layout
-        else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
-    )
-    input_mxfp8, input_scale = quantize(x)
-    physical_output_features = int(weight.shape[0])
-    output = torch.empty(
-        (x.shape[0], physical_output_features),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    runner, workspace = _mxfp8_trtllm_runtime(
-        x.device.type,
-        _tensor_device_index(x),
-        use_8x4_sf_layout,
-    )
-    result = runner.forward(
-        [
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            x.dtype,
-            output,
-            workspace,
-        ],
-        tactic=tactic,
-    )
+    with _device_guard(x.device):
+        quantize = (
+            vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+            if use_8x4_sf_layout
+            else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
+        )
+        input_mxfp8, input_scale = quantize(x)
+        physical_output_features = int(weight.shape[0])
+        output = torch.empty(
+            (x.shape[0], physical_output_features),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        runner, workspace = _mxfp8_trtllm_runtime(
+            x.device.type,
+            _tensor_device_index(x),
+            use_8x4_sf_layout,
+        )
+        result = runner.forward(
+            [
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                x.dtype,
+                output,
+                workspace,
+            ],
+            tactic=tactic,
+        )
     return result[:, :output_features].contiguous()
 
 
@@ -259,49 +282,50 @@ def _time_mxfp8_trtllm_candidate(
     warmup: int = 2,
     iterations: int = 8,
 ) -> float:
-    quantize = (
-        vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
-        if use_8x4_sf_layout
-        else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
-    )
-    physical_output_features = int(weight.shape[0])
-    output = torch.empty(
-        (x.shape[0], physical_output_features),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    runner, workspace = _mxfp8_trtllm_runtime(
-        x.device.type,
-        _tensor_device_index(x),
-        use_8x4_sf_layout,
-    )
-
-    def run() -> None:
-        input_mxfp8, input_scale = quantize(x)
-        runner.forward(
-            [
-                input_mxfp8,
-                weight.t(),
-                input_scale,
-                weight_scale,
-                x.dtype,
-                output,
-                workspace,
-            ],
-            tactic=tactic,
+    with _device_guard(x.device):
+        quantize = (
+            vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+            if use_8x4_sf_layout
+            else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
+        )
+        physical_output_features = int(weight.shape[0])
+        output = torch.empty(
+            (x.shape[0], physical_output_features),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        runner, workspace = _mxfp8_trtllm_runtime(
+            x.device.type,
+            _tensor_device_index(x),
+            use_8x4_sf_layout,
         )
 
-    for _ in range(warmup):
-        run()
-    torch.accelerator.synchronize()
-    start = torch.Event(enable_timing=True)
-    end = torch.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        run()
-    end.record()
-    torch.accelerator.synchronize()
-    return float(start.elapsed_time(end)) / max(1, iterations)
+        def run() -> None:
+            input_mxfp8, input_scale = quantize(x)
+            runner.forward(
+                [
+                    input_mxfp8,
+                    weight.t(),
+                    input_scale,
+                    weight_scale,
+                    x.dtype,
+                    output,
+                    workspace,
+                ],
+                tactic=tactic,
+            )
+
+        for _ in range(warmup):
+            run()
+        torch.accelerator.synchronize(_tensor_device_index(x))
+        start = torch.Event(enable_timing=True)
+        end = torch.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            run()
+        end.record()
+        torch.accelerator.synchronize(_tensor_device_index(x))
+        return float(start.elapsed_time(end)) / max(1, iterations)
 
 
 def _tune_mxfp8_trtllm_exact_shape(
@@ -317,39 +341,40 @@ def _tune_mxfp8_trtllm_exact_shape(
     profile = _ShapeProfile(m, n, k)
     trials: list[tuple[float, bool, int]] = []
 
-    for use_8x4_sf_layout in candidate_layouts:
-        quantize = (
-            vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
-            if use_8x4_sf_layout
-            else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
-        )
-        input_mxfp8, input_scale = quantize(x)
-        runner, workspace = _mxfp8_trtllm_runtime(
-            x.device.type,
-            _tensor_device_index(x),
-            use_8x4_sf_layout,
-        )
-        output = torch.empty((m, n), dtype=x.dtype, device=x.device)
-        inputs = [
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            x.dtype,
-            output,
-            workspace,
-        ]
-        valid_tactics = list(runner.get_valid_tactics(inputs, profile))
-        candidates = list(dict.fromkeys([-1, *valid_tactics]))
-        for tactic in candidates:
-            latency_ms = _time_mxfp8_trtllm_candidate(
-                x,
-                weight,
-                weight_scale,
-                use_8x4_sf_layout=use_8x4_sf_layout,
-                tactic=int(tactic),
+    with _device_guard(x.device):
+        for use_8x4_sf_layout in candidate_layouts:
+            quantize = (
+                vllm_flashinfer.flashinfer_mxfp8_quantize_8x4
+                if use_8x4_sf_layout
+                else vllm_flashinfer.flashinfer_mxfp8_quantize_128x4
             )
-            trials.append((latency_ms, use_8x4_sf_layout, int(tactic)))
+            input_mxfp8, input_scale = quantize(x)
+            runner, workspace = _mxfp8_trtllm_runtime(
+                x.device.type,
+                _tensor_device_index(x),
+                use_8x4_sf_layout,
+            )
+            output = torch.empty((m, n), dtype=x.dtype, device=x.device)
+            inputs = [
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                x.dtype,
+                output,
+                workspace,
+            ]
+            valid_tactics = list(runner.get_valid_tactics(inputs, profile))
+            candidates = list(dict.fromkeys([-1, *valid_tactics]))
+            for tactic in candidates:
+                latency_ms = _time_mxfp8_trtllm_candidate(
+                    x,
+                    weight,
+                    weight_scale,
+                    use_8x4_sf_layout=use_8x4_sf_layout,
+                    tactic=int(tactic),
+                )
+                trials.append((latency_ms, use_8x4_sf_layout, int(tactic)))
 
     if not trials:
         raise RuntimeError(f"No valid TRTLLM MXFP8 tactic for {(m, n, k)}")
@@ -537,6 +562,7 @@ def mxfp8_trtllm_linear(
     if (
         implementation == "flashinfer"
         and _mxfp8_trtllm_layout_config().policy == "adaptive"
+        and _has_mxfp8_dynamic_quant()
     ):
         return torch.ops.vllm.mxfp8_trtllm_adaptive_linear(
             x, weight, weight_scale, output_features
@@ -754,11 +780,13 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
-        ):
-            return False, "requires SM100-family GPU"
+        if not current_platform.is_cuda():
+            return False, "requires an NVIDIA GPU"
+        if compute_capability is None:
+            capability = current_platform.get_device_capability()
+            compute_capability = capability.to_int() if capability is not None else None
+        if compute_capability not in {100, 103, 107}:
+            return False, "requires SM100, SM103, or SM107"
         if not has_flashinfer():
             return False, "requires FlashInfer"
         return True, None
@@ -814,9 +842,10 @@ class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert x.dtype == torch.bfloat16, (
-            f"FlashInfer TRTLLM MXFP8 requires bfloat16 activations, got {x.dtype}."
-        )
+        if x.dtype != torch.bfloat16:
+            raise ValueError(
+                f"FlashInfer TRTLLM MXFP8 requires bfloat16 activations, got {x.dtype}."
+            )
 
         weight = layer.weight  # shuffled [padded N, K]
         weight_scale = layer.weight_scale

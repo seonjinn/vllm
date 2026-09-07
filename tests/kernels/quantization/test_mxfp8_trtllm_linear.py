@@ -24,6 +24,9 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_SWITCH_M_ENV,
     MXFP8_TRTLLM_TACTIC_POLICY_ENV,
     MXFP8_TRTLLM_TACTICS_ENV,
+    _has_mxfp8_dynamic_quant,
+    _mxfp8_trtllm_adaptive_linear_impl,
+    _mxfp8_trtllm_dispatch_linear_impl,
     _mxfp8_trtllm_exact_cache,
     _mxfp8_trtllm_exact_linear_impl,
     _mxfp8_trtllm_impl,
@@ -33,7 +36,6 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     _mxfp8_trtllm_tactics,
     _trace_mxfp8_dense_shape,
     _tune_mxfp8_trtllm_exact_shape,
-    mxfp8_trtllm_linear,
     mxfp8_trtllm_tactic,
     mxfp8_trtllm_use_8x4_sf_layout,
 )
@@ -93,12 +95,14 @@ def test_mxfp8_dense_shape_trace_records_unique_serving_shape(
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
     _mxfp8_trtllm_impl.cache_clear()
+    _has_mxfp8_dynamic_quant.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
     _mxfp8_trtllm_tactic_policy.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
     _mxfp8_trtllm_exact_cache.clear()
     yield
     _mxfp8_trtllm_impl.cache_clear()
+    _has_mxfp8_dynamic_quant.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
     _mxfp8_trtllm_tactic_policy.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
@@ -392,7 +396,7 @@ def test_mxfp8_trtllm_adaptive_op_uses_joint_flashinfer_api(monkeypatch) -> None
     x = torch.empty((3, 512), dtype=torch.bfloat16)
     weight = torch.empty((256, 512), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty((4096,), dtype=torch.uint8)
-    output = mxfp8_trtllm_linear(x, weight, weight_scale, 130)
+    output = _mxfp8_trtllm_adaptive_linear_impl(x, weight, weight_scale, 130)
 
     assert set(calls) == {"a", "b", "b_scale", "out_dtype"}
     assert calls["a"] is x
@@ -428,7 +432,7 @@ def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
         tactic_impl,
     )
 
-    mxfp8_trtllm_linear(
+    _mxfp8_trtllm_dispatch_linear_impl(
         torch.empty((3, 512), dtype=torch.bfloat16),
         torch.empty((256, 512), dtype=torch.float8_e4m3fn),
         torch.empty((4096,), dtype=torch.uint8),
@@ -438,7 +442,7 @@ def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
     assert calls == [7]
 
 
-def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
+def test_mxfp8_trtllm_adaptive_impl_compiles_with_dynamic_m(monkeypatch) -> None:
     monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
     calls: list[int] = []
 
@@ -463,7 +467,7 @@ def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
 
     @torch.compile(backend="eager", dynamic=True)
     def compiled_linear(x: torch.Tensor) -> torch.Tensor:
-        return mxfp8_trtllm_linear(x, weight, weight_scale, 130)
+        return _mxfp8_trtllm_adaptive_linear_impl(x, weight, weight_scale, 130)
 
     compiled_linear(torch.empty((2, 512), dtype=torch.bfloat16))
     compiled_linear(torch.empty((3, 512), dtype=torch.bfloat16))
@@ -516,7 +520,7 @@ def test_mxfp8_trtllm_backend_selects_trtllm_kernel(platform_mock) -> None:
 
 
 @patch("vllm.model_executor.kernels.linear.current_platform")
-def test_mxfp8_trtllm_backend_is_not_considered_by_auto(platform_mock) -> None:
+def test_mxfp8_trtllm_backend_is_considered_by_auto(platform_mock) -> None:
     platform_mock._enum = PlatformEnum.CUDA
 
     with (
@@ -533,11 +537,10 @@ def test_mxfp8_trtllm_backend_is_not_considered_by_auto(platform_mock) -> None:
             "is_supported",
             return_value=(True, None),
         ),
-        pytest.raises(
-            ValueError, match="Failed to find a kernel that can implement the MXFP8"
-        ),
     ):
-        init_mxfp8_linear_kernel()
+        kernel = init_mxfp8_linear_kernel()
+
+    assert isinstance(kernel, FlashInferTrtllmMxfp8LinearKernel)
 
 
 def test_mxfp8_trtllm_prepares_padded_weight_and_scale(monkeypatch) -> None:
@@ -654,6 +657,18 @@ def test_mxfp8_trtllm_uses_8x4_quantization_and_slices_output(monkeypatch) -> No
         mm_mxfp8,
         raising=False,
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.mxfp8_trtllm_linear",
+        lambda x, weight, weight_scale, output_features: (
+            _mxfp8_trtllm_linear_fixed_impl(
+                x,
+                weight,
+                weight_scale,
+                output_features,
+                use_8x4_sf_layout=True,
+            )
+        ),
+    )
 
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
@@ -694,5 +709,5 @@ def test_mxfp8_trtllm_rejects_float16_input() -> None:
     )
     layer._mxfp8_trtllm_output_size = 256
 
-    with pytest.raises(ValueError, match="requires bfloat16 output"):
+    with pytest.raises(ValueError, match="requires bfloat16 activations"):
         _kernel().apply_weights(layer, torch.zeros((1, 512), dtype=torch.float16))

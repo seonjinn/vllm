@@ -12,9 +12,15 @@ from vllm.model_executor.kernels.linear import (
     Mxfp8LinearLayerConfig,
 )
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    MXFP8_TRTLLM_IMPL_ENV,
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
+    MXFP8_TRTLLM_TACTIC_POLICY_ENV,
+    _mxfp8_trtllm_exact_cache,
+    _mxfp8_trtllm_impl,
     _mxfp8_trtllm_layout_config,
+    _mxfp8_trtllm_runtime,
+    _mxfp8_trtllm_tactic_policy,
 )
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
@@ -49,9 +55,17 @@ def _make_layer(weight: torch.Tensor) -> torch.nn.Module:
 
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
+    _mxfp8_trtllm_impl.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_tactic_policy.cache_clear()
+    _mxfp8_trtllm_runtime.cache_clear()
+    _mxfp8_trtllm_exact_cache.clear()
     yield
+    _mxfp8_trtllm_impl.cache_clear()
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_tactic_policy.cache_clear()
+    _mxfp8_trtllm_runtime.cache_clear()
+    _mxfp8_trtllm_exact_cache.clear()
 
 
 @pytest.mark.parametrize("shape", [(1, 130, 256), (7, 256, 512), (128, 130, 768)])
@@ -184,4 +198,40 @@ def test_flashinfer_trtllm_mxfp8_linear_cuda_graph(
     graph.replay()
     eager_output = kernel.apply_weights(layer, new_x)
 
+    torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_direct_exact_mxfp8_linear_cuda_graph(monkeypatch) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_IMPL_ENV, "direct")
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "adaptive")
+    monkeypatch.setenv(MXFP8_TRTLLM_TACTIC_POLICY_ENV, "exact-shape")
+    torch.manual_seed(0)
+    m, n, k = 7, 256, 512
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    layer = _make_layer(weight)
+    kernel = FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+    kernel.process_weights_after_loading(layer)
+
+    static_x = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    eager_output = kernel.apply_weights(layer, static_x)
+    reference = torch.mm(static_x, weight.t())
+    similarity = F.cosine_similarity(
+        eager_output.float().flatten(), reference.float().flatten(), dim=0
+    )
+    assert similarity.item() > 0.98
+    assert len(_mxfp8_trtllm_exact_cache) == 1
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = kernel.apply_weights(layer, static_x)
+
+    new_x = torch.randn_like(static_x)
+    static_x.copy_(new_x)
+    graph.replay()
+    replay_cache_size = len(_mxfp8_trtllm_exact_cache)
+    eager_output = kernel.apply_weights(layer, new_x)
+
+    assert replay_cache_size == 1
+    assert len(_mxfp8_trtllm_exact_cache) == 1
     torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
