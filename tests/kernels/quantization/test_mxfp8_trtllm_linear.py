@@ -352,7 +352,7 @@ def test_mxfp8_trtllm_dispatch_uses_exact_layout_for_physical_shape(
         fixed_impl,
     )
 
-    mxfp8_trtllm_linear(
+    _mxfp8_trtllm_dispatch_linear_impl(
         torch.empty((3, 512), dtype=torch.bfloat16),
         torch.empty((256, 512), dtype=torch.float8_e4m3fn),
         torch.empty((4096,), dtype=torch.uint8),
