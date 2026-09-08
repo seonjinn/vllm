@@ -23,6 +23,7 @@ from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_LAYOUTS_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
     MXFP8_TRTLLM_TACTICS_ENV,
+    _mxfp8_trtllm_dispatch_linear_impl,
     _mxfp8_trtllm_layout_config,
     _mxfp8_trtllm_layouts,
     _mxfp8_trtllm_linear_fixed_impl,
@@ -322,7 +323,7 @@ def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
         tactic_impl,
     )
 
-    mxfp8_trtllm_linear(
+    _mxfp8_trtllm_dispatch_linear_impl(
         torch.empty((3, 512), dtype=torch.bfloat16),
         torch.empty((256, 512), dtype=torch.float8_e4m3fn),
         torch.empty((4096,), dtype=torch.uint8),
