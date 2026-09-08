@@ -56,17 +56,35 @@ def _trace_mxfp8_dense_shape(
     n_physical: int,
     k: int,
 ) -> None:
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        return
+    _write_mxfp8_dense_trace(
+        family=_mxfp8_dense_family(layer),
+        prefix=str(getattr(layer, "prefix", "unknown")),
+        m=m,
+        n_logical=n_logical,
+        n_physical=n_physical,
+        k=k,
+    )
+
+
+def _write_mxfp8_dense_trace(
+    *,
+    family: str,
+    prefix: str,
+    m: int,
+    n_logical: int,
+    n_physical: int,
+    k: int,
+    selection: dict[str, Any] | None = None,
+) -> None:
     enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "").strip().lower()
     if enabled in ("", "0", "false", "no", "off"):
-        return
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return
     trace_dir = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", "").strip()
     if not trace_dir:
         return
 
-    family = _mxfp8_dense_family(layer)
-    prefix = str(getattr(layer, "prefix", "unknown"))
     shape = (family, int(m), int(n_logical), int(n_physical), int(k))
     max_records = int(os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE_MAX", "4096"))
     if shape in _MXFP8_DENSE_TRACE_SEEN or len(_MXFP8_DENSE_TRACE_SEEN) >= max_records:
@@ -88,6 +106,8 @@ def _trace_mxfp8_dense_shape(
         "pid": os.getpid(),
         "prefix": prefix,
     }
+    if selection is not None:
+        record.update(selection)
     with output.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -308,6 +328,21 @@ def _mxfp8_trtllm_dispatch_linear_impl(
     )
     tactic = mxfp8_trtllm_tactic(
         int(x.shape[0]), physical_output_features, int(x.shape[1])
+    )
+    shape = (int(x.shape[0]), physical_output_features, int(x.shape[1]))
+    _write_mxfp8_dense_trace(
+        family="Dispatch",
+        prefix="custom_op",
+        m=shape[0],
+        n_logical=output_features,
+        n_physical=shape[1],
+        k=shape[2],
+        selection={
+            "layout": "8x4" if use_8x4_sf_layout else "128x4",
+            "layout_exact": shape in _mxfp8_trtllm_layouts(),
+            "tactic": tactic,
+            "tactic_exact": shape in _mxfp8_trtllm_tactics(),
+        },
     )
     if tactic is not None:
         return _mxfp8_trtllm_tactic_linear_impl(

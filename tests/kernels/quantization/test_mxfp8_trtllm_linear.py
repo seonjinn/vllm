@@ -19,6 +19,7 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp8_linear_kernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    _MXFP8_DENSE_TRACE_SEEN,
     MXFP8_TRTLLM_LAYOUT_ENV,
     MXFP8_TRTLLM_LAYOUTS_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
@@ -88,10 +89,12 @@ def test_mxfp8_dense_shape_trace_records_unique_serving_shape(
 
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
+    _MXFP8_DENSE_TRACE_SEEN.clear()
     _mxfp8_trtllm_layout_config.cache_clear()
     _mxfp8_trtllm_layouts.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
     yield
+    _MXFP8_DENSE_TRACE_SEEN.clear()
     _mxfp8_trtllm_layout_config.cache_clear()
     _mxfp8_trtllm_layouts.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
@@ -360,6 +363,57 @@ def test_mxfp8_trtllm_dispatch_uses_exact_layout_for_physical_shape(
     )
 
     assert calls == [False]
+
+
+def test_mxfp8_trtllm_dispatch_traces_capture_shape_and_selection(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE", "1")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_SHAPE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUTS_ENV, "3x256x512:128x4")
+    monkeypatch.setenv(MXFP8_TRTLLM_TACTICS_ENV, "3x256x512:7")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_tactic_linear_impl",
+        lambda *args, **kwargs: torch.empty(
+            (args[0].shape[0], args[3]), dtype=args[0].dtype
+        ),
+    )
+
+    _mxfp8_trtllm_dispatch_linear_impl(
+        torch.empty((3, 512), dtype=torch.bfloat16),
+        torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((4096,), dtype=torch.uint8),
+        130,
+    )
+
+    records = [
+        json.loads(line)
+        for path in tmp_path.glob("dense_shapes_*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0] | {
+        "hostname": records[0]["hostname"],
+        "pid": records[0]["pid"],
+    } == {
+        "event": "mxfp8_dense_shape",
+        "family": "Dispatch",
+        "hostname": records[0]["hostname"],
+        "k": 512,
+        "layout": "128x4",
+        "layout_exact": True,
+        "m": 3,
+        "n": 256,
+        "n_logical": 130,
+        "n_physical": 256,
+        "pid": records[0]["pid"],
+        "prefix": "custom_op",
+        "tactic": 7,
+        "tactic_exact": True,
+    }
 
 
 def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
