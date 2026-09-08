@@ -302,7 +302,6 @@ def _mxfp8_trtllm_dispatch_linear_impl(
     weight_scale: torch.Tensor,
     output_features: int,
 ) -> torch.Tensor:
-    config = _mxfp8_trtllm_layout_config()
     physical_output_features = int(weight.shape[0])
     use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(
         int(x.shape[0]), physical_output_features, int(x.shape[1])
@@ -324,9 +323,7 @@ def _mxfp8_trtllm_dispatch_linear_impl(
         weight,
         weight_scale,
         output_features,
-        use_8x4_sf_layout=(
-            use_8x4_sf_layout if config.policy == "adaptive" else config.policy == "8x4"
-        ),
+        use_8x4_sf_layout=use_8x4_sf_layout,
     )
 
 
