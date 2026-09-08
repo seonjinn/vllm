@@ -39,6 +39,7 @@ logger = init_logger(__name__)
 _MXFP8_ADAPTIVE_DISPATCH_TRACE_SEEN: set[
     tuple[tuple[int, int, int], bool, int, bool, str | None]
 ] = set()
+_MXFP8_TRTLLM_TACTIC_CACHE: dict[tuple[object, ...], int] = {}
 
 
 def _trace_mxfp8_adaptive_dispatch(
@@ -48,6 +49,7 @@ def _trace_mxfp8_adaptive_dispatch(
     tactic: int,
     tactic_hit: bool,
     config_sha256: str | None,
+    tactic_source: str | None = None,
 ) -> None:
     raw_enabled = os.environ.get("VLLM_MXFP8_DENSE_SHAPE_TRACE", "")
     if raw_enabled.strip().lower() in ("", "0", "false", "no", "off"):
@@ -78,7 +80,8 @@ def _trace_mxfp8_adaptive_dispatch(
         "n": shape_key[1],
         "k": shape_key[2],
         "tactic": tactic,
-        "tactic_source": "static_hint" if tactic_hit else "runner_default",
+        "tactic_source": tactic_source
+        or ("static_hint" if tactic_hit else "runner_default"),
     }
     with output.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -89,6 +92,33 @@ def _mxfp8_env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _mxfp8_trtllm_tactic_policy() -> tuple[int, bool]:
+    tactic_raw = os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1")
+    policy = os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_POLICY", "")
+    auto_values = {"auto", "auto-best", "shape-cache", "shape_cache"}
+    use_shape_cache = (
+        tactic_raw.strip().lower() in auto_values
+        or policy.strip().lower() in auto_values
+    )
+    try:
+        default_tactic = int(tactic_raw)
+    except ValueError:
+        default_tactic = -1
+    return default_tactic, use_shape_cache
+
+
+class _Mxfp8ShapeProfile:
+    def __init__(
+        self,
+        a_shape: tuple[int, ...],
+        b_shape: tuple[int, ...],
+    ) -> None:
+        self._shapes = [a_shape, b_shape]
+
+    def get_opt_shapes(self) -> list[tuple[int, ...]]:
+        return self._shapes
 
 
 @functools.cache
@@ -264,7 +294,7 @@ def _mxfp8_trtllm_configuration_fingerprint(
         gemm_backend=gemm_backend,
         direct_trtllm=env_flag("VLLM_MXFP8_DENSE_DIRECT_TRTLLM"),
         require_direct_trtllm=env_flag("VLLM_MXFP8_DENSE_REQUIRE_DIRECT_TRTLLM"),
-        default_tactic=int(os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1")),
+        default_tactic=_mxfp8_trtllm_tactic_policy()[0],
         low_tactic_hints_raw=low_tactic_hints_raw,
         low_tactic_map=tuple(
             sorted(_parse_mxfp8_tactic_hints(low_tactic_hints_raw).items())
@@ -541,6 +571,86 @@ def _mxfp8_trtllm_run_prepared(
         [A, B, A_scale, B_scale, out_dtype, out, workspace],
         tactic=tactic,
     )
+
+
+def _mxfp8_trtllm_select_tactic(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    out: torch.Tensor,
+    workspace: torch.Tensor,
+    use_8x4_sf_layout: bool,
+    default_tactic: int,
+) -> tuple[int, str]:
+    _, use_shape_cache = _mxfp8_trtllm_tactic_policy()
+    if not use_shape_cache:
+        return default_tactic, "env"
+
+    cache_key = (
+        str(A.device),
+        int(A.shape[0]),
+        int(A.shape[1]),
+        int(B.shape[1]),
+        str(A.dtype),
+        str(B.dtype),
+        str(out_dtype),
+        use_8x4_sf_layout,
+    )
+    cached = _MXFP8_TRTLLM_TACTIC_CACHE.get(cache_key)
+    if cached is not None:
+        return cached, "auto_cache"
+    if torch.cuda.is_current_stream_capturing():
+        return default_tactic, "auto_capture_default"
+
+    state = _require_mxfp8_trtllm_direct_state(A.device)
+    runner = state.runner_8x4 if use_8x4_sf_layout else state.runner_128x4
+    inputs = [A, B, A_scale, B_scale, out_dtype, out, workspace]
+    try:
+        valid_tactics = list(
+            runner.get_valid_tactics(
+                inputs,
+                _Mxfp8ShapeProfile(tuple(A.shape), tuple(B.shape)),
+            )
+        )
+    except Exception:
+        valid_tactics = []
+
+    candidates = [default_tactic]
+    candidates.extend(tactic for tactic in valid_tactics if tactic != default_tactic)
+    warmup = max(
+        0,
+        int(os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_WARMUP", "2")),
+    )
+    iterations = max(
+        1,
+        int(os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_ITERS", "8")),
+    )
+    trials: list[tuple[int, float]] = []
+    for candidate in candidates:
+        try:
+            for _ in range(warmup):
+                runner.forward(inputs, tactic=candidate)
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iterations):
+                runner.forward(inputs, tactic=candidate)
+            end.record()
+            torch.cuda.synchronize()
+            trials.append(
+                (candidate, float(start.elapsed_time(end)) / iterations)
+            )
+        except Exception:
+            continue
+
+    if not trials:
+        return default_tactic, "auto_default"
+    tactic = min(trials, key=lambda item: item[1])[0]
+    _MXFP8_TRTLLM_TACTIC_CACHE[cache_key] = tactic
+    return tactic, "auto_tuned"
 
 
 def get_mxfp8_trtllm_prepared_workspaces(
@@ -1359,10 +1469,11 @@ if has_flashinfer():
             try:
                 state = _require_mxfp8_trtllm_direct_state(A.device)
                 configuration = state.configuration
+                default_tactic, _ = _mxfp8_trtllm_tactic_policy()
                 tactic = (
                     configuration.default_tactic
                     if configuration is not None
-                    else int(os.environ.get("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "-1"))
+                    else default_tactic
                 )
                 tactic_hints_name = (
                     "VLLM_MXFP8_DENSE_TRTLLM_TACTIC_HINTS"
@@ -1385,7 +1496,24 @@ if has_flashinfer():
                 shape_key = (m, n, k)
                 tactic_hit = shape_key in tactic_table
                 tactic = tactic_table.get((m, n, k), tactic)
-                if is_adaptive_layout:
+                workspace = (
+                    state.workspace_8x4 if use_8x4_sf_layout else state.workspace_128x4
+                )
+                tactic_source = "static_hint" if tactic_hit else "runner_default"
+                if configuration is None and not tactic_hit:
+                    out = torch.empty((m, n), dtype=out_dtype, device=A.device)
+                    tactic, tactic_source = _mxfp8_trtllm_select_tactic(
+                        A,
+                        B,
+                        A_scale,
+                        B_scale,
+                        out_dtype,
+                        out,
+                        workspace,
+                        use_8x4_sf_layout,
+                        tactic,
+                    )
+                if is_adaptive_layout or tactic_source.startswith("auto"):
                     _trace_mxfp8_adaptive_dispatch(
                         shape_key=shape_key,
                         use_8x4_sf_layout=use_8x4_sf_layout,
@@ -1394,10 +1522,8 @@ if has_flashinfer():
                         config_sha256=(
                             configuration.config_sha256 if configuration else None
                         ),
+                        tactic_source=tactic_source,
                     )
-                workspace = (
-                    state.workspace_8x4 if use_8x4_sf_layout else state.workspace_128x4
-                )
                 return _mxfp8_trtllm_run_prepared(
                     A,
                     B,

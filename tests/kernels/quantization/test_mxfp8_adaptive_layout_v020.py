@@ -83,6 +83,45 @@ def _load_layout_policy() -> Callable[[int], bool]:
     return namespace["mxfp8_dense_use_8x4_sf_layout"]  # type: ignore[return-value]
 
 
+def _load_tactic_policy() -> Callable[[], tuple[int, bool]]:
+    tree = ast.parse(FLASHINFER_UTILS.read_text(encoding="utf-8"))
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_mxfp8_trtllm_tactic_policy"
+    ]
+    assert len(selected) == 1
+    namespace: dict[str, object] = {"os": os}
+    exec(
+        compile(
+            ast.Module(body=selected, type_ignores=[]),
+            str(FLASHINFER_UTILS),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["_mxfp8_trtllm_tactic_policy"]  # type: ignore[return-value]
+
+
+def test_fixed_layout_auto_tactic_uses_shape_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "auto")
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_POLICY", "shape-cache")
+
+    assert _load_tactic_policy()() == (-1, True)
+
+
+def test_fixed_layout_integer_tactic_stays_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC", "17")
+    monkeypatch.delenv("VLLM_MXFP8_DENSE_TRTLLM_TACTIC_POLICY", raising=False)
+
+    assert _load_tactic_policy()() == (17, False)
+
+
 def _load_trtllm_configuration_contract() -> tuple[type, Callable, Callable]:
     tree = ast.parse(FLASHINFER_UTILS.read_text(encoding="utf-8"))
     names = {
