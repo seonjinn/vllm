@@ -6,7 +6,9 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
-from typing import TYPE_CHECKING
+from contextlib import AbstractContextManager
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
@@ -50,6 +52,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _LL_BF16_WARMUP_M_RANGE = range(1, 17)
+
+
+class _WorldGroup(Protocol):
+    world_size: int
+
+    def barrier(self) -> None: ...
 
 
 def _ll_bf16_router_shapes_from_model(
@@ -223,6 +231,38 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
+def _flashinfer_autotune_context(
+    fi_utils: Any,
+    cache_path: Path,
+    autotune_kwargs: dict[str, Any],
+) -> AbstractContextManager[None]:
+    if not envs.VLLM_FLASHINFER_AUTOTUNE_USE_V2:
+        return fi_utils.autotune(tune_mode=True, **autotune_kwargs)
+
+    from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2
+
+    return autotune_v2(
+        mode="tune",
+        persistent_cache=True,
+        cache_root=cache_path.parent,
+        measurement_policy=MeasurementPolicy(
+            execution_mode="cuda_graph",
+            cold_l2=True,
+        ),
+        **autotune_kwargs,
+    )
+
+
+def _reload_flashinfer_autotune_v2(world: _WorldGroup) -> None:
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    if world.world_size > 1:
+        world.barrier()
+    autotune_v2_reload()
+    if world.world_size > 1:
+        world.barrier()
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -245,6 +285,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     world = get_world_group()
     is_leader = world.rank_in_group == 0
     tuner = AutoTuner.get()
+    use_autotune_v2 = envs.VLLM_FLASHINFER_AUTOTUNE_USE_V2
 
     autotune_kwargs: dict = {}
     skip_ops = _flashinfer_autotune_skip_ops(runner)
@@ -274,29 +315,33 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         randomize_inputs=True,
     )
 
-    # Read cached autotune results and broadcast to all ranks.
-    cached_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            cached_results = f.read()
-    cached_results = world.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
+    if not use_autotune_v2:
+        # Read cached autotune results and broadcast to all ranks.
+        cached_results: bytes | None = None
+        if is_leader and cache_path.exists():
+            with open(cache_path, "rb") as f:
+                cached_results = f.read()
+        cached_results = world.broadcast_object(cached_results, src=0)
+        if cached_results is not None:
+            write_flashinfer_autotune_cache(cache_path, cached_results)
+            world.barrier()
+            tuner.load_configs(str(cache_path))
 
     group = world.cpu_group if world.world_size > 1 else None
     set_autotune_process_group(group)
     try:
         with (
             torch.inference_mode(),
-            fi_utils.autotune(tune_mode=True, **autotune_kwargs),
+            _flashinfer_autotune_context(fi_utils, cache_path, autotune_kwargs),
         ):
             runner._dummy_run(**dummy_run_kwargs)
     finally:
         set_autotune_process_group(None)
 
-    if world.world_size > 1:
-        world.barrier()
-    if is_leader:
-        tuner.save_configs(str(cache_path))
+    if use_autotune_v2:
+        _reload_flashinfer_autotune_v2(world)
+    else:
+        if world.world_size > 1:
+            world.barrier()
+        if is_leader:
+            tuner.save_configs(str(cache_path))
