@@ -769,22 +769,34 @@ def test_runner_and_linear_path_share_the_same_layout_choice() -> None:
     assert "use_8x4_sf_layout=use_8x4_sf_layout" in linear_source
 
 
-def test_dense_trace_layout_resolution_stays_outside_compilation() -> None:
-    """Tracing layout must not force a symbolic compile-time layout decision."""
+def test_dense_layout_resolution_only_defers_adaptive_compilation() -> None:
+    """Fixed layouts are compile-safe; adaptive layouts need the marker op."""
     linear_source = LINEAR.read_text(encoding="utf-8")
+    resolve_layout = _function_source(
+        LINEAR, "_mxfp8_dense_layout_for_apply"
+    )
+    calls: list[int] = []
+    namespace: dict[str, object] = {
+        "mxfp8_dense_use_8x4_sf_layout": lambda m: calls.append(m) or True,
+    }
+    exec(resolve_layout, namespace)
+    resolve = namespace["_mxfp8_dense_layout_for_apply"]
+
+    assert resolve(  # type: ignore[operator]
+        128, is_adaptive_layout=False, is_compiling=True
+    ) is True
+    assert calls == [128]
+    assert resolve(  # type: ignore[operator]
+        256, is_adaptive_layout=True, is_compiling=True
+    ) is None
+    assert calls == [128]
+
     compiling = linear_source.index(
         "is_compiling = _mxfp8_dense_is_compiling()"
     )
-    layout_choice = linear_source.index(
-        "use_8x4_sf_layout = mxfp8_dense_use_8x4_sf_layout(M_padded)"
-    )
-
-    assert compiling < layout_choice
-    assert (
-        "if not is_compiling:\n"
-        "            use_8x4_sf_layout = "
-        "mxfp8_dense_use_8x4_sf_layout(M_padded)"
-    ) in linear_source
+    trace = linear_source.index("_mxfp8_dense_shape_trace(")
+    assert compiling < trace
+    assert "if not is_compiling:" in linear_source[compiling:trace]
 
 
 def test_tactic_hint_table_is_parsed_once_and_looked_up_by_shape() -> None:

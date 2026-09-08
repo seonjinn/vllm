@@ -190,6 +190,14 @@ def _mxfp8_dense_pad_to_128() -> bool:
     return _env_flag("VLLM_MXFP8_DENSE_PAD_TO_128", True)
 
 
+def _mxfp8_dense_layout_for_apply(
+    m: int, *, is_adaptive_layout: bool, is_compiling: bool
+) -> bool | None:
+    if is_adaptive_layout and is_compiling:
+        return None
+    return mxfp8_dense_use_8x4_sf_layout(m)
+
+
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
 
@@ -398,9 +406,12 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
 
         is_compiling = _mxfp8_dense_is_compiling()
-        use_8x4_sf_layout = None
+        use_8x4_sf_layout = _mxfp8_dense_layout_for_apply(
+            M_padded,
+            is_adaptive_layout=is_adaptive_layout,
+            is_compiling=is_compiling,
+        )
         if not is_compiling:
-            use_8x4_sf_layout = mxfp8_dense_use_8x4_sf_layout(M_padded)
             _mxfp8_dense_shape_trace(
                 layer=layer,
                 family=_mxfp8_dense_family(layer),
