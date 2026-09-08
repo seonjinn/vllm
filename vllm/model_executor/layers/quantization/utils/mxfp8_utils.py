@@ -344,8 +344,9 @@ def _resolve_mxfp8_exact_tactic(
     k: int,
     layout: str,
     tactics: dict[Mxfp8ExactTacticKey, int],
-) -> int:
-    return tactics.get((m, n_logical, n_physical, k, layout), -1)
+) -> int | None:
+    tactic = tactics.get((m, n_logical, n_physical, k, layout))
+    return tactic if tactic is not None and tactic >= 0 else None
 
 
 def mxfp8_trtllm_exact_tactics_enabled() -> bool:
@@ -399,7 +400,7 @@ def prepare_mxfp8_trtllm_exact_tactic_state(
     )
 
     canonical = torch.device(device_key[0], device_key[1])
-    with torch.cuda.device(canonical):
+    with torch.accelerator.device_index(device_key[1]):
         workspace_8x4 = _get_cache_buf(
             "vllm_mxfp8_trtllm_exact_tactic_workspace_8x4",
             DEFAULT_WORKSPACE_SIZE,
@@ -460,7 +461,7 @@ def _mxfp8_cuda_device_key(device: torch.device) -> tuple[str, int]:
         raise RuntimeError(f"MXFP8 TRTLLM tactics require CUDA, got {canonical}.")
     index = canonical.index
     if index is None:
-        index = torch.cuda.current_device()
+        index = torch.accelerator.current_device_index()
     return canonical.type, index
 
 
@@ -494,7 +495,7 @@ def prepare_mxfp8_trtllm_high_m_tactic_state(
     )
 
     canonical = torch.device(device_key[0], device_key[1])
-    with torch.cuda.device(canonical):
+    with torch.accelerator.device_index(device_key[1]):
         workspace = _get_cache_buf(
             "vllm_mxfp8_trtllm_high_m_static_tactic_workspace",
             DEFAULT_WORKSPACE_SIZE,
@@ -818,7 +819,7 @@ def _mxfp8_trtllm_linear_fixed_impl(
         sf_swizzle_layout=sf_layout,
     )
     if mxfp8_trtllm_exact_tactics_enabled():
-        state = _require_mxfp8_trtllm_exact_tactic_state(x.device)
+        exact_state = _require_mxfp8_trtllm_exact_tactic_state(x.device)
         layout = "8x4" if use_8x4_sf_layout else "128x4"
         physical_n = int(weight.shape[0])
         tactic = _resolve_mxfp8_exact_tactic(
@@ -827,42 +828,23 @@ def _mxfp8_trtllm_linear_fixed_impl(
             physical_n,
             int(x.shape[1]),
             layout,
-            state.tactics,
-        )
-        output = torch.empty(
-            (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
-        )
-        runner = state.runner_8x4 if use_8x4_sf_layout else state.runner_128x4
-        workspace = state.workspace_8x4 if use_8x4_sf_layout else state.workspace_128x4
-        output = runner.forward(
-            [
-                input_mxfp8,
-                weight.t(),
-                input_scale,
-                weight_scale,
-                torch.bfloat16,
-                output,
-                workspace,
-            ],
-            tactic=tactic,
-        )
-        return output[:, :output_features].contiguous()
-
-    if not use_8x4_sf_layout and mxfp8_trtllm_high_m_static_tactics_enabled():
-        state = _require_mxfp8_trtllm_high_m_tactic_state(x.device)
-        logical_shape = (int(x.shape[0]), int(output_features), int(x.shape[1]))
-        tactic = _resolve_mxfp8_high_m_tactic(
-            *logical_shape,
-            state.tactic_hints,
-            state.fallback_tactic,
-            use_global_fallback=state.use_global_fallback,
+            exact_state.tactics,
         )
         if tactic is not None:
-            physical_n = int(weight.shape[0])
             output = torch.empty(
                 (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
             )
-            output = state.runner.forward(
+            runner = (
+                exact_state.runner_8x4
+                if use_8x4_sf_layout
+                else exact_state.runner_128x4
+            )
+            workspace = (
+                exact_state.workspace_8x4
+                if use_8x4_sf_layout
+                else exact_state.workspace_128x4
+            )
+            output = runner.forward(
                 [
                     input_mxfp8,
                     weight.t(),
@@ -870,7 +852,35 @@ def _mxfp8_trtllm_linear_fixed_impl(
                     weight_scale,
                     torch.bfloat16,
                     output,
-                    state.workspace,
+                    workspace,
+                ],
+                tactic=tactic,
+            )
+            return output[:, :output_features].contiguous()
+
+    if not use_8x4_sf_layout and mxfp8_trtllm_high_m_static_tactics_enabled():
+        high_m_state = _require_mxfp8_trtllm_high_m_tactic_state(x.device)
+        logical_shape = (int(x.shape[0]), int(output_features), int(x.shape[1]))
+        tactic = _resolve_mxfp8_high_m_tactic(
+            *logical_shape,
+            high_m_state.tactic_hints,
+            high_m_state.fallback_tactic,
+            use_global_fallback=high_m_state.use_global_fallback,
+        )
+        if tactic is not None:
+            physical_n = int(weight.shape[0])
+            output = torch.empty(
+                (x.shape[0], physical_n), dtype=torch.bfloat16, device=x.device
+            )
+            output = high_m_state.runner.forward(
+                [
+                    input_mxfp8,
+                    weight.t(),
+                    input_scale,
+                    weight_scale,
+                    torch.bfloat16,
+                    output,
+                    high_m_state.workspace,
                 ],
                 tactic=tactic,
             )

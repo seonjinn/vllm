@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 
 
 @pytest.fixture(autouse=True)
-def reset_mxfp8_layout_config() -> None:
+def reset_mxfp8_layout_config() -> Generator[None, None, None]:
     _mxfp8_trtllm_layout_config.cache_clear()
     yield
     _mxfp8_trtllm_layout_config.cache_clear()
@@ -281,7 +282,18 @@ def test_mxfp8_exact_tactic_table_uses_full_execution_signature(
             "8x4",
             table.tactics,
         )
-        == -1
+        is None
+    )
+    assert (
+        _resolve_mxfp8_exact_tactic(
+            16,
+            8768,
+            8832,
+            8192,
+            "8x4",
+            {(16, 8768, 8832, 8192, "8x4"): -1},
+        )
+        is None
     )
 
 
