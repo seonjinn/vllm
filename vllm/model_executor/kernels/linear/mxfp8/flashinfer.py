@@ -25,6 +25,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 MXFP8_TRTLLM_LAYOUT_ENV = "VLLM_MXFP8_TRTLLM_LAYOUT"
+MXFP8_TRTLLM_LAYOUTS_ENV = "VLLM_MXFP8_TRTLLM_LAYOUTS"
 MXFP8_TRTLLM_SWITCH_M_ENV = "VLLM_MXFP8_TRTLLM_SWITCH_M"
 MXFP8_TRTLLM_TACTICS_ENV = "VLLM_MXFP8_TRTLLM_TACTICS"
 _MXFP8_DENSE_TRACE_SEEN: set[tuple[str, int, int, int, int]] = set()
@@ -110,7 +111,40 @@ def _mxfp8_trtllm_layout_config() -> _Mxfp8TrtllmLayoutConfig:
     return _Mxfp8TrtllmLayoutConfig(policy, switch_m)
 
 
-def mxfp8_trtllm_use_8x4_sf_layout(m: int) -> bool:
+@cache
+def _mxfp8_trtllm_layouts() -> dict[tuple[int, int, int], bool]:
+    layouts: dict[tuple[int, int, int], bool] = {}
+    for raw_entry in envs.VLLM_MXFP8_TRTLLM_LAYOUTS.split(";"):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        shape_text, separator, layout = entry.partition(":")
+        try:
+            shape = tuple(
+                int(value) for value in shape_text.replace("x", ",").split(",")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {MXFP8_TRTLLM_LAYOUTS_ENV} entry: {entry!r}."
+            ) from exc
+        if separator != ":" or len(shape) != 3 or layout not in ("8x4", "128x4"):
+            raise ValueError(f"Invalid {MXFP8_TRTLLM_LAYOUTS_ENV} entry: {entry!r}.")
+        key = (shape[0], shape[1], shape[2])
+        if key in layouts:
+            raise ValueError(
+                f"Duplicate {MXFP8_TRTLLM_LAYOUTS_ENV} shape: {shape_text!r}."
+            )
+        layouts[key] = layout == "8x4"
+    return layouts
+
+
+def mxfp8_trtllm_use_8x4_sf_layout(
+    m: int, n: int | None = None, k: int | None = None
+) -> bool:
+    if n is not None and k is not None:
+        selected = _mxfp8_trtllm_layouts().get((m, n, k))
+        if selected is not None:
+            return selected
     config = _mxfp8_trtllm_layout_config()
     if config.policy == "8x4":
         return True
@@ -269,8 +303,10 @@ def _mxfp8_trtllm_dispatch_linear_impl(
     output_features: int,
 ) -> torch.Tensor:
     config = _mxfp8_trtllm_layout_config()
-    use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(int(x.shape[0]))
     physical_output_features = int(weight.shape[0])
+    use_8x4_sf_layout = mxfp8_trtllm_use_8x4_sf_layout(
+        int(x.shape[0]), physical_output_features, int(x.shape[1])
+    )
     tactic = mxfp8_trtllm_tactic(
         int(x.shape[0]), physical_output_features, int(x.shape[1])
     )

@@ -20,9 +20,11 @@ from vllm.model_executor.kernels.linear import (
 )
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     MXFP8_TRTLLM_LAYOUT_ENV,
+    MXFP8_TRTLLM_LAYOUTS_ENV,
     MXFP8_TRTLLM_SWITCH_M_ENV,
     MXFP8_TRTLLM_TACTICS_ENV,
     _mxfp8_trtllm_layout_config,
+    _mxfp8_trtllm_layouts,
     _mxfp8_trtllm_linear_fixed_impl,
     _mxfp8_trtllm_tactics,
     _trace_mxfp8_dense_shape,
@@ -86,9 +88,11 @@ def test_mxfp8_dense_shape_trace_records_unique_serving_shape(
 @pytest.fixture(autouse=True)
 def clear_mxfp8_trtllm_layout_config() -> Generator[None, None, None]:
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_layouts.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
     yield
     _mxfp8_trtllm_layout_config.cache_clear()
+    _mxfp8_trtllm_layouts.cache_clear()
     _mxfp8_trtllm_tactics.cache_clear()
 
 
@@ -128,8 +132,32 @@ def test_mxfp8_trtllm_layout_policy_rejects_invalid_value(monkeypatch) -> None:
 
 def test_mxfp8_trtllm_environment_variables_are_registered() -> None:
     assert MXFP8_TRTLLM_LAYOUT_ENV in envs.environment_variables
+    assert MXFP8_TRTLLM_LAYOUTS_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_SWITCH_M_ENV in envs.environment_variables
     assert MXFP8_TRTLLM_TACTICS_ENV in envs.environment_variables
+
+
+def test_mxfp8_trtllm_layout_uses_exact_shape_then_falls_back(monkeypatch) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
+    monkeypatch.setenv(
+        MXFP8_TRTLLM_LAYOUTS_ENV,
+        "128x2304x8192:128x4;256,8192,2560:8x4",
+    )
+
+    assert not mxfp8_trtllm_use_8x4_sf_layout(128, 2304, 8192)
+    assert mxfp8_trtllm_use_8x4_sf_layout(256, 8192, 2560)
+    assert mxfp8_trtllm_use_8x4_sf_layout(64, 2304, 8192)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["128,2304:8x4", "128,2304,8192", "128,2304,8192:32x4"],
+)
+def test_mxfp8_trtllm_layouts_reject_malformed_entries(monkeypatch, value: str) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUTS_ENV, value)
+
+    with pytest.raises(ValueError, match=MXFP8_TRTLLM_LAYOUTS_ENV):
+        mxfp8_trtllm_use_8x4_sf_layout(128, 2304, 8192)
 
 
 def test_mxfp8_trtllm_tactic_uses_exact_shape(monkeypatch) -> None:
@@ -302,6 +330,35 @@ def test_mxfp8_trtllm_tactic_uses_physical_output_size(monkeypatch) -> None:
     )
 
     assert calls == [7]
+
+
+def test_mxfp8_trtllm_dispatch_uses_exact_layout_for_physical_shape(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(MXFP8_TRTLLM_LAYOUT_ENV, "8x4")
+    monkeypatch.setenv(
+        MXFP8_TRTLLM_LAYOUTS_ENV,
+        "3x256x512:128x4",
+    )
+    calls: list[bool] = []
+
+    def fixed_impl(*args, **kwargs) -> torch.Tensor:
+        calls.append(kwargs["use_8x4_sf_layout"])
+        return torch.empty((args[0].shape[0], args[3]), dtype=args[0].dtype)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer._mxfp8_trtllm_linear_fixed_impl",
+        fixed_impl,
+    )
+
+    mxfp8_trtllm_linear(
+        torch.empty((3, 512), dtype=torch.bfloat16),
+        torch.empty((256, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((4096,), dtype=torch.uint8),
+        130,
+    )
+
+    assert calls == [False]
 
 
 def test_mxfp8_trtllm_dispatch_compiles_with_dynamic_m(monkeypatch) -> None:
