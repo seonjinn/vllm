@@ -136,6 +136,7 @@ class CuMemAllocator:
         self.pointer_to_data: dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
+        self.retired_allocators: list[Any] = []
         # Creating strong references to the two callbacks here to prevent
         # these ephemeral bound-method objects being garbage collected.
         # See discussions in https://github.com/vllm-project/vllm/pull/22724
@@ -160,14 +161,15 @@ class CuMemAllocator:
         the pluggable allocator wrappers alive while MemPool destructors run.
         This is safe to call more than once.
         """
-        if not self.allocator_and_pools:
+        if not self.allocator_and_pools and not self.retired_allocators:
             return
 
         pool_entries = list(self.allocator_and_pools.values())
         self.allocator_and_pools.clear()
 
         mem_pools = [entry[0] for entry in pool_entries]
-        allocators = [entry[1] for entry in pool_entries]
+        allocators = [entry[1] for entry in pool_entries] + self.retired_allocators
+        self.retired_allocators = []
         pool_entries.clear()
 
         # Phase 1: drop MemPool refs while allocators are still strongly held.
@@ -335,32 +337,21 @@ class CuMemAllocator:
         old_tag = self.current_tag
         self.current_tag = tag
         try:
-            with use_memory_pool_with_allocator(
-                self.python_malloc_callback, self.python_free_callback
-            ) as data:
-                # start to hit another PyTorch bug in PyTorch 2.6,
-                # possibly because of gc-related issue w.r.t. the allocator
-                # and the memory pool.
-                # to avoid the issue, we keep a reference of the data.
-                # see https://github.com/pytorch/pytorch/issues/146431 .
-                self.allocator_and_pools[tag] = data
-                yield
-                # PyTorch's bug, calling torch.cuda.empty_cache() will error
-                # when using pluggable allocator, see
-                # https://github.com/pytorch/pytorch/issues/145168 .
-                # if we have some memory allocated and then freed,
-                # the memory will not be released, e.g. in online
-                # quantization, where the model is created in higher
-                # precision, and then quantized in lower precision.
-                # Find all unused allocations and manually release them.
-                # TODO: we should expose `empty_cache` method in the memory
-                # pool.
-                # TODO: ask for help from PyTorch team to expose this method.
-                allocations = data[0].snapshot()
-                for allocation in allocations:
-                    if allocation["allocated_size"] == 0:
-                        handle = self._python_free_callback(allocation["address"])
-                        unmap_and_release(handle)
+            data = None
+            try:
+                with use_memory_pool_with_allocator(
+                    self.python_malloc_callback, self.python_free_callback
+                ) as data:
+                    self.allocator_and_pools[tag] = data
+                    yield
+            finally:
+                if data is not None:
+                    # Keep callbacks alive for live tensors, but let PyTorch
+                    # reclaim unused segments and update its reserved stats.
+                    self.retired_allocators.append(data[1])
+                    if self.allocator_and_pools.get(tag) is data:
+                        del self.allocator_and_pools[tag]
+                    del data
         finally:
             self.current_tag = old_tag
             if expandable_was_enabled:
