@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     align_moe_weights_for_fi,
 )
 
