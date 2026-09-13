@@ -103,6 +103,14 @@ CUresult error_code = no_error;  // store error code
 static PyObject* g_python_malloc_callback = nullptr;
 static PyObject* g_python_free_callback = nullptr;
 
+#ifndef USE_ROCM
+struct CudaAllocationHandle {
+  CUmemGenericAllocationHandle handle;
+  bool allocated;
+  bool mapped;
+};
+#endif
+
 // ---------------------------------------------------------------------------
 // Helper functions:
 
@@ -118,7 +126,7 @@ void ensure_context(unsigned long long device) {
 
 void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
 #ifndef USE_ROCM
-                    CUmemGenericAllocationHandle* p_memHandle) {
+                    CudaAllocationHandle* p_memHandle) {
 #else
                     CUmemGenericAllocationHandle** p_memHandle,
                     unsigned long long* chunk_sizes, size_t num_chunks) {
@@ -151,14 +159,14 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
 
 #ifndef USE_ROCM
   // Allocate memory using cuMemCreate
-  CUresult ret = (CUresult)cuMemCreate(p_memHandle, size, &prop, 0);
+  CUresult ret = (CUresult)cuMemCreate(&p_memHandle->handle, size, &prop, 0);
   if (ret) {
     if (fab_flag &&
         (ret == CUDA_ERROR_NOT_PERMITTED || ret == CUDA_ERROR_NOT_SUPPORTED)) {
       // Fabric allocation may fail without multi-node nvlink,
       // fallback to POSIX file descriptor
       prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-      CUDA_CHECK(cuMemCreate(p_memHandle, size, &prop, 0));
+      CUDA_CHECK(cuMemCreate(&p_memHandle->handle, size, &prop, 0));
     } else {
       CUDA_CHECK(ret);
     }
@@ -166,10 +174,12 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
   if (error_code != 0) {
     return;
   }
-  CUDA_CHECK(cuMemMap(d_mem, size, 0, *p_memHandle, 0));
+  p_memHandle->allocated = true;
+  CUDA_CHECK(cuMemMap(d_mem, size, 0, p_memHandle->handle, 0));
   if (error_code != 0) {
     return;
   }
+  p_memHandle->mapped = true;
 #else
   for (auto i = 0; i < num_chunks; ++i) {
     CUDA_CHECK(cuMemCreate(p_memHandle[i], chunk_sizes[i], &prop, 0));
@@ -219,7 +229,7 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
 void unmap_and_release(unsigned long long device, ssize_t size,
                        CUdeviceptr d_mem,
 #ifndef USE_ROCM
-                       CUmemGenericAllocationHandle* p_memHandle) {
+                       CudaAllocationHandle* p_memHandle) {
 #else
                        CUmemGenericAllocationHandle** p_memHandle,
                        unsigned long long* chunk_sizes, size_t num_chunks) {
@@ -228,13 +238,19 @@ void unmap_and_release(unsigned long long device, ssize_t size,
   // ", d_mem=" << d_mem << ", p_memHandle=" << p_memHandle << std::endl;
   ensure_context(device);
 #ifndef USE_ROCM
-  CUDA_CHECK(cuMemUnmap(d_mem, size));
-  if (error_code != 0) {
-    return;
+  if (p_memHandle->mapped) {
+    CUDA_CHECK(cuMemUnmap(d_mem, size));
+    if (error_code != 0) {
+      return;
+    }
+    p_memHandle->mapped = false;
   }
-  CUDA_CHECK(cuMemRelease(*p_memHandle));
-  if (error_code != 0) {
-    return;
+  if (p_memHandle->allocated) {
+    CUDA_CHECK(cuMemRelease(p_memHandle->handle));
+    if (error_code != 0) {
+      return;
+    }
+    p_memHandle->allocated = false;
   }
 #else
   unsigned long long allocated_size = 0;
@@ -357,9 +373,8 @@ void* my_malloc(ssize_t size, int device, CUstream stream) {
 
 #ifndef USE_ROCM
   // allocate the CUmemGenericAllocationHandle
-  CUmemGenericAllocationHandle* p_memHandle =
-      (CUmemGenericAllocationHandle*)malloc(
-          sizeof(CUmemGenericAllocationHandle));
+  CudaAllocationHandle* p_memHandle =
+      (CudaAllocationHandle*)calloc(1, sizeof(CudaAllocationHandle));
 #else
   // Make sure chunk size is aligned with hardware granularity. The base
   // chunk size can be configured via environment variable
@@ -550,8 +565,7 @@ void my_free(void* ptr, ssize_t size, int device, CUstream stream) {
   Py_DECREF(py_result);
   PyGILState_Release(gstate);
 
-  CUmemGenericAllocationHandle* p_memHandle =
-      (CUmemGenericAllocationHandle*)recv_p_memHandle;
+  CudaAllocationHandle* p_memHandle = (CudaAllocationHandle*)recv_p_memHandle;
   unmap_and_release(device, size, d_mem, p_memHandle);
 #endif
 
@@ -618,8 +632,7 @@ static PyObject* python_unmap_and_release(PyObject* self, PyObject* args) {
 
   CUdeviceptr d_mem_ptr = (CUdeviceptr)recv_d_mem;
 #ifndef USE_ROCM
-  CUmemGenericAllocationHandle* p_memHandle =
-      (CUmemGenericAllocationHandle*)recv_p_memHandle;
+  CudaAllocationHandle* p_memHandle = (CudaAllocationHandle*)recv_p_memHandle;
 
   unmap_and_release(recv_device, recv_size, d_mem_ptr, p_memHandle);
 #else
@@ -739,8 +752,7 @@ static PyObject* python_create_and_map(PyObject* self, PyObject* args) {
 
   CUdeviceptr d_mem_ptr = (CUdeviceptr)recv_d_mem;
 #ifndef USE_ROCM
-  CUmemGenericAllocationHandle* p_memHandle =
-      (CUmemGenericAllocationHandle*)recv_p_memHandle;
+  CudaAllocationHandle* p_memHandle = (CudaAllocationHandle*)recv_p_memHandle;
 
   create_and_map(recv_device, recv_size, d_mem_ptr, p_memHandle);
 #else
