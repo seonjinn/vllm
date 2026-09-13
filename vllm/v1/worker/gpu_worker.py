@@ -465,7 +465,13 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            logger.debug(
+                "MEMORY_AUDIT before forward: %s", profile_result.before_profile
+            )
             self.model_runner.profile_run()
+            logger.debug(
+                "MEMORY_AUDIT after forward: %s", MemorySnapshot(device=self.device)
+            )
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
@@ -481,6 +487,12 @@ class Worker(WorkerBase):
                 != CUDAGraphMode.NONE
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                logger.debug(
+                    "MEMORY_AUDIT after graph probe: %s",
+                    MemorySnapshot(device=self.device),
+                )
+
+        logger.debug("MEMORY_AUDIT after cleanup: %s", profile_result.after_profile)
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
