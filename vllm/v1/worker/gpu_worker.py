@@ -411,6 +411,28 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+            logger.debug(
+                "MEMORY_AUDIT before weights pool exit: %s",
+                MemorySnapshot(device=self.device),
+            )
+            if self.vllm_config.model_config.enable_sleep_mode:
+                from vllm.device_allocator.cumem import CuMemAllocator
+
+                allocator = CuMemAllocator.get_instance()
+                pool, _ = allocator.allocator_and_pools["weights"]
+                inactive_bytes = sum(
+                    entry["total_size"]
+                    for entry in pool.snapshot()
+                    if entry["allocated_size"] == 0
+                )
+                logger.debug(
+                    "MEMORY_AUDIT weights inactive pool bytes: %d", inactive_bytes
+                )
+
+        logger.debug(
+            "MEMORY_AUDIT after weights pool exit: %s",
+            MemorySnapshot(device=self.device),
+        )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
