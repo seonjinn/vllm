@@ -37,6 +37,15 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 logger = init_logger(__name__)
 
 
+def _prepare_dspark_draft_hidden(
+    model: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    draft_steps: torch.Tensor,
+) -> torch.Tensor:
+    prepare = getattr(model, "prepare_draft_hidden", None)
+    return prepare(hidden_states, draft_steps) if callable(prepare) else hidden_states
+
+
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
@@ -58,7 +67,11 @@ class DSparkSpeculator(DFlashSpeculator):
         # layers, combined to hidden_size via main_proj. Store that combined
         # main_x (hidden_size wide). DSpark does not use the same pre-allocated buffer
         # that DeepSeek-V4's MTP uses.
-        draft_hidden = self.draft_model_config.get_hidden_size()
+        from vllm.model_executor.models.qwen3_dflash import (
+            _get_dflash_context_input_size,
+        )
+
+        draft_hidden = _get_dflash_context_input_size(vllm_config)
         self.hidden_states = torch.zeros(
             self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
         )
@@ -159,6 +172,9 @@ class DSparkSpeculator(DFlashSpeculator):
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sample_hidden = _prepare_dspark_draft_hidden(
+            self.model, sample_hidden, self.sample_col[:num_sample]
+        )
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
@@ -206,6 +222,9 @@ class DSparkSpeculator(DFlashSpeculator):
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sample_hidden = _prepare_dspark_draft_hidden(
+            self.model, sample_hidden, self.sample_col[:num_sample]
+        )
         base_logits = self.model.compute_draft_logits(sample_hidden)
         base_logits = base_logits.view(num_reqs, n_spec, -1)
         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)

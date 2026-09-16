@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -104,6 +105,163 @@ def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
         getattr(config, "target_hidden_size", None) or config.hidden_size
     )
     return target_hidden_size * num_features_to_use
+
+
+def _get_dflash_config_value(config: Qwen3Config, name: str, default=None):
+    value = getattr(config, name, None)
+    if value is not None:
+        return value
+    return (getattr(config, "dflash_config", None) or {}).get(name, default)
+
+
+def _get_dflash_context_input_size(vllm_config: VllmConfig) -> int:
+    config = vllm_config.speculative_config.draft_model_config.hf_config
+    if (
+        _get_dflash_config_value(config, "target_fusion_type", "concat_fc")
+        == "adaptive_layerwise"
+    ):
+        return _get_dflash_fc_input_size(vllm_config)
+    return config.hidden_size
+
+
+def _validate_num_target_taps(value, *, fallback: int) -> int:
+    value = fallback if value is None else value
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"num_target_taps must be a positive integer, got {value!r}.")
+    return value
+
+
+def _fuse_adaptive_target_hidden_states(
+    hidden_states: torch.Tensor,
+    fusion_logits: torch.Tensor,
+    hidden_norms: Iterable[nn.Module],
+) -> torch.Tensor:
+    num_taps = fusion_logits.shape[1]
+    if hidden_states.shape[-1] % num_taps != 0:
+        raise ValueError(
+            f"Adaptive target fusion expects {num_taps} equally sized taps, "
+            f"but received width {hidden_states.shape[-1]}."
+        )
+    taps = hidden_states.unflatten(-1, (num_taps, -1))
+    weights = fusion_logits.softmax(dim=-1).to(dtype=taps.dtype)
+    fused = torch.einsum("lt,nth->lnh", weights, taps)
+    return torch.stack(
+        [norm(layer_states) for norm, layer_states in zip(hidden_norms, fused)],
+        dim=0,
+    )
+
+
+def _map_dflash_weights(
+    weights: Iterable[tuple[str, torch.Tensor]], mapper: WeightsMapper
+) -> Iterable[tuple[str, torch.Tensor]]:
+    for item in weights:
+        name, _ = item
+        if (
+            ".target_k_proj." in name
+            or ".target_v_proj." in name
+            or name.startswith("first_draft_adapter.")
+        ):
+            yield item
+        else:
+            yield from mapper.apply((item,))
+
+
+def _checkpoint_backed_parameter_names(module: nn.Module) -> set[str]:
+    parameter_names = {name for name, _ in module.named_parameters(recurse=False)}
+    quant_method = getattr(module, "quant_method", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    if quant_config is None:
+        return parameter_names
+
+    serialized_flags = [
+        bool(getattr(quant_config, name))
+        for name in dir(quant_config)
+        if name.startswith("is_checkpoint_") and name.endswith("_serialized")
+    ]
+    if serialized_flags and not any(serialized_flags):
+        return parameter_names & {"weight", "bias"}
+    return parameter_names
+
+
+def _prefixed_checkpoint_parameters(module: nn.Module, prefix: str) -> set[str]:
+    return {f"{prefix}.{name}" for name in _checkpoint_backed_parameter_names(module)}
+
+
+def _required_adaptive_checkpoint_weights(model: nn.Module) -> set[str]:
+    required: set[str] = set()
+    if getattr(model, "target_fusion_type", None) == "adaptive_layerwise":
+        required.add("target_fusion_logits")
+        for i, norm in enumerate(model.target_hidden_norms):
+            required.update(
+                _prefixed_checkpoint_parameters(norm, f"target_hidden_norms.{i}")
+            )
+        if getattr(model, "separate_target_kv", False):
+            for i, layer in enumerate(model.layers):
+                for projection in ("target_k_proj", "target_v_proj"):
+                    prefix = f"layers.{i}.self_attn.{projection}"
+                    module = getattr(layer.self_attn, projection)
+                    required.update(_prefixed_checkpoint_parameters(module, prefix))
+    adapter = getattr(model, "first_draft_adapter", None)
+    if adapter is not None:
+        for projection in ("down_proj", "up_proj"):
+            module = getattr(adapter, projection)
+            required.update(
+                _prefixed_checkpoint_parameters(
+                    module, f"first_draft_adapter.{projection}"
+                )
+            )
+    return required
+
+
+def _validate_required_adaptive_weights(
+    model: nn.Module, checkpoint_weight_names: set[str]
+) -> None:
+    missing = _required_adaptive_checkpoint_weights(model) - checkpoint_weight_names
+    if missing:
+        raise ValueError(
+            "Checkpoint is missing required adaptive weights: "
+            + ", ".join(sorted(missing))
+        )
+
+
+def _validate_loaded_adaptive_weights(
+    model: nn.Module, loaded_weight_names: set[str]
+) -> None:
+    loaded_model_weights = {
+        name.removeprefix("model.")
+        for name in loaded_weight_names
+        if name.startswith("model.")
+    }
+    _validate_required_adaptive_weights(model, loaded_model_weights)
+
+
+def _make_kv_parallel_linear(
+    input_size: int,
+    total_num_kv_heads: int,
+    head_dim: int,
+    *,
+    bias: bool,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> ColumnParallelLinear:
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+    if tp_size >= total_num_kv_heads:
+        kv_tp_size = total_num_kv_heads
+        replicas = tp_size // total_num_kv_heads
+        kv_tp_rank = tp_rank // replicas
+    else:
+        kv_tp_size = tp_size
+        kv_tp_rank = tp_rank
+    return ColumnParallelLinear(
+        input_size=input_size,
+        output_size=total_num_kv_heads * head_dim,
+        bias=bias,
+        quant_config=quant_config,
+        prefix=prefix,
+        tp_size=kv_tp_size,
+        tp_rank=kv_tp_rank,
+    )
 
 
 def _resolve_layer_attention(
@@ -194,6 +352,8 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        separate_target_kv: bool = False,
+        target_context_size: int | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -222,6 +382,25 @@ class DFlashQwen3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
+        self.target_k_proj: ColumnParallelLinear | None = None
+        self.target_v_proj: ColumnParallelLinear | None = None
+        if separate_target_kv:
+            target_context_size = target_context_size or hidden_size
+            projection_args = {
+                "input_size": target_context_size,
+                "total_num_kv_heads": self.total_num_kv_heads,
+                "head_dim": self.head_dim,
+                "bias": attention_bias,
+                "quant_config": quant_config,
+            }
+            self.target_k_proj = _make_kv_parallel_linear(
+                **projection_args,
+                prefix=f"{prefix}.target_k_proj",
+            )
+            self.target_v_proj = _make_kv_parallel_linear(
+                **projection_args,
+                prefix=f"{prefix}.target_v_proj",
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -307,6 +486,20 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # DFlash drafts store the sink-bias flag inside dflash_config; fall back
         # to the top-level attribute used by other (e.g. MiMo) configs.
         dflash_config = getattr(config, "dflash_config", None) or {}
+        target_fusion_type = _get_dflash_config_value(
+            config, "target_fusion_type", "concat_fc"
+        )
+        separate_target_kv = bool(
+            _get_dflash_config_value(config, "separate_target_kv", False)
+        )
+        target_hidden_size = (
+            getattr(config, "target_hidden_size", None) or config.hidden_size
+        )
+        target_context_size = (
+            target_hidden_size
+            if target_fusion_type == "adaptive_layerwise"
+            else config.hidden_size
+        )
         add_swa_attention_sink_bias = dflash_config.get(
             "attention_sink_bias",
             getattr(config, "add_swa_attention_sink_bias", False),
@@ -340,6 +533,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            separate_target_kv=separate_target_kv,
+            target_context_size=target_context_size,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -417,6 +612,18 @@ class DFlashQwen3Model(nn.Module):
         else:
             self.use_aux_hidden_state = True
 
+        self.target_fusion_type = _get_dflash_config_value(
+            self.config, "target_fusion_type", "concat_fc"
+        )
+        if self.target_fusion_type not in {"concat_fc", "adaptive_layerwise"}:
+            raise ValueError(
+                "target_fusion_type must be 'concat_fc' or "
+                f"'adaptive_layerwise', got {self.target_fusion_type!r}."
+            )
+        self.separate_target_kv = bool(
+            _get_dflash_config_value(self.config, "separate_target_kv", False)
+        )
+
         current_vllm_config = get_current_vllm_config()
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -450,7 +657,7 @@ class DFlashQwen3Model(nn.Module):
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
-        if self.use_aux_hidden_state:
+        if self.use_aux_hidden_state and self.target_fusion_type == "concat_fc":
             self.fc = ReplicatedLinear(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
@@ -462,10 +669,45 @@ class DFlashQwen3Model(nn.Module):
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
             )
-        self.hidden_norm = RMSNorm(
-            self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-        )
+        if self.target_fusion_type == "adaptive_layerwise":
+            target_hidden_size = (
+                getattr(self.config, "target_hidden_size", None)
+                or self.config.hidden_size
+            )
+            configured_taps = _get_dflash_config_value(
+                self.config, "num_target_taps", None
+            )
+            aux_layers = get_eagle3_aux_layers_from_config(
+                vllm_config.speculative_config
+            )
+            num_target_taps = _validate_num_target_taps(
+                configured_taps,
+                fallback=(
+                    len(aux_layers) if aux_layers else self.config.num_hidden_layers
+                ),
+            )
+            if aux_layers and len(aux_layers) != num_target_taps:
+                raise ValueError(
+                    f"num_target_taps={num_target_taps} does not match the "
+                    f"{len(aux_layers)} configured target layer ids."
+                )
+            self.num_target_taps = num_target_taps
+            self.target_fusion_logits = nn.Parameter(
+                torch.zeros(
+                    self.config.num_hidden_layers,
+                    num_target_taps,
+                    dtype=vllm_config.model_config.dtype,
+                )
+            )
+            self.target_hidden_norms = nn.ModuleList(
+                RMSNorm(target_hidden_size, eps=self.config.rms_norm_eps)
+                for _ in range(self.config.num_hidden_layers)
+            )
+        else:
+            self.hidden_norm = RMSNorm(
+                self.config.hidden_size,
+                eps=self.config.rms_norm_eps,
+            )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -484,16 +726,18 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        self._hidden_norm_weight = self.hidden_norm.weight.data
+        if self.target_fusion_type == "concat_fc":
+            self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
-        else:
-            self._fused_kv_bias = None
+        if self.target_fusion_type == "concat_fc" and not self.separate_target_kv:
+            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+            if has_bias:
+                kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+                self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+            else:
+                self._fused_kv_bias = None
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
@@ -552,6 +796,30 @@ class DFlashQwen3Model(nn.Module):
         num_kv_heads: int,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.target_fusion_type == "adaptive_layerwise":
+            per_layer_states = _fuse_adaptive_target_hidden_states(
+                context_states,
+                self.target_fusion_logits,
+                self.target_hidden_norms,
+            )
+            all_k = []
+            all_v = []
+            for states, layer in zip(per_layer_states, self.layers):
+                attn = layer.self_attn
+                if self.separate_target_kv:
+                    assert attn.target_k_proj is not None
+                    assert attn.target_v_proj is not None
+                    k, _ = attn.target_k_proj(states)
+                    v, _ = attn.target_v_proj(states)
+                else:
+                    qkv, _ = attn.qkv_proj(states)
+                    _, k, v = qkv.split(
+                        [attn.q_size, attn.kv_size, attn.kv_size], dim=-1
+                    )
+                all_k.append(k.unflatten(-1, (num_kv_heads, head_dim)))
+                all_v.append(v.unflatten(-1, (num_kv_heads, head_dim)))
+            return torch.stack(all_k), torch.stack(all_v)
+
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
@@ -560,6 +828,19 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
+        if self.separate_target_kv:
+            all_k = []
+            all_v = []
+            for layer in self.layers:
+                attn = layer.self_attn
+                assert attn.target_k_proj is not None
+                assert attn.target_v_proj is not None
+                k, _ = attn.target_k_proj(normed_context_states)
+                v, _ = attn.target_v_proj(normed_context_states)
+                all_k.append(k.unflatten(-1, (num_kv_heads, head_dim)))
+                all_v.append(v.unflatten(-1, (num_kv_heads, head_dim)))
+            return torch.stack(all_k), torch.stack(all_v)
+
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
@@ -699,7 +980,10 @@ class DFlashQwen3Model(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(
-            self._preprocess(weights), mapper=self.hf_to_vllm_mapper
+            _map_dflash_weights(
+                self._preprocess(weights),
+                self.hf_to_vllm_mapper,
+            )
         )
 
 
@@ -800,7 +1084,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
-        expected = self.model.fc.input_size
+        if self.model.target_fusion_type == "adaptive_layerwise":
+            expected = self.model.num_target_taps * (
+                getattr(self.config, "target_hidden_size", None)
+                or self.config.hidden_size
+            )
+        else:
+            expected = self.model.fc.input_size
         if hidden_states.shape[-1] != expected:
             raise ValueError(
                 f"DFlash drafter expects {expected} concatenated aux hidden "
@@ -808,16 +1098,25 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
-        result = self.model.fc(hidden_states)
+        result = (
+            hidden_states
+            if self.model.target_fusion_type == "adaptive_layerwise"
+            else self.model.fc(hidden_states)
+        )
         if needs_squeeze:
             result = result.squeeze(0)
         return result
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    # None intentionally preserves historical DefaultModelLoader behavior.
+    def load_weights(  # type: ignore[override]
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> None:
         model_weights = {}
+        checkpoint_weight_names = set()
         includes_draft_id_mapping = False
         includes_embed_tokens = False
         for name, loaded_weight in weights:
+            checkpoint_weight_names.add(name)
             assert "mask_hidden" not in name, (
                 "DFlash embeds masked slots via mask_token_id (optionally "
                 "overridden by a mask_embedding.pt file); it should not ship a "
@@ -835,6 +1134,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
+        _validate_required_adaptive_weights(
+            self.model,
+            checkpoint_weight_names,
+        )
+
         # Route the separately-trained mask embedding (if shipped) through the
         # standard weight loader alongside the rest of the draft weights.
         mask_embedding = self._read_mask_embedding()
@@ -849,11 +1153,15 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             orig_to_new_substr["embed_tokens"] = None
         if not self.model.use_aux_hidden_state:
             orig_to_new_substr["fc."] = None
+        if self.model.target_fusion_type == "adaptive_layerwise":
+            orig_to_new_substr["fc."] = None
+            orig_to_new_substr["hidden_norm."] = None
         if not self.model.has_separate_mask_embedding:
             orig_to_new_substr["mask_embedding"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items(), mapper=mapper)
+        loaded = loader.load_weights(model_weights.items(), mapper=mapper)
+        _validate_loaded_adaptive_weights(self.model, loaded)
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

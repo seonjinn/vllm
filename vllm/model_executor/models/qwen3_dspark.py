@@ -19,6 +19,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -29,7 +30,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
 )
 
-from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
+from .qwen3_dflash import (
+    DFlashQwen3ForCausalLM,
+    DFlashQwen3Model,
+    _validate_loaded_adaptive_weights,
+    _validate_required_adaptive_weights,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -38,6 +44,50 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+class DSparkFirstDraftAdapter(nn.Module):
+    """Low-rank residual adapter applied only to semantic draft step zero."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        rank: int,
+        prefix: str,
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
+        super().__init__()
+        self.down_proj = ReplicatedLinear(
+            hidden_size,
+            rank,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "down_proj"),
+            return_bias=False,
+        )
+        self.up_proj = ReplicatedLinear(
+            rank,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "up_proj"),
+            return_bias=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.up_proj(F.silu(self.down_proj(hidden_states)))
+
+    def apply_to_steps(
+        self,
+        hidden_states: torch.Tensor,
+        draft_steps: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] != draft_steps.numel():
+            raise ValueError(
+                "First-draft adapter needs one semantic draft step per hidden row."
+            )
+        is_first = draft_steps.eq(0).unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states + self(hidden_states) * is_first
 
 
 class DSparkMarkovHead(nn.Module):
@@ -173,6 +223,19 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                 bias=True,
                 with_markov=with_markov,
             )
+        first_draft_adapter_rank = getattr(config, "first_draft_adapter_rank", None)
+        if first_draft_adapter_rank is None:
+            first_draft_adapter_rank = (
+                getattr(config, "dflash_config", None) or {}
+            ).get("first_draft_adapter_rank", 0)
+        self.first_draft_adapter: DSparkFirstDraftAdapter | None = None
+        if first_draft_adapter_rank:
+            self.first_draft_adapter = DSparkFirstDraftAdapter(
+                config.hidden_size,
+                first_draft_adapter_rank,
+                prefix=maybe_prefix(prefix, "first_draft_adapter"),
+                quant_config=self.quant_config,
+            )
 
 
 class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
@@ -211,6 +274,16 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+
+    def prepare_draft_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        draft_steps: torch.Tensor,
+    ) -> torch.Tensor:
+        adapter = getattr(self.model, "first_draft_adapter", None)
+        if adapter is not None:
+            return adapter.apply_to_steps(hidden_states, draft_steps)
+        return hidden_states
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Draft-vocab logits without the d2t scatter: the speculator adds the
@@ -251,13 +324,15 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         assert self.model.confidence_head is not None
         return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         model_weights = {}
+        checkpoint_weight_names = set()
         includes_embed_tokens = False
         includes_lm_head = False
         includes_draft_id_mapping = False
         includes_confidence_head = False
         for name, loaded_weight in weights:
+            checkpoint_weight_names.add(name)
             # t2d is training-only; the draft remaps via d2t at sampling time.
             if "t2d" in name:
                 continue
@@ -277,6 +352,11 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             # knows whether to keep these or alias the target's.
             process_eagle_weight(self, name)
 
+        _validate_required_adaptive_weights(
+            self.model,
+            checkpoint_weight_names,
+        )
+
         # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
         # embed_tokens / lm_head are optional; when omitted they are shared from
         # the target by load_dspark_model, so skip the unloaded params here.
@@ -292,5 +372,6 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             orig_to_new_substr["confidence_head"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items(), mapper=mapper)
+        loaded = loader.load_weights(model_weights.items(), mapper=mapper)
+        _validate_loaded_adaptive_weights(self.model, loaded)
         self.model._build_fused_kv_buffers()

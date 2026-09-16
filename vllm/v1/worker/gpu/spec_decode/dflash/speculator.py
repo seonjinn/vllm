@@ -36,8 +36,16 @@ class DFlashSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
+        from vllm.model_executor.models.qwen3_dflash import (
+            _get_dflash_context_input_size,
+        )
+
+        context_input_size = _get_dflash_context_input_size(vllm_config)
         self.hidden_states = torch.zeros(
-            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+            self.max_num_tokens,
+            context_input_size,
+            dtype=self.dtype,
+            device=device,
         )
 
         # Multimodal inputs not currently supported.
@@ -359,6 +367,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
+            if hidden_states.shape[-1] != self.hidden_states.shape[-1]:
+                raise ValueError(
+                    "Adaptive target fusion requires auxiliary hidden states "
+                    "from every configured target tap."
+                )
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
