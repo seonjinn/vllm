@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     biased_moe_quant_config,
 )
@@ -34,6 +35,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
+from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -64,6 +66,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     @property
     def supports_eplb(self) -> bool:
         return True
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        hidden_size, intermediate_size_per_partition = super().maybe_roundup_sizes(
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            act_dtype=act_dtype,
+            moe_parallel_config=moe_parallel_config,
+        )
+        if self.unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 128
+            )
+        return hidden_size, intermediate_size_per_partition
 
     def maybe_make_prepare_finalize(
         self,
@@ -158,6 +179,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> None:
+        self._zero_trtllm_padding(layer)
         # Shuffle weights to runtime format.
         w13_new, w2_new = convert_to_unquantized_kernel_format(
             self.unquantized_backend,
@@ -197,6 +219,30 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
+
+    def _zero_trtllm_padding(self, layer: "RoutedExperts") -> None:
+        if self.unquantized_backend != UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+            return
+
+        unpadded = layer.moe_config.intermediate_size_per_partition_unpadded
+        if unpadded is None or layer.w2_weight.shape[-1] <= unpadded:
+            return
+
+        padded = layer.w2_weight.shape[-1]
+        with torch.no_grad():
+            if layer.moe_config.is_act_and_mul:
+                layer.w13_weight[:, unpadded:padded].zero_()
+                layer.w13_weight[:, padded + unpadded :].zero_()
+            else:
+                layer.w13_weight[:, unpadded:].zero_()
+            layer.w2_weight[:, :, unpadded:].zero_()
+
+            if getattr(layer, "w13_bias", None) is not None:
+                if layer.moe_config.is_act_and_mul:
+                    layer.w13_bias[:, unpadded:padded].zero_()
+                    layer.w13_bias[:, padded + unpadded :].zero_()
+                else:
+                    layer.w13_bias[:, unpadded:].zero_()
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         super().process_weights_after_loading(layer)
