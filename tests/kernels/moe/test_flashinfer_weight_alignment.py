@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from torch import nn
 
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
@@ -71,3 +72,34 @@ def test_unquantized_trtllm_rounds_intermediate_before_kernel_setup() -> None:
 
     assert hidden == 1024
     assert intermediate == 128
+
+
+def test_unquantized_trtllm_zeroes_gated_intermediate_padding() -> None:
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    method.unquantized_backend = UnquantizedMoeBackend.FLASHINFER_TRTLLM
+    method.moe = type(
+        "MoeConfig",
+        (),
+        {
+            "intermediate_size_per_partition_unpadded": 64,
+            "is_act_and_mul": True,
+        },
+    )()
+    layer = nn.Module()
+    layer.register_parameter(
+        "w13_weight",
+        nn.Parameter(torch.ones(2, 256, 32), requires_grad=False),
+    )
+    layer.register_parameter(
+        "w2_weight",
+        nn.Parameter(torch.ones(2, 32, 128), requires_grad=False),
+    )
+
+    method._zero_trtllm_padding(layer)
+
+    assert torch.all(layer.w13_weight[:, :64] == 1)
+    assert torch.count_nonzero(layer.w13_weight[:, 64:128]).item() == 0
+    assert torch.all(layer.w13_weight[:, 128:192] == 1)
+    assert torch.count_nonzero(layer.w13_weight[:, 192:]).item() == 0
+    assert torch.all(layer.w2_weight[:, :, :64] == 1)
+    assert torch.count_nonzero(layer.w2_weight[:, :, 64:]).item() == 0
