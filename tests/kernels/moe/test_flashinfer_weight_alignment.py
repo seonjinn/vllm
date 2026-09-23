@@ -4,6 +4,13 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+    UnquantizedMoeBackend,
+)
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     align_moe_weights_for_fi,
 )
@@ -49,3 +56,18 @@ def test_align_moe_preserves_each_projection(intermediate: int, gated: bool) -> 
     assert twice_padded == padded
     assert twice_w13.data_ptr() == aligned_w13.data_ptr()
     assert twice_w2.data_ptr() == aligned_w2.data_ptr()
+
+
+def test_unquantized_trtllm_rounds_intermediate_before_kernel_setup() -> None:
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    method.unquantized_backend = UnquantizedMoeBackend.FLASHINFER_TRTLLM
+
+    hidden, intermediate = method.maybe_roundup_sizes(
+        hidden_size=1024,
+        intermediate_size_per_partition=64,
+        act_dtype=torch.bfloat16,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+    )
+
+    assert hidden == 1024
+    assert intermediate == 128
