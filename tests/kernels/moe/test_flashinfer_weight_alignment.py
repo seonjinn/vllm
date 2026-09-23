@@ -86,6 +86,7 @@ def test_unquantized_trtllm_zeroes_gated_intermediate_padding() -> None:
         },
     )()
     layer = nn.Module()
+    layer.moe_config = method.moe
     layer.register_parameter(
         "w13_weight",
         nn.Parameter(torch.ones(2, 256, 32), requires_grad=False),
