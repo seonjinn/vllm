@@ -21,7 +21,15 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from .utils import make_dummy_moe_config
 
 
-@pytest.mark.usefixtures("default_vllm_config")
+@pytest.fixture
+def tp_local_vllm_config():
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):
+        yield
+
+
+@pytest.mark.usefixtures("tp_local_vllm_config")
 class TestTpLocalBf16ExpertLoading:
     @staticmethod
     def _make_experts(monkeypatch, tp_rank: int) -> RoutedExperts:
