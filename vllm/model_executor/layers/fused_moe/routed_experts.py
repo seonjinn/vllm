@@ -376,6 +376,7 @@ class RoutedExperts(PluggableLayer):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         is_scale: bool = False,
+        tp_local: bool = False,
     ):
         """Load grouped weight scales for group quantization or model weights
 
@@ -386,6 +387,7 @@ class RoutedExperts(PluggableLayer):
             loaded_weight: checkpoint weight to load into the param
             tp_rank: tensor parallel rank
             is_scale: whether padding should use unit scales instead of zero weights.
+            tp_local: whether the source already contains this TP rank's slice.
 
         """
         padded_tp = self.moe_config.tp_shard_with_padding
@@ -419,7 +421,7 @@ class RoutedExperts(PluggableLayer):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
-                load_full=padded_tp,
+                load_full=padded_tp or tp_local,
             )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -428,7 +430,40 @@ class RoutedExperts(PluggableLayer):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
-                load_full=padded_tp,
+                load_full=padded_tp or tp_local,
+            )
+
+    def _validate_tp_local_weight(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        base_quant_method: FusedMoEMethodBase,
+        is_transposed: bool,
+    ) -> None:
+        local_width = self.moe_config.intermediate_size_per_partition_unpadded
+        hidden = self.moe_config.hidden_dim_unpadded
+        if local_width is None or hidden is None:
+            raise ValueError("TP-local expert projection requires unpadded dimensions")
+        expected_shape = (
+            (hidden, local_width) if shard_id == "w2" else (local_width, hidden)
+        )
+        if (
+            not isinstance(base_quant_method, UnquantizedFusedMoEMethod)
+            or self.moe_config.tp_shard_with_padding
+            or is_transposed
+            or not weight_name.endswith("_weight")
+            or loaded_weight.ndim != 2
+            or param.dtype != torch.bfloat16
+            or loaded_weight.dtype != torch.bfloat16
+            or tuple(loaded_weight.shape) != expected_shape
+        ):
+            raise ValueError(
+                "TP-local expert projection requires an untransposed, "
+                "unquantized BF16 per-expert weight with exact local shape "
+                f"{expected_shape}; got {weight_name!r} with "
+                f"shape {tuple(loaded_weight.shape)} and dtype {loaded_weight.dtype}"
             )
 
     def _load_per_channel_weight_scale(
@@ -672,6 +707,8 @@ class RoutedExperts(PluggableLayer):
         shard_id: str,
         expert_id: int,
         return_success: Literal[False],
+        *,
+        tp_local: bool = False,
     ) -> None: ...
 
     @overload
@@ -683,6 +720,8 @@ class RoutedExperts(PluggableLayer):
         shard_id: str,
         expert_id: int,
         return_success: Literal[True],
+        *,
+        tp_local: bool = False,
     ) -> bool: ...
 
     def weight_loader(
@@ -693,6 +732,8 @@ class RoutedExperts(PluggableLayer):
         shard_id: str,
         expert_id: int,
         return_success: bool = False,
+        *,
+        tp_local: bool = False,
     ) -> bool | None:
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
@@ -789,6 +830,16 @@ class RoutedExperts(PluggableLayer):
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
+
+        if tp_local:
+            self._validate_tp_local_weight(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                base_quant_method,
+                is_transposed,
+            )
 
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
@@ -996,14 +1047,22 @@ class RoutedExperts(PluggableLayer):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=self.moe_config.tp_rank,
+                tp_local=tp_local,
             )
             return True if return_success else None
 
         return False if return_success else None
 
     def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
+        self, weights: Iterable[tuple[str, torch.Tensor]], *, tp_local: bool = False
     ) -> Iterable[str]:
+        """Load expert projections; ``tp_local`` accepts this TP rank's BF16 slice.
+
+        The caller must supply the slice for ``moe_config.tp_rank``. Validation
+        checks its shape and dtype before the parameter loader copies it.
+        """
+        if tp_local and not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+            raise ValueError("TP-local expert projection requires unquantized MoE")
         expert_mapping = self.get_expert_mapping(include_fused=True)
         mapping_by_expert = _index_expert_mapping(expert_mapping)
 
@@ -1086,14 +1145,25 @@ class RoutedExperts(PluggableLayer):
                 # Unified loading logic for fused and non-fused experts
                 loaded_experts = experts_shard.unbind()
                 for expert_id, loaded_expert in enumerate(loaded_experts, start=start):
-                    success = param.weight_loader(
-                        param=param,
-                        loaded_weight=loaded_expert,
-                        weight_name=weight_name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
+                    if tp_local:
+                        success = param.weight_loader(
+                            param=param,
+                            loaded_weight=loaded_expert,
+                            weight_name=weight_name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                            tp_local=True,
+                        )
+                    else:
+                        success = param.weight_loader(
+                            param=param,
+                            loaded_weight=loaded_expert,
+                            weight_name=weight_name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
                     if success:
                         logger.debug(
                             "Loaded expert %d of shard %s into %s for layer %s",

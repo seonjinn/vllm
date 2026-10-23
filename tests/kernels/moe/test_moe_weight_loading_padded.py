@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
 )
@@ -465,6 +466,92 @@ class TestUnquantizedTrtLlmPrePadding:
 
         assert hidden == 64
         assert intermediate == expected
+
+
+class TestTpLocalBf16ExpertLoading:
+    @staticmethod
+    def _make_experts(monkeypatch, tp_rank: int) -> RoutedExperts:
+        from vllm.model_executor.layers.fused_moe import (
+            unquantized_fused_moe_method,
+        )
+
+        monkeypatch.setattr(
+            unquantized_fused_moe_method,
+            "select_unquantized_moe_backend",
+            lambda **_: (UnquantizedMoeBackend.FLASHINFER_TRTLLM, None),
+        )
+        config = make_dummy_moe_config(
+            num_experts=1, hidden_dim=64, intermediate_size=2688
+        )
+        config.moe_parallel_config.tp_size = 2
+        config.moe_parallel_config.tp_rank = tp_rank
+        config.intermediate_size_per_partition = 1344
+        config.intermediate_size_per_partition_unpadded = 1344
+        manager = ExpertMapManager(
+            max_num_batched_tokens=512,
+            top_k=1,
+            global_num_experts=1,
+            num_redundant_experts=0,
+            num_expert_group=None,
+            moe_parallel_config=config.moe_parallel_config,
+            placement_strategy="linear",
+            enable_eplb=False,
+        )
+        return RoutedExperts(
+            "model.layers.0.mlp.experts", torch.bfloat16, config, None, manager
+        )
+
+    @pytest.mark.parametrize("tp_rank", [0, 1])
+    def test_tp_local_projections_match_full_checkpoint(self, monkeypatch, tp_rank):
+        full_loader = self._make_experts(monkeypatch, tp_rank)
+        local_loader = self._make_experts(monkeypatch, tp_rank)
+        with torch.no_grad():
+            for loader in (full_loader, local_loader):
+                loader.w13_weight.zero_()
+                loader.w2_weight.zero_()
+        projections = {
+            "gate_proj": torch.arange(2688 * 64, dtype=torch.int32)
+            .remainder(251)
+            .to(torch.bfloat16)
+            .reshape(2688, 64),
+            "up_proj": torch.arange(2688 * 64, dtype=torch.int32)
+            .remainder(197)
+            .to(torch.bfloat16)
+            .reshape(2688, 64),
+            "down_proj": torch.arange(2688 * 64, dtype=torch.int32)
+            .remainder(151)
+            .to(torch.bfloat16)
+            .reshape(64, 2688),
+        }
+        for projection, full_weight in projections.items():
+            name = f"experts.0.{projection}.weight"
+            assert list(full_loader.load_weights([(name, full_weight)]))
+            local_weight = (
+                full_weight[:, tp_rank * 1344 : (tp_rank + 1) * 1344]
+                if projection == "down_proj"
+                else full_weight[tp_rank * 1344 : (tp_rank + 1) * 1344]
+            )
+            assert list(
+                local_loader.load_weights([(name, local_weight)], tp_local=True)
+            )
+
+        torch.testing.assert_close(
+            local_loader.w13_weight, full_loader.w13_weight, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            local_loader.w2_weight, full_loader.w2_weight, rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("bad_width", [1343, 2688])
+    def test_tp_local_rejects_ambiguous_width(self, monkeypatch, bad_width):
+        experts = self._make_experts(monkeypatch, 1)
+        weight = torch.zeros((bad_width, 64), dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="TP-local expert projection"):
+            list(
+                experts.load_weights(
+                    [("experts.0.up_proj.weight", weight)], tp_local=True
+                )
+            )
 
 
 class TestLoadWeightsExpertBias:
