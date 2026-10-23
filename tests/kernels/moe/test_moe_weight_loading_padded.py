@@ -548,11 +548,7 @@ class TestTpLocalBf16ExpertLoading:
         experts = self._make_experts(monkeypatch, 1)
         weight = torch.zeros((bad_width, 64), dtype=torch.bfloat16)
         with pytest.raises(ValueError, match="TP-local expert projection"):
-            list(
-                experts.load_weights(
-                    [("0.up_proj.weight", weight)], tp_local=True
-                )
-            )
+            list(experts.load_weights([("0.up_proj.weight", weight)], tp_local=True))
 
 
 class TestLoadWeightsExpertBias:
