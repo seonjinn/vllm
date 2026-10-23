@@ -468,6 +468,7 @@ class TestUnquantizedTrtLlmPrePadding:
         assert intermediate == expected
 
 
+@pytest.mark.usefixtures("default_vllm_config")
 class TestTpLocalBf16ExpertLoading:
     @staticmethod
     def _make_experts(monkeypatch, tp_rank: int) -> RoutedExperts:
@@ -524,7 +525,7 @@ class TestTpLocalBf16ExpertLoading:
             .reshape(64, 2688),
         }
         for projection, full_weight in projections.items():
-            name = f"experts.0.{projection}.weight"
+            name = f"0.{projection}.weight"
             assert list(full_loader.load_weights([(name, full_weight)]))
             local_weight = (
                 full_weight[:, tp_rank * 1344 : (tp_rank + 1) * 1344]
@@ -549,7 +550,7 @@ class TestTpLocalBf16ExpertLoading:
         with pytest.raises(ValueError, match="TP-local expert projection"):
             list(
                 experts.load_weights(
-                    [("experts.0.up_proj.weight", weight)], tp_local=True
+                    [("0.up_proj.weight", weight)], tp_local=True
                 )
             )
 
